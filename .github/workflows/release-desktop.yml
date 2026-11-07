@@ -1,0 +1,83 @@
+name: Build Cross-Platform Desktop Executables (Windows / macOS / Linux)
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: hide-go-desktop-linux-x86_64
+            bin_name: hide-go-desktop
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: hide-go-desktop-macos-arm64
+            bin_name: hide-go-desktop
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: hide-go-desktop-windows-x64.exe
+            bin_name: hide-go-desktop.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build Frontend Assets
+        run: |
+          npm install
+          npm run build
+
+      - name: Update Embedded Asset Paths & Build Standalone Desktop Binary
+        shell: bash
+        run: |
+          CSS_FILE=$(basename dist/assets/*.css)
+          JS_FILE=$(basename dist/assets/*.js)
+          sed -i.bak "s|index-[A-Za-z0-9_-]*\.css|${CSS_FILE}|g" src-tauri/src/lib.rs
+          sed -i.bak "s|index-[A-Za-z0-9_-]*\.js|${JS_FILE}|g" src-tauri/src/lib.rs
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Binary
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "${{ matrix.artifact_name }}"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+
+      - name: Publish to GitHub Release v0.1.0
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.0
+          name: "Hide-Go Desktop v0.1.0 (Windows / macOS / Linux)"
+          body: |
+            Hide-Go 单文件桌面端（已内嵌完整图形界面，零外部依赖，双击或直接执行即可启动本地隐私网关并弹出桌面控制台）：
+            - **Windows (x64)**: `hide-go-desktop-windows-x64.exe`
+            - **macOS (Apple Silicon arm64)**: `hide-go-desktop-macos-arm64`
+            - **Linux (x86_64)**: `hide-go-desktop-linux-x86_64`
+          files: ${{ matrix.artifact_name }}
+          prerelease: false
