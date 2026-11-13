@@ -1,16 +1,42 @@
-name: Build Cross-Platform Desktop Executables (Windows / macOS / Linux)
+name: CI & Release
 
 on:
   push:
     branches: [main]
     tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-desktop:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Build frontend (type-check + bundle)
+        run: |
+          npm ci
+          npm run build
+      - name: Verify committed dist/ matches sources
+        run: git diff --exit-code -- dist
+      - name: Rust format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+
+  build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -27,57 +53,53 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact_name: hide-go-desktop-windows-x64.exe
             bin_name: hide-go-desktop.exe
-
     runs-on: ${{ matrix.os }}
-
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Build Frontend Assets
+      - name: Build frontend
         run: |
-          npm install
+          npm ci
           npm run build
-
-      - name: Update Embedded Asset Paths & Build Standalone Desktop Binary
-        shell: bash
-        run: |
-          CSS_FILE=$(basename dist/assets/*.css)
-          JS_FILE=$(basename dist/assets/*.js)
-          sed -i.bak "s|index-[A-Za-z0-9_-]*\.css|${CSS_FILE}|g" src-tauri/src/lib.rs
-          sed -i.bak "s|index-[A-Za-z0-9_-]*\.js|${JS_FILE}|g" src-tauri/src/lib.rs
-          cargo build --release --target ${{ matrix.target }}
-
-      - name: Package Binary
+      - name: Build desktop binary
+        run: cargo build --release --locked -p hide-go-desktop --target ${{ matrix.target }}
+      - name: Package binary and checksum
         shell: bash
         run: |
           cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "${{ matrix.artifact_name }}"
-
-      - name: Upload Build Artifact
-        uses: actions/upload-artifact@v4
+          if command -v sha256sum >/dev/null; then sha256sum "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256"; \
+          else shasum -a 256 "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256"; fi
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}
+            ${{ matrix.artifact_name }}.sha256
 
-      - name: Publish to GitHub Release v0.1.0
-        uses: softprops/action-gh-release@v2
+  release:
+    # Releases are cut only from version tags, so every binary matches its tagged source.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
         with:
-          tag_name: v0.1.0
-          name: "Hide-Go Desktop v0.1.0 (Windows / macOS / Linux)"
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Hide-Go ${{ github.ref_name }}
           body: |
-            Hide-Go 单文件桌面端（已内嵌完整图形界面，零外部依赖，双击或直接执行即可启动本地隐私网关并弹出桌面控制台）：
-            - **Windows (x64)**: `hide-go-desktop-windows-x64.exe`
-            - **macOS (Apple Silicon arm64)**: `hide-go-desktop-macos-arm64`
-            - **Linux (x86_64)**: `hide-go-desktop-linux-x86_64`
-          files: ${{ matrix.artifact_name }}
-          prerelease: false
+            Hide-Go 单文件桌面端（内嵌控制台界面，启动后在 127.0.0.1 运行本地隐私网关）。
+            每个二进制附带 `.sha256` 校验文件。macOS / Windows 版本未做代码签名，首次运行需手动放行。
+          files: artifacts/*
+          fail_on_unmatched_files: true
