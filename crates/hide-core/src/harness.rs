@@ -15,6 +15,8 @@ pub struct HarnessProfile {
     pub risk_summary: Vec<String>,
     pub env_setup_bash: String,
     pub env_setup_powershell: String,
+    /// Known limitation of routing this tool through a local gateway, if any.
+    pub integration_note: Option<String>,
     pub detected_active: bool,
 }
 
@@ -45,6 +47,7 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "$env:ANTHROPIC_BASE_URL=\"{}/claude-code\"\nclaude",
                 base
             ),
+            integration_note: None,
             detected_active: true,
         },
         HarnessProfile {
@@ -69,6 +72,7 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "$env:OPENAI_BASE_URL=\"{}/codex/v1\"\ncodex",
                 base
             ),
+            integration_note: None,
             detected_active: true,
         },
         HarnessProfile {
@@ -85,14 +89,9 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "系统提示词中包含宿主机用户名、工作区目录结构与 Git 远端地址".to_string(),
                 "长上下文窗口一次性聚合大量私有架构设计与内部接口定义".to_string(),
             ],
-            env_setup_bash: format!(
-                "export ANTIGRAVITY_API_BASE=\"{}/antigravity\"\nexport HTTPS_PROXY=\"{}\"",
-                base, base
-            ),
-            env_setup_powershell: format!(
-                "$env:ANTIGRAVITY_API_BASE=\"{}/antigravity\"\n$env:HTTPS_PROXY=\"{}\"",
-                base, base
-            ),
+            env_setup_bash: format!("export ANTIGRAVITY_API_BASE=\"{}/antigravity\"", base),
+            env_setup_powershell: format!("$env:ANTIGRAVITY_API_BASE=\"{}/antigravity\"", base),
+            integration_note: Some("需客户端支持自定义 Gemini Base URL；Hide-Go 不是 HTTPS CONNECT 代理，不能通过 HTTPS_PROXY 接入。".to_string()),
             detected_active: true,
         },
         HarnessProfile {
@@ -117,6 +116,7 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "$env:ZCODE_API_BASE=\"{}/zcode/v1\"\n$env:OPENAI_BASE_URL=\"{}/zcode/v1\"",
                 base, base
             ),
+            integration_note: None,
             detected_active: true,
         },
         HarnessProfile {
@@ -133,14 +133,9 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "跨模块调用链分析会将核心算法实现与内部 RPC 协议发送至云端".to_string(),
                 "持续心跳与行为遥测记录开发者编辑历史".to_string(),
             ],
-            env_setup_bash: format!(
-                "export QODER_BASE_URL=\"{}/qoder\"\nqoder --proxy-url \"{}\"",
-                base, base
-            ),
-            env_setup_powershell: format!(
-                "$env:QODER_BASE_URL=\"{}/qoder\"\nqoder --proxy-url \"{}\"",
-                base, base
-            ),
+            env_setup_bash: format!("export QODER_BASE_URL=\"{}/qoder\"\nqoder", base),
+            env_setup_powershell: format!("$env:QODER_BASE_URL=\"{}/qoder\"\nqoder", base),
+            integration_note: Some("仅当客户端允许覆盖 API Base URL 时可接入；内置索引通道若不读取该变量将不会经过网关。".to_string()),
             detected_active: true,
         },
         HarnessProfile {
@@ -165,6 +160,7 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "# Cursor Settings -> Models -> Override OpenAI Base URL:\n{}/cursor/v1",
                 base
             ),
+            integration_note: Some("Cursor 的自定义 Base URL 请求由 Cursor 服务器转发，无法直接访问 127.0.0.1；需要通过你自己的 HTTPS 隧道暴露网关，并自行承担暴露风险。".to_string()),
             detected_active: true,
         },
         HarnessProfile {
@@ -189,85 +185,108 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "$env:XAI_BASE_URL=\"{}/grok-build/v1\"\ngrok-build",
                 base
             ),
+            integration_note: None,
             detected_active: true,
         },
     ]
 }
 
-/// Inspects the URL path prefix, User-Agent header, and JSON payload keys to determine
-/// both `HarnessKind` and `TrafficCategory`.
-pub fn detect_harness_and_category(
-    path: &str,
-    user_agent: Option<&str>,
-    body: &str,
-) -> (HarnessKind, TrafficCategory) {
+/// Model-inference endpoints. Requests to these are always forwarded upstream, never
+/// answered locally, whatever their body contains.
+pub fn is_inference_endpoint(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    [
+        "/v1/messages",
+        "/chat/completions",
+        "/v1/completions",
+        "/v1/responses",
+        ":generatecontent",
+        ":streamgeneratecontent",
+        "/v1/complete",
+    ]
+    .iter()
+    .any(|e| p.contains(e))
+        && !p.contains("/count_tokens")
+}
+
+/// Inspects the URL path prefix and User-Agent to determine both `HarnessKind` and
+/// `TrafficCategory`. Classification is path-based on purpose: request bodies are user
+/// content, and a tool schema that merely mentions `event_type` must not turn a chat request
+/// into "telemetry" that gets answered locally.
+pub fn detect_harness_and_category(path: &str, user_agent: Option<&str>, body: &str) -> (HarnessKind, TrafficCategory) {
     let path_lower = path.to_lowercase();
     let ua_lower = user_agent.unwrap_or_default().to_lowercase();
-    let body_lower = body.to_lowercase();
 
-    // 1. Determine HarnessKind from route prefix, User-Agent, or payload structure
-    let harness = if path_lower.starts_with("/claude-code")
-        || ua_lower.contains("claude-code")
-        || ua_lower.contains("anthropic")
-        || path_lower.contains("/v1/messages")
-    {
+    let harness = if path_lower.starts_with("/claude-code") {
         HarnessKind::ClaudeCode
-    } else if path_lower.starts_with("/codex")
-        || ua_lower.contains("codex")
-        || ua_lower.contains("openai-codex")
-        || path_lower.contains("/v1/responses")
-    {
+    } else if path_lower.starts_with("/codex") {
         HarnessKind::Codex
-    } else if path_lower.starts_with("/antigravity")
-        || ua_lower.contains("antigravity")
-        || path_lower.contains("generatecontent")
-    {
+    } else if path_lower.starts_with("/antigravity") {
         HarnessKind::Antigravity
-    } else if path_lower.starts_with("/zcode") || ua_lower.contains("zcode") {
+    } else if path_lower.starts_with("/zcode") {
         HarnessKind::Zcode
-    } else if path_lower.starts_with("/qoder") || ua_lower.contains("qoder") {
+    } else if path_lower.starts_with("/qoder") {
         HarnessKind::Qoder
-    } else if path_lower.starts_with("/cursor") || ua_lower.contains("cursor") {
+    } else if path_lower.starts_with("/cursor") {
         HarnessKind::Cursor
-    } else if path_lower.starts_with("/grok-build")
-        || ua_lower.contains("grok")
-        || ua_lower.contains("xai")
-        || body_lower.contains("\"grok-")
-    {
+    } else if path_lower.starts_with("/grok-build") {
+        HarnessKind::GrokBuild
+    } else if ua_lower.contains("claude-cli") || ua_lower.contains("claude-code") {
+        HarnessKind::ClaudeCode
+    } else if ua_lower.contains("codex") {
+        HarnessKind::Codex
+    } else if ua_lower.contains("antigravity") {
+        HarnessKind::Antigravity
+    } else if ua_lower.contains("zcode") {
+        HarnessKind::Zcode
+    } else if ua_lower.contains("qoder") {
+        HarnessKind::Qoder
+    } else if ua_lower.contains("cursor") {
+        HarnessKind::Cursor
+    } else if ua_lower.contains("grok") || ua_lower.contains("xai") {
         HarnessKind::GrokBuild
     } else {
         HarnessKind::Generic
     };
 
-    // 2. Determine TrafficCategory from path keywords and JSON payload keys
-    let category = if path_lower.contains("telemetry")
-        || path_lower.contains("event_logging")
-        || path_lower.contains("analytics")
-        || path_lower.contains("metrics")
-        || path_lower.contains("/events")
-        || body_lower.contains("\"event_type\"")
-        || body_lower.contains("\"telemetry\"")
-        || body_lower.contains("\"client_metrics\"")
+    let segments: Vec<&str> = path_lower.split(['/', '?', ':']).filter(|s| !s.is_empty()).collect();
+    let has_segment = |names: &[&str]| segments.iter().any(|s| names.contains(s));
+
+    let category = if is_inference_endpoint(&path_lower) {
+        if body.contains("\"tool_result\"")
+            || body.contains("\"function_call_output\"")
+            || body.contains("\"role\":\"tool\"")
+        {
+            TrafficCategory::ToolExecutionSync
+        } else {
+            TrafficCategory::InteractivePrompt
+        }
+    } else if has_segment(&[
+        "telemetry",
+        "event_logging",
+        "analytics",
+        "metrics",
+        "events",
+        "traces",
+        "logs",
+        "rgstr",
+    ]) || path_lower.contains("event_logging")
     {
         TrafficCategory::Telemetry
-    } else if path_lower.contains("index")
-        || path_lower.contains("embeddings")
-        || path_lower.contains("merkle")
-        || path_lower.contains("codebase_sync")
-        || path_lower.contains("vector")
-        || body_lower.contains("\"code_chunks\"")
-        || body_lower.contains("\"merkle_root\"")
-        || body_lower.contains("\"embedding\"")
-        || body_lower.contains("\"repository_index\"")
+    } else if has_segment(&[
+        "embeddings",
+        "embedding",
+        "index",
+        "indexing",
+        "index-sync",
+        "codebase",
+        "merkle",
+        "vector",
+        "repo-service",
+        "upload-chunks",
+    ]) || path_lower.contains("codebase_sync")
     {
         TrafficCategory::CodebaseIndexing
-    } else if path_lower.contains("tool_output")
-        || path_lower.contains("tool_result")
-        || body_lower.contains("\"tool_result\"")
-        || body_lower.contains("\"function_call_output\"")
-        || body_lower.contains("\"tool_call_id\"")
-    {
-        TrafficCategory::ToolExecutionSync
     } else {
         TrafficCategory::InteractivePrompt
     };

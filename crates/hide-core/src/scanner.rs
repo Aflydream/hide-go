@@ -1,8 +1,9 @@
-use crate::config::{FindingKind, HideConfig};
+use crate::config::{CustomRule, FindingKind, HideConfig};
 use once_cell::sync::Lazy;
-use regex::Regex;
+use parking_lot::Mutex;
+use regex::{Regex, RegexBuilder};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 struct BuiltinRule {
     kind: FindingKind,
@@ -12,120 +13,171 @@ struct BuiltinRule {
     capture_group: usize,
 }
 
+fn rule(kind: FindingKind, label: &'static str, severity: &'static str, re: &str, capture_group: usize) -> BuiltinRule {
+    BuiltinRule {
+        kind,
+        label,
+        severity,
+        regex: Regex::new(re).expect("valid builtin regex"),
+        capture_group,
+    }
+}
+
 static BUILTIN_RULES: Lazy<Vec<BuiltinRule>> = Lazy::new(|| {
+    use FindingKind::*;
     vec![
-        // Private Key (Full multi-line PEM block or unclosed PEM header+body)
-        BuiltinRule {
-            kind: FindingKind::PrivateKey,
-            label: "PEM Private Key",
-            severity: "critical",
-            regex: Regex::new(
-                r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----|[A-Za-z0-9+/=\r\n\t \\]*)",
-            )
-            .expect("valid regex"),
-            capture_group: 0,
-        },
-        // API Keys
-        BuiltinRule {
-            kind: FindingKind::ApiKey,
-            label: "Anthropic API Key",
-            severity: "critical",
-            regex: Regex::new(r"sk-ant-[a-zA-Z0-9_-]{16,}").expect("valid regex"),
-            capture_group: 0,
-        },
-        BuiltinRule {
-            kind: FindingKind::ApiKey,
-            label: "OpenAI / Generic Secret Key",
-            severity: "critical",
-            regex: Regex::new(r"sk-[a-zA-Z0-9_-]{16,}").expect("valid regex"),
-            capture_group: 0,
-        },
-        BuiltinRule {
-            kind: FindingKind::ApiKey,
-            label: "AWS Access Key ID",
-            severity: "critical",
-            regex: Regex::new(r"AKIA[0-9A-Z]{16}").expect("valid regex"),
-            capture_group: 0,
-        },
-        BuiltinRule {
-            kind: FindingKind::ApiKey,
-            label: "GitHub Personal Access Token",
-            severity: "critical",
-            regex: Regex::new(r"(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9]{20,}|github_pat_[a-zA-Z0-9_]{20,}")
-                .expect("valid regex"),
-            capture_group: 0,
-        },
-        BuiltinRule {
-            kind: FindingKind::ApiKey,
-            label: "xAI Grok API Key",
-            severity: "critical",
-            regex: Regex::new(r"xai-[a-zA-Z0-9_-]{16,}").expect("valid regex"),
-            capture_group: 0,
-        },
-        // Database URL
-        BuiltinRule {
-            kind: FindingKind::DatabaseUrl,
-            label: "Database Connection URI",
-            severity: "critical",
-            regex: Regex::new(
-                r#"(?:postgres|postgresql|mysql|mongodb|mongodb\+srv|redis|rediss)://[^\s'`]+"#,
-            )
-            .expect("valid regex"),
-            capture_group: 0,
-        },
-        // Env Secret (supports both ENV=val and JSON {"PASSWORD": "val"} syntax)
-        BuiltinRule {
-            kind: FindingKind::EnvSecret,
-            label: "Environment / Config Secret",
-            severity: "high",
-            regex: Regex::new(
-                r#"(?i)["']?\b(?:PASSWORD|PASSWD|SECRET|SECRET_KEY|TOKEN|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|DB_PASS|DB_PASSWORD|ACCESS_KEY|API_KEY|APIKEY|CLIENT_SECRET)\b["']?\s*[=:]\s*["']?([^"'\s,}\]]+)"#,
-            )
-            .expect("valid regex"),
-            capture_group: 1,
-        },
-        // Internal IP
-        BuiltinRule {
-            kind: FindingKind::InternalIp,
-            label: "Private Intranet IPv4",
-            severity: "high",
-            regex: Regex::new(
-                r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})\b",
-            )
-            .expect("valid regex"),
-            capture_group: 0,
-        },
-        // Internal Domain
-        BuiltinRule {
-            kind: FindingKind::InternalDomain,
-            label: "Internal Corporate Domain",
-            severity: "medium",
-            regex: Regex::new(r"\b[a-zA-Z0-9.-]+\.(?:internal|corp|local|lan|intranet)\b")
-                .expect("valid regex"),
-            capture_group: 0,
-        },
-        // Project Path (Linux, macOS, and Windows single/double-backslash paths)
-        BuiltinRule {
-            kind: FindingKind::ProjectPath,
-            label: "Local Workspace Path",
-            severity: "medium",
-            regex: Regex::new(
-                r#"(?:/home/[a-zA-Z0-9._-]+/[^\s"'`:,<>\\]+|/Users/[a-zA-Z0-9._-]+/[^\s"'`:,<>\\]+|[a-zA-Z]:(?:\\\\|\\)[a-zA-Z0-9._-]+(?:(?:\\\\|\\)[a-zA-Z0-9._-]+)+)"#,
-            )
-            .expect("valid regex"),
-            capture_group: 0,
-        },
-        // Email or PII
-        BuiltinRule {
-            kind: FindingKind::EmailOrPii,
-            label: "Developer Email / Identity",
-            severity: "medium",
-            regex: Regex::new(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b")
-                .expect("valid regex"),
-            capture_group: 0,
-        },
+        rule(
+            PrivateKey,
+            "PEM Private Key",
+            "critical",
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----|[A-Za-z0-9+/=\r\n\t \\]*)",
+            0,
+        ),
+        // `\b` keeps kebab-case words such as `risk-assessment` from matching `sk-…`.
+        rule(
+            ApiKey,
+            "Anthropic API Key",
+            "critical",
+            r"\bsk-ant-[a-zA-Z0-9_-]{16,}",
+            0,
+        ),
+        rule(
+            ApiKey,
+            "OpenAI / Generic Secret Key",
+            "critical",
+            r"\bsk-[a-zA-Z0-9_-]{16,}",
+            0,
+        ),
+        rule(ApiKey, "AWS Access Key ID", "critical", r"\bAKIA[0-9A-Z]{16}\b", 0),
+        rule(
+            ApiKey,
+            "GitHub Personal Access Token",
+            "critical",
+            r"\b(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9]{20,}|\bgithub_pat_[a-zA-Z0-9_]{20,}",
+            0,
+        ),
+        rule(ApiKey, "xAI Grok API Key", "critical", r"\bxai-[a-zA-Z0-9_-]{16,}", 0),
+        rule(
+            DatabaseUrl,
+            "Database Connection URI",
+            "critical",
+            r#"\b(?:postgres|postgresql|mysql|mongodb|mongodb\+srv|redis|rediss)://[^\s'`]+"#,
+            0,
+        ),
+        rule(
+            EnvSecret,
+            "Environment / Config Secret",
+            "high",
+            r#"(?i)["']?\b(?:PASSWORD|PASSWD|SECRET|SECRET_KEY|TOKEN|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|DB_PASS|DB_PASSWORD|ACCESS_KEY|API_KEY|APIKEY|CLIENT_SECRET)\b["']?\s*[=:]\s*"([^"\r\n]+)""#,
+            1,
+        ),
+        rule(
+            EnvSecret,
+            "Environment / Config Secret",
+            "high",
+            r#"(?i)["']?\b(?:PASSWORD|PASSWD|SECRET|SECRET_KEY|TOKEN|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|DB_PASS|DB_PASSWORD|ACCESS_KEY|API_KEY|APIKEY|CLIENT_SECRET)\b["']?\s*[=:]\s*'([^'\r\n]+)'"#,
+            1,
+        ),
+        rule(
+            EnvSecret,
+            "Environment / Config Secret",
+            "high",
+            r#"(?i)["']?\b(?:PASSWORD|PASSWD|SECRET|SECRET_KEY|TOKEN|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|DB_PASS|DB_PASSWORD|ACCESS_KEY|API_KEY|APIKEY|CLIENT_SECRET)\b["']?\s*[=:]\s*([^\s,;\}\]"']+)"#,
+            1,
+        ),
+        rule(
+            InternalIp,
+            "Private Intranet IPv4",
+            "high",
+            r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})\b",
+            0,
+        ),
+        rule(
+            InternalDomain,
+            "Internal Corporate Domain",
+            "medium",
+            r"\b[a-zA-Z0-9][a-zA-Z0-9.-]*\.(?:internal|corp|local|lan|intranet)\b",
+            0,
+        ),
+        // Only the identifying root (`/home/<user>`, `C:\Users\<user>`, `D:\<first>`) is masked,
+        // so directory structure and file names stay intact for the model and new paths restore.
+        rule(
+            ProjectPath,
+            "Local Workspace Path",
+            "medium",
+            r"(?:^|[^A-Za-z0-9._/~-])(/(?:home|Users)/[A-Za-z0-9._-]+)",
+            1,
+        ),
+        rule(
+            ProjectPath,
+            "Local Workspace Path",
+            "medium",
+            r"\b([A-Za-z]:(?:\\\\|\\)[Uu]sers(?:\\\\|\\)[A-Za-z0-9._-]+)",
+            1,
+        ),
+        rule(
+            ProjectPath,
+            "Local Workspace Path",
+            "medium",
+            r"\b([A-Za-z]:(?:\\\\|\\)[A-Za-z0-9._-]+)(?:\\\\|\\)[A-Za-z0-9._-]",
+            1,
+        ),
+        rule(
+            EmailOrPii,
+            "Developer Email / Identity",
+            "medium",
+            r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b",
+            0,
+        ),
     ]
 });
+
+const CUSTOM_REGEX_SIZE_LIMIT: usize = 1 << 20;
+
+static CUSTOM_REGEX_CACHE: Lazy<Mutex<HashMap<String, Result<Regex, String>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Compile (and cache) a user rule with the same engine the gateway uses at runtime.
+pub fn compile_custom_regex(pattern: &str) -> Result<Regex, String> {
+    let mut cache = CUSTOM_REGEX_CACHE.lock();
+    if let Some(hit) = cache.get(pattern) {
+        return hit.clone();
+    }
+    let compiled = RegexBuilder::new(pattern)
+        .size_limit(CUSTOM_REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|e| {
+            e.to_string()
+                .lines()
+                .last()
+                .unwrap_or("invalid regex")
+                .trim()
+                .to_string()
+        })
+        .and_then(|re| {
+            if re.is_match("") {
+                Err("pattern matches the empty string".to_string())
+            } else {
+                Ok(re)
+            }
+        });
+    if cache.len() > 512 {
+        cache.clear();
+    }
+    cache.insert(pattern.to_string(), compiled.clone());
+    compiled
+}
+
+/// Reject rules the runtime engine cannot apply, instead of silently skipping them.
+pub fn validate_custom_rules(rules: &[CustomRule]) -> Result<(), String> {
+    for rule in rules {
+        if rule.pattern.trim().is_empty() {
+            return Err(format!("规则「{}」的正则表达式为空", rule.name));
+        }
+        compile_custom_regex(&rule.pattern).map_err(|e| format!("规则「{}」无法编译：{}", rule.name, e))?;
+    }
+    Ok(())
+}
 
 /// Check if a JSON object property key represents a sensitive secret / credential field
 pub fn is_sensitive_secret_key(key: &str) -> bool {
@@ -166,58 +218,194 @@ pub fn is_placeholder_token(val: &str) -> bool {
     let trimmed = val.trim();
     (trimmed.starts_with("<<") && trimmed.ends_with(">>"))
         || trimmed.starts_with("⟦HIDE-CIPHER::")
-        || trimmed.starts_with("⟦HG_LIT_")
         || trimmed.starts_with("sk-sem-placeholder-key-")
         || trimmed.contains("db_pass_placeholder_")
-        || trimmed.contains("/workspace/sandbox_proj/")
-        || trimmed.contains("\\workspace\\sandbox_proj\\")
+        || trimmed.contains("/workspace/user_")
+        || trimmed.contains("workspace\\user_")
+        || trimmed.contains("workspace\\\\user_")
         || trimmed.ends_with(".example.internal")
         || trimmed.ends_with("@sandbox.example.org")
+}
+
+fn is_non_secret_env_token(raw: &str, is_quoted: bool) -> bool {
+    if is_quoted {
+        return false;
+    }
+    if raw.starts_with(['&', '<', '[', '(', '{']) || raw.contains("->") || raw.ends_with(['>', ']', ')']) {
+        return true;
+    }
+    matches!(
+        raw.to_ascii_lowercase().as_str(),
+        "string"
+            | "str"
+            | "int"
+            | "integer"
+            | "int32"
+            | "int64"
+            | "uint"
+            | "usize"
+            | "i32"
+            | "i64"
+            | "u32"
+            | "u64"
+            | "f32"
+            | "f64"
+            | "number"
+            | "float"
+            | "double"
+            | "bool"
+            | "boolean"
+            | "true"
+            | "false"
+            | "null"
+            | "none"
+            | "nil"
+            | "undefined"
+            | "any"
+            | "unknown"
+            | "never"
+            | "void"
+            | "object"
+            | "bytes"
+            | "byte"
+            | "char"
+            | "optional"
+            | "required"
+            | "readonly"
+            | "please"
+    )
+}
+
+fn is_placeholder_windows_workspace(raw: &str, tail: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    (lower.ends_with(":\\workspace") || lower.ends_with(":\\\\workspace"))
+        && (tail.starts_with("\\user_") || tail.starts_with("\\\\user_"))
 }
 
 /// Clean trailing quote/punctuation from a matched Database URL when it was enclosed in quotes in prose
 pub fn clean_database_url_match(raw: &str) -> &str {
     let mut s = raw;
     while let Some(last) = s.chars().last() {
-        if matches!(last, '"' | ',' | ';' | ')' | ']' | '}') {
+        if matches!(last, '"' | ',' | ';' | ')' | ']' | '}' | '.') {
             s = &s[..s.len() - last.len_utf8()];
         } else {
             break;
         }
     }
-    // If raw had a trailing `\` from raw JSON `\"` before unescaping, strip that trailing `\`
     if s.ends_with('\\') && !raw.ends_with("\\\\") {
         s = &s[..s.len() - 1];
     }
     s
 }
 
+/// A sensitive match located in the scanned text.
+#[derive(Debug, Clone)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    pub kind: FindingKind,
+    pub label: String,
+    pub severity: String,
+}
+
+fn rule_enabled(kind: FindingKind, config: &HideConfig) -> bool {
+    match kind {
+        FindingKind::ApiKey | FindingKind::PrivateKey | FindingKind::DatabaseUrl | FindingKind::EnvSecret => {
+            config.protect_secrets_and_keys
+        }
+        FindingKind::InternalIp | FindingKind::InternalDomain => config.protect_internal_network,
+        FindingKind::ProjectPath | FindingKind::EmailOrPii => config.protect_project_paths,
+        _ => true,
+    }
+}
+
+/// Positional scan of plain text. Spans may overlap; callers resolve overlaps.
+/// Custom rules come first so project codenames win ties against generic detectors.
+pub fn scan_spans(text: &str, config: &HideConfig) -> Vec<Span> {
+    let mut spans = Vec::new();
+    for rule in config
+        .custom_rules
+        .iter()
+        .filter(|r| r.enabled && !r.pattern.trim().is_empty())
+    {
+        if let Ok(re) = compile_custom_regex(&rule.pattern) {
+            for m in re.find_iter(text) {
+                if !m.as_str().is_empty() && !is_placeholder_token(m.as_str()) {
+                    spans.push(Span {
+                        start: m.start(),
+                        end: m.end(),
+                        kind: FindingKind::CustomKeyword,
+                        label: rule.name.clone(),
+                        severity: "high".to_string(),
+                    });
+                }
+            }
+        }
+    }
+    for rule in BUILTIN_RULES.iter().filter(|r| rule_enabled(r.kind, config)) {
+        for caps in rule.regex.captures_iter(text) {
+            let Some(m) = caps.get(rule.capture_group) else {
+                continue;
+            };
+            let mut end = m.end();
+            if rule.kind == FindingKind::DatabaseUrl {
+                end = m.start() + clean_database_url_match(m.as_str()).len();
+            }
+            let raw = &text[m.start()..end];
+            if raw.len() < 3 || is_placeholder_token(raw) {
+                continue;
+            }
+            if rule.kind == FindingKind::EnvSecret {
+                let is_quoted =
+                    matches!(text.as_bytes().get(m.start().wrapping_sub(1)), Some(b'"' | b'\'')) && m.start() > 0;
+                if is_non_secret_env_token(raw, is_quoted) {
+                    continue;
+                }
+            }
+            if rule.kind == FindingKind::ProjectPath && is_placeholder_windows_workspace(raw, &text[end..]) {
+                continue;
+            }
+            spans.push(Span {
+                start: m.start(),
+                end,
+                kind: rule.kind,
+                label: rule.label.to_string(),
+                severity: rule.severity.to_string(),
+            });
+        }
+    }
+    spans
+}
+
+/// Pick non-overlapping spans: earliest start first, longer span on ties, custom rules on equal extent.
+pub fn resolve_overlaps(mut spans: Vec<Span>) -> Vec<Span> {
+    spans.sort_by(|a, b| a.start.cmp(&b.start).then((b.end - b.start).cmp(&(a.end - a.start))));
+    let mut out: Vec<Span> = Vec::with_capacity(spans.len());
+    for s in spans {
+        if out.last().is_some_and(|last| s.start < last.end) {
+            continue;
+        }
+        out.push(s);
+    }
+    out
+}
+
 /// Project-level sensitive data scanner powered by compiled regular expressions and JSON-aware traversal.
 pub struct ProjectScanner;
 
 impl ProjectScanner {
-    /// Scans `payload` against enabled `HideConfig` protections and custom rules.
-    /// If `payload` is valid JSON, traverses the parsed JSON structure (including unescaped strings
-    /// and sensitive key-value pairs) so escaped values and `{"PASSWORD":"s3cr3t"}` are never missed.
-    /// Returns `(kind, label, matched_raw_value, severity)` deduplicated by `matched_raw_value` while preserving order.
+    /// Returns `(kind, label, matched_raw_value, severity)` deduplicated by raw value, preserving order.
     #[allow(non_snake_case)]
-    pub fn scan_Matches(
-        payload: &str,
-        config: &HideConfig,
-    ) -> Vec<(FindingKind, String, String, String)> {
+    pub fn scan_Matches(payload: &str, config: &HideConfig) -> Vec<(FindingKind, String, String, String)> {
         let mut results = Vec::new();
         let mut seen = HashSet::new();
-
         let trimmed = payload.trim();
-        if (trimmed.starts_with('{') || trimmed.starts_with('[') || trimmed.starts_with('"'))
-            && serde_json::from_str::<Value>(trimmed).is_ok()
-        {
+        if trimmed.starts_with(['{', '[', '"']) {
             if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
                 Self::scan_json_value(&val, config, &mut results, &mut seen);
                 return results;
             }
         }
-
         Self::scan_plain_text_into(payload, config, &mut results, &mut seen);
         results
     }
@@ -231,37 +419,37 @@ impl ProjectScanner {
         match val {
             Value::Object(map) => {
                 for (k, v) in map {
+                    Self::scan_plain_text_into(k, config, results, seen);
                     if config.protect_secrets_and_keys && is_sensitive_secret_key(k) {
-                        if let Value::String(secret_val) = v {
-                            let s = secret_val.trim();
-                            if !s.is_empty()
-                                && !is_placeholder_token(s)
-                                && seen.insert(secret_val.clone())
-                            {
+                        let raw = match v {
+                            Value::String(s) if !s.trim().is_empty() && !is_placeholder_token(s) => Some(s.clone()),
+                            Value::Number(_) | Value::Bool(_) => Some(v.to_string()),
+                            _ => None,
+                        };
+                        if let Some(raw) = raw {
+                            if seen.insert(raw.clone()) {
                                 results.push((
                                     FindingKind::EnvSecret,
                                     "Environment / Config Secret".to_string(),
-                                    secret_val.clone(),
+                                    raw,
                                     "high".to_string(),
                                 ));
                             }
+                            continue;
                         }
                     }
                     Self::scan_json_value(v, config, results, seen);
                 }
             }
-            Value::Array(arr) => {
-                for item in arr {
-                    Self::scan_json_value(item, config, results, seen);
-                }
-            }
+            Value::Array(arr) => arr
+                .iter()
+                .for_each(|item| Self::scan_json_value(item, config, results, seen)),
             Value::String(s) => {
                 let st = s.trim();
-                if (st.starts_with('{') || st.starts_with('['))
-                    && serde_json::from_str::<Value>(st).is_ok()
-                {
+                if st.starts_with(['{', '[']) {
                     if let Ok(inner) = serde_json::from_str::<Value>(st) {
                         Self::scan_json_value(&inner, config, results, seen);
+                        return;
                     }
                 }
                 Self::scan_plain_text_into(s, config, results, seen);
@@ -276,133 +464,84 @@ impl ProjectScanner {
         results: &mut Vec<(FindingKind, String, String, String)>,
         seen: &mut HashSet<String>,
     ) {
-        // If payload contains literal `\u00` JSON-style unicode escapes inside raw text, also scan decoded form
-        let decoded_unicode = unescape_inline_unicode(payload);
-        let target = decoded_unicode.as_deref().unwrap_or(payload);
-
-        // 1. Evaluate custom user rules first so high-priority project codenames / domains are captured
-        for rule in &config.custom_rules {
-            if !rule.enabled || rule.pattern.trim().is_empty() {
-                continue;
-            }
-            if let Ok(re) = Regex::new(&rule.pattern) {
-                for mat in re.find_iter(target) {
-                    let raw = mat.as_str().to_string();
-                    if !raw.is_empty() && !is_placeholder_token(&raw) && seen.insert(raw.clone()) {
-                        results.push((
-                            FindingKind::CustomKeyword,
-                            rule.name.clone(),
-                            raw,
-                            "high".to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-
-        // 2. Evaluate built-in pattern detectors gated by HideConfig flags
-        for rule in BUILTIN_RULES.iter() {
-            let allowed = match rule.kind {
-                FindingKind::ApiKey
-                | FindingKind::PrivateKey
-                | FindingKind::DatabaseUrl
-                | FindingKind::EnvSecret => config.protect_secrets_and_keys,
-                FindingKind::InternalIp | FindingKind::InternalDomain => {
-                    config.protect_internal_network
-                }
-                FindingKind::ProjectPath | FindingKind::EmailOrPii => config.protect_project_paths,
-                _ => true,
-            };
-
-            if !allowed {
-                continue;
-            }
-
-            if rule.capture_group == 0 {
-                for mat in rule.regex.find_iter(target) {
-                    let matched_str = if rule.kind == FindingKind::DatabaseUrl {
-                        clean_database_url_match(mat.as_str())
-                    } else {
-                        mat.as_str()
-                    };
-                    let raw = matched_str.to_string();
-                    if !raw.is_empty() && !is_placeholder_token(&raw) && seen.insert(raw.clone()) {
-                        results.push((
-                            rule.kind,
-                            rule.label.to_string(),
-                            raw,
-                            rule.severity.to_string(),
-                        ));
-                    }
-                }
-            } else {
-                for caps in rule.regex.captures_iter(target) {
-                    if let Some(m) = caps.get(rule.capture_group) {
-                        let raw = m.as_str().to_string();
-                        if !raw.is_empty()
-                            && !is_placeholder_token(&raw)
-                            && seen.insert(raw.clone())
-                        {
-                            results.push((
-                                rule.kind,
-                                rule.label.to_string(),
-                                raw,
-                                rule.severity.to_string(),
-                            ));
-                        }
-                    }
-                }
+        let decoded = decode_inline_unicode(payload);
+        let target = decoded.as_ref().map_or(payload, |d| d.text.as_str());
+        for span in resolve_overlaps(scan_spans(target, config)) {
+            let raw = target[span.start..span.end].to_string();
+            if seen.insert(raw.clone()) {
+                results.push((span.kind, span.label, raw, span.severity));
             }
         }
     }
 
     /// Snake-case alias for `scan_Matches`.
-    pub fn scan_matches(
-        payload: &str,
-        config: &HideConfig,
-    ) -> Vec<(FindingKind, String, String, String)> {
+    pub fn scan_matches(payload: &str, config: &HideConfig) -> Vec<(FindingKind, String, String, String)> {
         Self::scan_Matches(payload, config)
     }
 }
 
-/// Unescape `\uXXXX` sequences in raw non-JSON text if present
-pub(crate) fn unescape_inline_unicode(input: &str) -> Option<String> {
-    if !input.contains("\\u00") && !input.contains("\\u0") {
+/// Text with `\uXXXX` escapes decoded, plus a map from decoded byte offsets back to the source.
+pub struct DecodedText {
+    pub text: String,
+    /// `origin[i]` is the source byte offset of decoded byte `i`; one extra trailing entry.
+    origin: Vec<usize>,
+}
+
+impl DecodedText {
+    pub fn source_offset(&self, decoded: usize) -> usize {
+        self.origin[decoded]
+    }
+}
+
+/// Decode inline `\uXXXX` escapes for detection only. Returns `None` when there are none.
+pub fn decode_inline_unicode(input: &str) -> Option<DecodedText> {
+    if !input.contains("\\u") {
         return None;
     }
-    static UNICODE_ESC_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"\\u([0-9a-fA-F]{4})").unwrap());
+    static UNICODE_ESC_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\\u([0-9a-fA-F]{4})").unwrap());
+    let mut text = String::with_capacity(input.len());
+    let mut origin = Vec::with_capacity(input.len() + 1);
+    let mut last = 0;
     let mut changed = false;
-    let out = UNICODE_ESC_RE.replace_all(input, |caps: &regex::Captures| {
-        if let Ok(code) = u32::from_str_radix(&caps[1], 16) {
-            if let Some(ch) = char::from_u32(code) {
-                changed = true;
-                return ch.to_string();
-            }
-        }
-        caps[0].to_string()
-    });
-    if changed {
-        Some(out.into_owned())
-    } else {
-        None
+    for caps in UNICODE_ESC_RE.captures_iter(input) {
+        let m = caps.get(0).unwrap();
+        let Some(ch) = u32::from_str_radix(&caps[1], 16).ok().and_then(char::from_u32) else {
+            continue;
+        };
+        text.push_str(&input[last..m.start()]);
+        origin.extend(last..m.start());
+        origin.extend(std::iter::repeat_n(m.start(), ch.len_utf8()));
+        text.push(ch);
+        last = m.end();
+        changed = true;
     }
+    if !changed {
+        return None;
+    }
+    text.push_str(&input[last..]);
+    origin.extend(last..input.len());
+    origin.push(input.len());
+    Some(DecodedText { text, origin })
+}
+
+/// Map a decoded span end to the source: an escape ending the span covers all of its source bytes.
+pub fn source_span(decoded: &DecodedText, start: usize, end: usize, source: &str) -> (usize, usize) {
+    let s = decoded.source_offset(start);
+    let e = if end >= decoded.text.len() {
+        source.len()
+    } else {
+        decoded.source_offset(end)
+    };
+    (s, e.max(s))
 }
 
 /// Top-level convenience function matching `ProjectScanner::scan_Matches`.
 #[allow(non_snake_case)]
-pub fn scan_Matches(
-    payload: &str,
-    config: &HideConfig,
-) -> Vec<(FindingKind, String, String, String)> {
+pub fn scan_Matches(payload: &str, config: &HideConfig) -> Vec<(FindingKind, String, String, String)> {
     ProjectScanner::scan_Matches(payload, config)
 }
 
 /// Top-level snake_case convenience function matching `ProjectScanner::scan_Matches`.
-pub fn scan_matches(
-    payload: &str,
-    config: &HideConfig,
-) -> Vec<(FindingKind, String, String, String)> {
+pub fn scan_matches(payload: &str, config: &HideConfig) -> Vec<(FindingKind, String, String, String)> {
     ProjectScanner::scan_Matches(payload, config)
 }
-

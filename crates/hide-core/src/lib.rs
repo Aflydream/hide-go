@@ -1,9 +1,14 @@
+#![cfg_attr(test, allow(clippy::field_reassign_with_default))]
+
 pub mod all_hide;
 pub mod config;
 pub mod desensitizer;
 pub mod harness;
+pub mod protocol;
 pub mod proxy;
+pub mod restore;
 pub mod scanner;
+pub mod sse_restorer;
 pub mod stream_restorer;
 pub mod vault;
 
@@ -80,7 +85,9 @@ using API key sk-ant-api03-1234567890abcdef1234567890 in /home/alice/ProjectTita
         // Vendor must NOT see real secrets, DB credentials, internal IP, or project path
         assert!(!res.transformed_payload.contains("MyTopSecret99"));
         assert!(!res.transformed_payload.contains("10.20.30.40"));
-        assert!(!res.transformed_payload.contains("sk-ant-api03-1234567890abcdef1234567890"));
+        assert!(!res
+            .transformed_payload
+            .contains("sk-ant-api03-1234567890abcdef1234567890"));
         assert!(!res.transformed_payload.contains("/home/alice/ProjectTitan/src/pay.rs"));
         assert!(!res.findings.is_empty());
 
@@ -115,12 +122,7 @@ pub fn verify_margin_liquidation(wallet_signature: &str) -> bool {
 }
 "#;
 
-        let out = AllHideEngine::process(
-            secret_code,
-            TrafficCategory::InteractivePrompt,
-            &cfg,
-            &vault,
-        );
+        let out = AllHideEngine::process(secret_code, TrafficCategory::InteractivePrompt, &cfg, &vault);
 
         // Vendor sees botanical garden identifiers instead of financial settlement identifiers
         assert!(!out.vendor_payload.contains("verify_margin_liquidation"));
@@ -145,30 +147,17 @@ pub fn verify_margin_liquidation(wallet_signature: &str) -> bool {
         let vault = PrivacyVault::new();
         let secret_text = "Confidential algorithm in /Users/dev/AflyCore/engine.rs";
 
-        let cipher_out = AllHideEngine::process(
-            secret_text,
-            TrafficCategory::InteractivePrompt,
-            &cfg,
-            &vault,
-        );
+        let cipher_out = AllHideEngine::process(secret_text, TrafficCategory::InteractivePrompt, &cfg, &vault);
         assert!(cipher_out.vendor_payload.starts_with("⟦HIDE-CIPHER::"));
         assert!(!cipher_out.vendor_payload.contains("Confidential"));
 
-        let decoded = AllHideEngine::decode_braille_cipher_blocks(
-            &cipher_out.vendor_payload,
-            &vault,
-            &cfg.project_salt,
-        );
+        let decoded =
+            AllHideEngine::decode_braille_cipher_blocks(&cipher_out.vendor_payload, &vault, &cfg.project_salt);
         let (fully_restored, _) = vault.restore_text(&decoded);
         assert_eq!(fully_restored, secret_text);
 
         // Telemetry request gets replaced with Chaff
-        let chaff_out = AllHideEngine::process(
-            secret_text,
-            TrafficCategory::Telemetry,
-            &cfg,
-            &vault,
-        );
+        let chaff_out = AllHideEngine::process(secret_text, TrafficCategory::Telemetry, &cfg, &vault);
         assert_eq!(chaff_out.action_taken, "chaff-injected");
         assert!(!chaff_out.vendor_payload.contains("AflyCore"));
     }
@@ -184,9 +173,7 @@ pub fn verify_margin_liquidation(wallet_signature: &str) -> bool {
         assert!(!res
             .transformed_payload
             .contains("MIIEpAIBAAKCAQEA99887766554433221100aabbccddeeff"));
-        assert!(!res
-            .transformed_payload
-            .contains("SuperSecretPrivateKeyBodyLine2=="));
+        assert!(!res.transformed_payload.contains("SuperSecretPrivateKeyBodyLine2=="));
         assert!(!res.transformed_payload.contains("END RSA PRIVATE KEY"));
 
         let (restored, count) = vault.restore_text(&res.transformed_payload);
@@ -238,12 +225,7 @@ pub fn verify_margin_liquidation(wallet_signature: &str) -> bool {
         let vault = PrivacyVault::new();
         let confidential = r#"let msg = "中文机密字面量：核心量子清算密钥阈值";"#;
 
-        let out_iso = AllHideEngine::process(
-            confidential,
-            TrafficCategory::InteractivePrompt,
-            &cfg,
-            &vault,
-        );
+        let out_iso = AllHideEngine::process(confidential, TrafficCategory::InteractivePrompt, &cfg, &vault);
         assert!(!out_iso.vendor_payload.contains("中文机密字面量"));
         assert!(!out_iso.vendor_payload.contains("核心量子清算"));
 
@@ -254,26 +236,15 @@ pub fn verify_margin_liquidation(wallet_signature: &str) -> bool {
         // Verify that an attacker with an empty/different Vault cannot decode the Chinese literal
         cfg.all_hide.enable_cipher_garble = true;
         let vault2 = PrivacyVault::new();
-        let out_cipher = AllHideEngine::process(
-            confidential,
-            TrafficCategory::InteractivePrompt,
-            &cfg,
-            &vault2,
-        );
+        let out_cipher = AllHideEngine::process(confidential, TrafficCategory::InteractivePrompt, &cfg, &vault2);
         let attacker_vault = PrivacyVault::new();
-        let attacker_attempt = AllHideEngine::decode_braille_cipher_blocks(
-            &out_cipher.vendor_payload,
-            &attacker_vault,
-            "wrong-salt",
-        );
+        let attacker_attempt =
+            AllHideEngine::decode_braille_cipher_blocks(&out_cipher.vendor_payload, &attacker_vault, "wrong-salt");
         assert!(!attacker_attempt.contains("中文机密字面量"));
 
         // Even with the right salt but without the originating Vault, it cannot be recovered
-        let attacker_same_salt = AllHideEngine::decode_braille_cipher_blocks(
-            &out_cipher.vendor_payload,
-            &attacker_vault,
-            &cfg.project_salt,
-        );
+        let attacker_same_salt =
+            AllHideEngine::decode_braille_cipher_blocks(&out_cipher.vendor_payload, &attacker_vault, &cfg.project_salt);
         assert!(!attacker_same_salt.contains("中文机密字面量"));
 
         // Legitimate owner with `vault2` restores 100% accurately
@@ -461,10 +432,7 @@ pub fn verify_margin_liquidation(wallet_signature: &str) -> bool {
         assert_eq!(proxy_res.status(), StatusCode::OK);
         let proxy_json: serde_json::Value = proxy_res.json().await.unwrap();
         assert_eq!(proxy_json["id"], "upstream_real_msg");
-        assert_eq!(
-            proxy_json["echo"],
-            "Use key sk-ant-api03-real-secret-key-9999999999"
-        );
+        assert_eq!(proxy_json["echo"], "Use key sk-ant-api03-real-secret-key-9999999999");
 
         // 5. Verify Audit #1: Real upstream forwarding with `stream: true` SSE
         let stream_req_body = serde_json::json!({
@@ -497,4 +465,3 @@ pub fn verify_margin_liquidation(wallet_signature: &str) -> bool {
         assert!(sse_body.contains("data: [DONE]"));
     }
 }
-

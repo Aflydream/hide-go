@@ -5,25 +5,34 @@ use tokio::net::TcpListener;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    let config = HideConfig::default();
+    let config_path = HideConfig::default_path();
+    let mut config = config_path
+        .as_deref()
+        .map(HideConfig::load_or_create)
+        .unwrap_or_default();
     let port = std::env::var("HIDE_GO_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(config.proxy_port);
 
-    let state = GatewayState::new(config);
-    let app = build_router(state);
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
+    let addr = listener.local_addr()?;
+    config.proxy_port = addr.port();
+    let mut state = GatewayState::new(config);
+    state.config_path = config_path.map(std::sync::Arc::new);
+    let app = build_router(state.clone());
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    tracing::info!("🛡️ Hide-Go Privacy Firewall & All-Hide Gateway listening on http://{}", addr);
+    tracing::info!("Hide-Go gateway listening on http://{addr}");
+    if std::env::var("HIDE_GO_ADMIN_TOKEN").is_err() {
+        tracing::info!(
+            "management API token (set HIDE_GO_ADMIN_TOKEN to pin it): {}",
+            state.admin_token()
+        );
+    }
 
-    let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }

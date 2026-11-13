@@ -1,12 +1,13 @@
 use crate::config::{CoverTheme, FindingKind, HideConfig, LeakFinding, TrafficCategory};
-use crate::desensitizer::{json_escape_contents, SemanticDesensitizer};
+use crate::desensitizer::SemanticDesensitizer;
+use crate::protocol::{is_opaque_block, is_schema_key, is_structural_key};
 use crate::scanner::is_placeholder_token;
-use crate::vault::{mask_preview, PrivacyVault};
+use crate::vault::{mask_preview, reserialize_like, DerivedContext, PrivacyVault};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub struct AllHideOutput {
     pub vendor_payload: String,
@@ -14,98 +15,331 @@ pub struct AllHideOutput {
     pub findings: Vec<LeakFinding>,
 }
 
-static IDENTIFIER_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\b[a-zA-Z_][a-zA-Z0-9_]{3,}\b").unwrap());
-static LINE_COMMENT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)//[^\n\r]*").unwrap());
-static NON_ASCII_LITERAL_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"[^\x00-\x7F⟦⟧]+").unwrap());
+static IDENTIFIER_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b[a-zA-Z_][a-zA-Z0-9_]{3,}\b").unwrap());
+/// `//` comments that start a line or follow whitespace (so `https://` is not a comment).
+static LINE_COMMENT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)(?:^|[ \t])(//[^\n\r]*)").unwrap());
 static QUOTED_LITERAL_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#""([^"\r\n\\]|\\.){2,}"|'([^'\r\n\\]|\\.){2,}'"#).unwrap());
+    Lazy::new(|| Regex::new(r#""(?:[^"\r\n\\]|\\.){2,}"|'(?:[^'\r\n\\]|\\.){2,}'"#).unwrap());
 
 /// Language keywords & standard library identifiers that must NOT be obfuscated
-/// so code syntax remains 100% valid for the LLM's AST reasoning.
+/// so code syntax remains valid for the LLM's AST reasoning.
 static RESERVED_KEYWORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     [
-        // Rust / TS / JS / Python / Go / C++ / JSON / HTTP standard keywords
-        "async", "await", "break", "const", "continue", "crate", "default", "delete", "else",
-        "enum", "export", "extends", "false", "final", "finally", "float", "from", "func",
-        "function", "global", "implements", "import", "interface", "let", "loop", "match",
-        "mod", "move", "mut", "namespace", "None", "null", "number", "object", "Ok", "Err",
-        "package", "private", "protected", "pub", "public", "raise", "range", "return",
-        "select", "self", "Self", "Some", "static", "string", "String", "struct", "super",
-        "switch", "this", "throw", "trait", "true", "type", "typeof", "undefined", "unsafe",
-        "use", "var", "Vec", "void", "where", "while", "with", "yield", "usize", "isize",
-        "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "bool", "Result",
-        "Option", "HashMap", "HashSet", "Arc", "Mutex", "RwLock", "Box", "println", "format",
-        "clone", "collect", "iter", "into", "unwrap", "expect", "messages", "model", "role",
-        "user", "assistant", "system", "content", "stream", "temperature", "max_tokens",
-        "tools", "input", "output", "prompt", "claude", "gpt", "grok", "codex",
+        "async",
+        "await",
+        "break",
+        "const",
+        "continue",
+        "crate",
+        "default",
+        "delete",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "final",
+        "finally",
+        "float",
+        "from",
+        "func",
+        "function",
+        "global",
+        "implements",
+        "import",
+        "interface",
+        "let",
+        "loop",
+        "match",
+        "mod",
+        "move",
+        "mut",
+        "namespace",
+        "None",
+        "null",
+        "number",
+        "object",
+        "Ok",
+        "Err",
+        "package",
+        "private",
+        "protected",
+        "pub",
+        "public",
+        "raise",
+        "range",
+        "return",
+        "select",
+        "self",
+        "Self",
+        "Some",
+        "static",
+        "string",
+        "String",
+        "struct",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "trait",
+        "true",
+        "type",
+        "typeof",
+        "undefined",
+        "unsafe",
+        "use",
+        "var",
+        "Vec",
+        "void",
+        "where",
+        "while",
+        "with",
+        "yield",
+        "usize",
+        "isize",
+        "bool",
+        "Result",
+        "Option",
+        "HashMap",
+        "HashSet",
+        "BTreeMap",
+        "Arc",
+        "Mutex",
+        "RwLock",
+        "Box",
+        "Rc",
+        "RefCell",
+        "println",
+        "eprintln",
+        "format",
+        "clone",
+        "collect",
+        "iter",
+        "into",
+        "unwrap",
+        "expect",
+        "to_string",
+        "to_owned",
+        "as_str",
+        "as_ref",
+        "len",
+        "is_empty",
+        "push_str",
+        "max_tokens",
+        "tool_use",
+        "tool_result",
+        "tool_call",
+        "tool_calls",
+        "__init__",
+        "__name__",
+        "__main__",
+        "self_",
+        "console",
+        "JSON",
+        "Promise",
+        "useState",
+        "useEffect",
+        "useCallback",
+        "useMemo",
+        "useRef",
+        "className",
+        "onClick",
+        "onChange",
+        "innerHTML",
+        "getElementById",
+        "addEventListener",
+        "querySelector",
+        "setTimeout",
+        "setInterval",
+        "localStorage",
+        "isize_",
+        "f32",
+        "f64",
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "u128",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "i128",
     ]
     .into_iter()
     .collect()
 });
 
 const BOTANICAL_NOUNS: &[&str] = &[
-    "fern", "orchid", "succulent", "bonsai", "moss", "clover", "lavender", "bamboo",
-    "hibiscus", "jasmine", "camellia", "azalea", "magnolia", "cypress", "maple", "lotus",
-    "seedling", "rootstock", "canopy", "greenhouse", "terrarium", "compost", "moisture",
-    "sunlight", "chlorophyll", "nectar", "pollen", "petal", "sprout", "foliage", "meadow",
+    "fern",
+    "orchid",
+    "succulent",
+    "bonsai",
+    "moss",
+    "clover",
+    "lavender",
+    "bamboo",
+    "hibiscus",
+    "jasmine",
+    "camellia",
+    "azalea",
+    "magnolia",
+    "cypress",
+    "maple",
+    "lotus",
+    "seedling",
+    "rootstock",
+    "canopy",
+    "greenhouse",
+    "terrarium",
+    "compost",
+    "moisture",
+    "sunlight",
+    "chlorophyll",
+    "nectar",
+    "pollen",
+    "petal",
+    "sprout",
+    "foliage",
+    "meadow",
     "planter",
 ];
 
 const LIBRARY_NOUNS: &[&str] = &[
-    "catalog", "manuscript", "anthology", "codex_leaf", "bookmark", "periodical", "lexicon",
-    "index_card", "shelf_bay", "folio", "archive", "binding", "chapter", "preface",
-    "colophon", "footnote", "glossary", "scroll", "chronicle", "almanac", "compendium",
-    "edition", "librarian", "carousel", "reading_room", "monograph", "atlas", "gazette",
-    "pamphlet", "parchment", "incipit", "epilogue",
+    "catalog",
+    "manuscript",
+    "anthology",
+    "codex_leaf",
+    "bookmark",
+    "periodical",
+    "lexicon",
+    "index_card",
+    "shelf_bay",
+    "folio",
+    "archive",
+    "binding",
+    "chapter",
+    "preface",
+    "colophon",
+    "footnote",
+    "glossary",
+    "scroll",
+    "chronicle",
+    "almanac",
+    "compendium",
+    "edition",
+    "librarian",
+    "carousel",
+    "reading_room",
+    "monograph",
+    "atlas",
+    "gazette",
+    "pamphlet",
+    "parchment",
+    "incipit",
+    "epilogue",
 ];
 
 const BAKERY_NOUNS: &[&str] = &[
-    "sourdough", "croissant", "brioche", "baguette", "ciabatta", "focaccia", "pretzel",
-    "macaron", "tartlet", "strudel", "ganache", "meringue", "custard", "caramel",
-    "cinnamon", "cardamom", "vanilla", "yeast_starter", "oven_deck", "kneading_hook",
-    "proofing_tray", "flour_sifter", "pastry_brush", "glaze", "crumb_coat", "shortbread",
-    "muffin_tin", "wafer", "biscotti", "galette", "palmier", "kouign",
+    "sourdough",
+    "croissant",
+    "brioche",
+    "baguette",
+    "ciabatta",
+    "focaccia",
+    "pretzel",
+    "macaron",
+    "tartlet",
+    "strudel",
+    "ganache",
+    "meringue",
+    "custard",
+    "caramel",
+    "cinnamon",
+    "cardamom",
+    "vanilla",
+    "yeast_starter",
+    "oven_deck",
+    "kneading_hook",
+    "proofing_tray",
+    "flour_sifter",
+    "pastry_brush",
+    "glaze",
+    "crumb_coat",
+    "shortbread",
+    "muffin_tin",
+    "wafer",
+    "biscotti",
+    "galette",
+    "palmier",
+    "kouign",
 ];
+
+/// Prefixes of identifiers produced by Hide-Go itself.
+const OWN_TOKEN_PREFIXES: &[&str] = &[
+    "HIDE_",
+    "__HIDE_",
+    "BotanicalSensor",
+    "CatalogIndex",
+    "OvenController",
+    "db_user_",
+    "db_pass_placeholder_",
+    "app_schema_",
+    "user_",
+    "dev_member_",
+    "svc",
+    "sk-sem",
+];
+
+#[derive(Default)]
+struct LayerStats {
+    literal: (usize, String, String),
+    camouflage: (usize, String, String),
+    cipher: (usize, String, String),
+}
+
+impl LayerStats {
+    fn note(slot: &mut (usize, String, String), original: &str, token: &str) {
+        if slot.0 == 0 {
+            slot.1 = original.to_string();
+            slot.2 = token.to_string();
+        }
+        slot.0 += 1;
+    }
+}
 
 pub struct AllHideEngine;
 
 impl AllHideEngine {
-    /// Execute All-Hide protection according to traffic category and configured sub-modes:
-    /// - Sub-mode C (`enable_telemetry_chaff`): If traffic is `Telemetry` or `CodebaseIndexing`,
-    ///   replace the entire request with realistic decoy/chaff or unreadable noise so the vendor gets zero real repo structure.
-    /// - Strict Literal Masking (`strict_literal_masking`): Replace all Chinese/non-ASCII confidential text segments
-    ///   and string literals with Vault-backed opaque tokens (`<<HIDE_LIT_...>>`) that contain zero raw literal bytes.
-    /// - Sub-mode A (`enable_isomorphic_camouflage`): Deterministically map all business identifiers, file paths, and comments
-    ///   into an unrelated cover domain (e.g., Botanical Garden watering system) with collision-free registration in `PrivacyVault`.
-    /// - Sub-mode B (`enable_cipher_garble`): Encrypt payload into keyed SHA-256 CTR Braille cipher blocks (`⟦HIDE-CIPHER::...⟧`)
-    ///   bound to the Vault's ephemeral 256-bit secret key and `project_salt`.
+    /// Execute All-Hide protection according to traffic category and configured sub-modes.
+    ///
+    /// Only user content is transformed (message text, tool results, tool arguments); tool
+    /// schemas, identifiers, signed reasoning and attachments are forwarded byte-exact so
+    /// the request stays a valid API call.
+    /// - Chaff: telemetry is acknowledged locally; indexing uploads keep their JSON shape and
+    ///   size but every content string is replaced with decoy code.
+    /// - Strict literal masking: quoted string literals become `<<HIDE_STR_nnn>>` tokens.
+    /// - Isomorphic camouflage: compound code identifiers and `//` comments are mapped into a
+    ///   cover domain deterministically from the project salt.
+    /// - Cipher garble: each content string becomes a keyed Braille cipher block.
     pub fn process(
         payload: &str,
         category: TrafficCategory,
         config: &HideConfig,
         vault: &PrivacyVault,
     ) -> AllHideOutput {
-        // 1. Sub-mode C: Silent Telemetry & Codebase Indexing Chaff Injection
         if config.all_hide.enable_telemetry_chaff
-            && matches!(
-                category,
-                TrafficCategory::Telemetry | TrafficCategory::CodebaseIndexing
-            )
+            && matches!(category, TrafficCategory::Telemetry | TrafficCategory::CodebaseIndexing)
         {
-            let chaff =
-                Self::generate_chaff_payload(category, config.all_hide.cover_theme, payload);
+            let chaff = Self::generate_chaff_payload(category, config.all_hide.cover_theme, payload);
             return AllHideOutput {
                 vendor_payload: chaff,
                 action_taken: "chaff-injected".to_string(),
                 findings: vec![LeakFinding {
                     kind: FindingKind::GitMetadata,
                     label: match category {
-                        TrafficCategory::Telemetry => {
-                            "静默遥测已拦截并投喂虚假噪声 (Chaff)".to_string()
-                        }
-                        _ => "后台代码库索引已拦截并替换为伪装仓库快照".to_string(),
+                        TrafficCategory::Telemetry => "静默遥测已在本地拦截并应答".to_string(),
+                        _ => "后台代码索引已替换为同结构诱饵内容".to_string(),
                     },
                     original_preview: format!("Payload ({} bytes)", payload.len()),
                     replacement_token: "<<CHAFF_DECOY_PAYLOAD>>".to_string(),
@@ -115,431 +349,231 @@ impl AllHideEngine {
             };
         }
 
-        // Always apply base secret & path desensitization first (JSON-aware)
-        let base_res = SemanticDesensitizer::process(payload, config, vault);
-        let mut current = base_res.transformed_payload;
-        let mut findings = base_res.findings;
-        let mut actions = Vec::new();
+        let base = SemanticDesensitizer::process(payload, config, vault);
+        let mut findings = base.findings;
+        let mut stats = LayerStats::default();
+        let current = base.transformed_payload;
 
-        // 2. Strict Literal Masking: replace Chinese/non-ASCII confidential literals and quoted string literals
-        // with Vault-only tokens so they cannot be recovered without the Vault
-        if config.all_hide.strict_literal_masking {
-            let (masked_literals, lit_findings) =
-                Self::apply_strict_literal_masking(&current, vault);
-            current = masked_literals;
-            findings.extend(lit_findings);
-            actions.push("strict-literal");
-        }
-
-        // 3. Sub-mode A: Isomorphic Camouflage (Readable but completely unrelated domain!)
-        if config.all_hide.enable_isomorphic_camouflage {
-            let (camouflaged, iso_findings) = Self::apply_isomorphic_camouflage(
-                &current,
-                config.all_hide.cover_theme,
-                &config.project_salt,
-                vault,
-            );
-            current = camouflaged;
-            findings.extend(iso_findings);
-            actions.push("all-hide-isomorphic");
-        }
-
-        // 4. Sub-mode B: Keyed Cipher Garble (Vendor sees unreadable Braille cipher blocks encrypted with Vault secret key)
-        if config.all_hide.enable_cipher_garble {
-            let (garbled, cipher_finding) =
-                Self::apply_cipher_garble(&current, &config.project_salt, vault);
-            current = garbled;
-            if let Some(f) = cipher_finding {
-                findings.push(f);
+        let trimmed = current.trim();
+        let vendor_payload = match serde_json::from_str::<Value>(trimmed)
+            .ok()
+            .filter(|_| trimmed.starts_with(['{', '[']))
+        {
+            Some(mut value) => {
+                Self::transform_json_content(&mut value, config, vault, &mut stats);
+                reserialize_like(trimmed, &value)
             }
-            actions.push("all-hide-cipher");
-        }
-
-        let action_taken = if actions.is_empty() {
-            "desensitized".to_string()
-        } else {
-            actions.join("+")
+            None => Self::transform_text(&current, config, vault, &mut stats),
         };
 
+        let mut actions = Vec::new();
+        let ah = &config.all_hide;
+        if ah.strict_literal_masking {
+            actions.push("strict-literal");
+        }
+        if ah.enable_isomorphic_camouflage {
+            actions.push("all-hide-isomorphic");
+        }
+        if ah.enable_cipher_garble {
+            actions.push("all-hide-cipher");
+        }
+        let layers = [
+            (&stats.literal, "All-Hide 严格字面量掩码", "high"),
+            (&stats.camouflage, "同构领域伪装", "high"),
+            (&stats.cipher, "All-Hide 密钥流加密乱码", "critical"),
+        ];
+        for ((count, original, token), label, severity) in layers {
+            if *count > 0 {
+                let label = if label == "同构领域伪装" {
+                    format!("{label} ({:?})", ah.cover_theme)
+                } else {
+                    label.to_string()
+                };
+                findings.push(LeakFinding {
+                    kind: FindingKind::ProprietaryCodeSymbol,
+                    label,
+                    original_preview: mask_preview(original),
+                    replacement_token: token.chars().take(48).collect(),
+                    severity: severity.to_string(),
+                    count: *count,
+                });
+            }
+        }
+
         AllHideOutput {
-            vendor_payload: current,
-            action_taken,
+            vendor_payload,
+            action_taken: if actions.is_empty() {
+                "desensitized".to_string()
+            } else {
+                actions.join("+")
+            },
             findings,
         }
     }
 
-    /// Mask all Chinese/non-ASCII confidential literals and quoted code string literals using Vault-only tokens
-    pub fn apply_strict_literal_masking(
-        input: &str,
-        vault: &PrivacyVault,
-    ) -> (String, Vec<LeakFinding>) {
-        let mut findings = Vec::new();
-        let trimmed = input.trim();
-
-        if (trimmed.starts_with('{') || trimmed.starts_with('['))
-            && serde_json::from_str::<Value>(trimmed).is_ok()
-        {
-            if let Ok(mut json_val) = serde_json::from_str::<Value>(trimmed) {
-                let mut count = 0usize;
-                let mut sample_orig = String::new();
-                let mut sample_tok = String::new();
-                Self::mask_literals_in_json(
-                    &mut json_val,
-                    vault,
-                    &mut count,
-                    &mut sample_orig,
-                    &mut sample_tok,
-                );
-                if count > 0 {
-                    findings.push(LeakFinding {
-                        kind: FindingKind::ProprietaryCodeSymbol,
-                        label: "All-Hide 严格字面量掩码 (Strict Literal Masking)".to_string(),
-                        original_preview: mask_preview(&sample_orig),
-                        replacement_token: sample_tok,
-                        severity: "high".to_string(),
-                        count,
-                    });
+    /// Walk only content-bearing positions of a request document.
+    fn transform_json_content(value: &mut Value, config: &HideConfig, vault: &PrivacyVault, stats: &mut LayerStats) {
+        match value {
+            Value::Object(map) => {
+                if is_opaque_block(map) {
+                    return;
                 }
-                let is_pretty = trimmed.starts_with("{\n") || trimmed.starts_with("[\n");
-                let out = if is_pretty {
-                    serde_json::to_string_pretty(&json_val).unwrap_or_else(|_| input.to_string())
-                } else {
-                    serde_json::to_string(&json_val).unwrap_or_else(|_| input.to_string())
-                };
-                return (out, findings);
+                for (key, item) in map.iter_mut() {
+                    if is_structural_key(key) || is_schema_key(key) {
+                        continue;
+                    }
+                    Self::transform_json_content(item, config, vault, stats);
+                }
             }
+            Value::Array(items) => items
+                .iter_mut()
+                .for_each(|v| Self::transform_json_content(v, config, vault, stats)),
+            Value::String(s) => {
+                let st = s.trim();
+                if st.starts_with(['{', '[']) {
+                    if let Ok(mut inner) = serde_json::from_str::<Value>(st) {
+                        // Nested tool arguments: transform values, keep the parameter names.
+                        Self::transform_json_content(&mut inner, config, vault, stats);
+                        *s = reserialize_like(st, &inner);
+                        return;
+                    }
+                }
+                *s = Self::transform_text(s, config, vault, stats);
+            }
+            _ => {}
         }
+    }
 
-        let mut count = 0usize;
-        let mut sample_orig = String::new();
-        let mut sample_tok = String::new();
-        let out = Self::mask_literals_in_plain_text(
-            input,
-            false,
-            vault,
-            &mut count,
-            &mut sample_orig,
-            &mut sample_tok,
-        );
-        if count > 0 {
-            findings.push(LeakFinding {
-                kind: FindingKind::ProprietaryCodeSymbol,
-                label: "All-Hide 严格字面量掩码 (Strict Literal Masking)".to_string(),
-                original_preview: mask_preview(&sample_orig),
-                replacement_token: sample_tok,
-                severity: "high".to_string(),
-                count,
-            });
+    fn transform_text(text: &str, config: &HideConfig, vault: &PrivacyVault, stats: &mut LayerStats) -> String {
+        if text.trim().is_empty() {
+            return text.to_string();
         }
+        let ah = &config.all_hide;
+        let mut out = text.to_string();
+        if ah.strict_literal_masking {
+            out = Self::mask_quoted_literals(&out, vault, stats);
+        }
+        if ah.enable_isomorphic_camouflage {
+            out = Self::camouflage(&out, ah.cover_theme, &config.project_salt, vault, stats);
+        }
+        if ah.enable_cipher_garble {
+            let (garbled, _) = Self::apply_cipher_garble(&out, &config.project_salt, vault);
+            LayerStats::note(&mut stats.cipher, &out, &garbled);
+            out = garbled;
+        }
+        out
+    }
+
+    /// Mask quoted code string literals with Vault-only tokens (single pass).
+    pub fn apply_strict_literal_masking(input: &str, vault: &PrivacyVault) -> (String, Vec<LeakFinding>) {
+        let mut stats = LayerStats::default();
+        let out = Self::mask_quoted_literals(input, vault, &mut stats);
+        let findings = (stats.literal.0 > 0)
+            .then(|| LeakFinding {
+                kind: FindingKind::ProprietaryCodeSymbol,
+                label: "All-Hide 严格字面量掩码".to_string(),
+                original_preview: mask_preview(&stats.literal.1),
+                replacement_token: stats.literal.2.clone(),
+                severity: "high".to_string(),
+                count: stats.literal.0,
+            })
+            .into_iter()
+            .collect();
         (out, findings)
     }
 
-    fn mask_literals_in_json(
-        val: &mut Value,
-        vault: &PrivacyVault,
-        count: &mut usize,
-        sample_orig: &mut String,
-        sample_tok: &mut String,
-    ) {
-        match val {
-            Value::Object(map) => {
-                for (k, v) in map.iter_mut() {
-                    if is_structural_json_key(k) {
-                        continue;
-                    }
-                    Self::mask_literals_in_json(v, vault, count, sample_orig, sample_tok);
-                }
-            }
-            Value::Array(arr) => {
-                for item in arr.iter_mut() {
-                    Self::mask_literals_in_json(item, vault, count, sample_orig, sample_tok);
-                }
-            }
-            Value::String(s) => {
-                *s = Self::mask_literals_in_plain_text(
-                    s,
-                    true,
-                    vault,
-                    count,
-                    sample_orig,
-                    sample_tok,
-                );
-            }
-            _ => {}
-        }
-    }
-
-    fn mask_literals_in_plain_text(
-        text: &str,
-        in_json: bool,
-        vault: &PrivacyVault,
-        count: &mut usize,
-        sample_orig: &mut String,
-        sample_tok: &mut String,
-    ) -> String {
-        let mut result = text.to_string();
-
-        // 1. Mask all non-ASCII / Chinese confidential text runs (e.g. 中文机密字面量)
-        let mut non_ascii_matches: Vec<String> = NON_ASCII_LITERAL_RE
-            .find_iter(&result)
-            .map(|m| m.as_str().to_string())
-            .filter(|s| !s.trim().is_empty())
-            .collect();
-        non_ascii_matches.sort_by(|a, b| b.len().cmp(&a.len()));
-        non_ascii_matches.dedup();
-
-        for seg in non_ascii_matches {
-            if !result.contains(&seg) {
-                continue;
-            }
-            let tok = vault.get_or_insert_with(&seg, "StrictLiteral", |idx| {
-                format!("<<HIDE_LIT_{:03}>>", idx)
-            });
-            if in_json {
-                let esc_raw = json_escape_contents(&seg);
-                let esc_tok = json_escape_contents(&tok);
-                if esc_raw != seg || esc_tok != tok {
-                    vault.insert_explicit(&esc_raw, &esc_tok, "StrictLiteral");
-                }
-            }
-            if sample_orig.is_empty() {
-                *sample_orig = seg.clone();
-                *sample_tok = tok.clone();
-            }
-            *count += result.matches(&seg).count();
-            result = result.replace(&seg, &tok);
-        }
-
-        // 2. Mask quoted string literals in code (`"..."` / `'...'`)
-        let mut quoted_matches: Vec<String> = QUOTED_LITERAL_RE
-            .find_iter(&result)
-            .map(|m| m.as_str().to_string())
-            .collect();
-        quoted_matches.sort_by(|a, b| b.len().cmp(&a.len()));
-        quoted_matches.dedup();
-
-        for q_lit in quoted_matches {
-            if q_lit.len() < 4 || !result.contains(&q_lit) {
-                continue;
-            }
-            let inner = &q_lit[1..q_lit.len() - 1];
-            if is_placeholder_token(inner)
+    fn mask_quoted_literals(text: &str, vault: &PrivacyVault, stats: &mut LayerStats) -> String {
+        let tokens = vault.matcher().token_ranges(text);
+        let mut out = String::with_capacity(text.len());
+        let mut last = 0;
+        for m in QUOTED_LITERAL_RE.find_iter(text) {
+            let lit = m.as_str();
+            let inner = &lit[1..lit.len() - 1];
+            if lit.len() < 4
+                || is_placeholder_token(inner)
                 || inner.starts_with("<<HIDE_")
-                || inner.contains("BotanicalSensor")
-                || inner.contains("CatalogIndex")
-                || inner.contains("OvenController")
+                || tokens.iter().any(|&(a, b)| a <= m.start() + 1 && m.end() - 1 <= b)
             {
                 continue;
             }
-            let quote_char = q_lit.chars().next().unwrap_or('"');
-            let tok_inner = vault.get_or_insert_with(inner, "StrictStringLiteral", |idx| {
+            let quote = &lit[..1];
+            let tok = vault.register_derived_with(inner, "StrictStringLiteral", DerivedContext::PlainText, |idx| {
                 format!("<<HIDE_STR_{:03}>>", idx)
             });
-            let replacement_quoted = format!("{}{}{}", quote_char, tok_inner, quote_char);
-            if in_json {
-                let esc_raw = json_escape_contents(inner);
-                let esc_tok = json_escape_contents(&tok_inner);
-                if esc_raw != inner || esc_tok != tok_inner {
-                    vault.insert_explicit(&esc_raw, &esc_tok, "StrictStringLiteral");
-                }
-            }
-            if sample_orig.is_empty() {
-                *sample_orig = inner.to_string();
-                *sample_tok = tok_inner.clone();
-            }
-            *count += result.matches(&q_lit).count();
-            result = result.replace(&q_lit, &replacement_quoted);
+            LayerStats::note(&mut stats.literal, inner, &tok);
+            out.push_str(&text[last..m.start()]);
+            out.push_str(quote);
+            out.push_str(&tok);
+            out.push_str(quote);
+            last = m.end();
         }
-
-        result
+        out.push_str(&text[last..]);
+        out
     }
 
-    /// Transform code identifiers & comments into an unrelated Cover Domain (Botanical Garden / Library / Bakery)
-    fn apply_isomorphic_camouflage(
-        input: &str,
-        theme: CoverTheme,
-        salt: &str,
-        vault: &PrivacyVault,
-    ) -> (String, Vec<LeakFinding>) {
-        let trimmed = input.trim();
-        if (trimmed.starts_with('{') || trimmed.starts_with('['))
-            && serde_json::from_str::<Value>(trimmed).is_ok()
-        {
-            if let Ok(mut json_val) = serde_json::from_str::<Value>(trimmed) {
-                let mut all_findings = Vec::new();
-                Self::camouflage_json_value(&mut json_val, theme, salt, vault, &mut all_findings);
-                let is_pretty = trimmed.starts_with("{\n") || trimmed.starts_with("[\n");
-                let out = if is_pretty {
-                    serde_json::to_string_pretty(&json_val).unwrap_or_else(|_| input.to_string())
-                } else {
-                    serde_json::to_string(&json_val).unwrap_or_else(|_| input.to_string())
-                };
-                return (out, all_findings);
+    /// Single-pass cover-domain mapping of `//` comments and compound identifiers.
+    fn camouflage(text: &str, theme: CoverTheme, salt: &str, vault: &PrivacyVault, stats: &mut LayerStats) -> String {
+        let tokens = vault.matcher().token_ranges(text);
+        let overlaps_token = |s: usize, e: usize| tokens.iter().any(|&(a, b)| s < b && a < e);
+
+        // 1. Comments become numbered cover comments.
+        let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+        for caps in LINE_COMMENT_RE.captures_iter(text) {
+            let m = caps.get(1).unwrap();
+            if overlaps_token(m.start(), m.end()) {
+                continue;
             }
-        }
-
-        Self::apply_isomorphic_camouflage_plain(input, theme, salt, vault)
-    }
-
-    fn camouflage_json_value(
-        val: &mut Value,
-        theme: CoverTheme,
-        salt: &str,
-        vault: &PrivacyVault,
-        findings: &mut Vec<LeakFinding>,
-    ) {
-        match val {
-            Value::Object(map) => {
-                for (k, v) in map.iter_mut() {
-                    if is_structural_json_key(k) {
-                        continue;
-                    }
-                    Self::camouflage_json_value(v, theme, salt, vault, findings);
+            let n = replacements.len() + 1;
+            let preferred = match theme {
+                CoverTheme::BotanicalGarden => {
+                    format!("// [BotanicalSensor-{n:02}] Calibrate greenhouse soil humidity and mist interval")
                 }
-            }
-            Value::Array(arr) => {
-                for item in arr.iter_mut() {
-                    Self::camouflage_json_value(item, theme, salt, vault, findings);
+                CoverTheme::LibraryCatalog => {
+                    format!("// [CatalogIndex-{n:02}] Verify shelf Dewey decimal classification order")
                 }
-            }
-            Value::String(s) => {
-                let (camouflaged, f) =
-                    Self::apply_isomorphic_camouflage_plain(s, theme, salt, vault);
-                *s = camouflaged;
-                findings.extend(f);
-            }
-            _ => {}
-        }
-    }
-
-    fn apply_isomorphic_camouflage_plain(
-        input: &str,
-        theme: CoverTheme,
-        salt: &str,
-        vault: &PrivacyVault,
-    ) -> (String, Vec<LeakFinding>) {
-        let mut result = input.to_string();
-        let mut findings = Vec::new();
-
-        // 1. Temporarily replace inline code comments with placeholders so words inside comments aren't treated as code identifiers.
-        // Always use the unique collision-free token returned by `vault.insert_explicit` so sequential comments
-        // (e.g. `// alpha` then `// bravo`) never overwrite each other in `PrivacyVault`!
-        let comment_matches: Vec<String> = LINE_COMMENT_RE
-            .find_iter(&result)
-            .map(|m| m.as_str().to_string())
-            .collect();
-
-        let mut comment_placeholders = Vec::new();
-        for (idx, comment) in comment_matches.into_iter().enumerate() {
-            let temp_placeholder = format!("__HIDE_COMMENT_SLOT_{:03}__", idx);
-            let preferred_cover_comment = match theme {
-                CoverTheme::BotanicalGarden => format!(
-                    "// [BotanicalSensor-{:02}] Calibrate greenhouse soil humidity and mist interval",
-                    idx + 1
-                ),
-                CoverTheme::LibraryCatalog => format!(
-                    "// [CatalogIndex-{:02}] Verify shelf Dewey decimal classification order",
-                    idx + 1
-                ),
-                CoverTheme::BakeryRecipe => format!(
-                    "// [OvenController-{:02}] Adjust sourdough fermentation thermal curve",
-                    idx + 1
-                ),
+                CoverTheme::BakeryRecipe => {
+                    format!("// [OvenController-{n:02}] Adjust sourdough fermentation thermal curve")
+                }
             };
-            let unique_cover_comment =
-                vault.insert_explicit(&comment, &preferred_cover_comment, "CoverComment");
-            result = result.replacen(&comment, &temp_placeholder, 1);
-            comment_placeholders.push((temp_placeholder, unique_cover_comment));
+            let cover =
+                vault.register_derived_with(m.as_str(), "CoverComment", DerivedContext::PlainText, |_| preferred);
+            LayerStats::note(&mut stats.camouflage, m.as_str(), &cover);
+            replacements.push((m.start(), m.end(), cover));
         }
 
-        // 2. Collect proprietary/domain identifiers (camelCase, PascalCase, snake_case) that aren't reserved keywords
-        let mut seen = HashSet::new();
-        let mut candidate_symbols = Vec::new();
-
-        for m in IDENTIFIER_RE.find_iter(&result) {
+        // 2. Compound identifiers outside comments and existing tokens.
+        let in_comment = |s: usize| replacements.iter().any(|&(a, b, _)| a <= s && s < b);
+        let mut covers: HashMap<&str, String> = HashMap::new();
+        let mut idents = Vec::new();
+        for m in IDENTIFIER_RE.find_iter(text) {
             let ident = m.as_str();
-            if RESERVED_KEYWORDS.contains(ident) {
+            if in_comment(m.start()) || overlaps_token(m.start(), m.end()) || !is_camouflage_candidate(ident) {
                 continue;
             }
-            // Skip tokens already produced by desensitizer, literal masker, or temporary comment slots
-            if ident.starts_with("HIDE_")
-                || ident.starts_with("__HIDE_COMMENT_SLOT_")
-                || ident.starts_with("BotanicalSensor")
-                || ident.starts_with("CatalogIndex")
-                || ident.starts_with("OvenController")
-                || ident.starts_with("greenhouse_")
-                || ident.starts_with("library_")
-                || ident.starts_with("bakery_")
-                || ident.starts_with("db_user_")
-                || ident.starts_with("db_pass_placeholder_")
-                || ident.starts_with("app_schema_")
-                || ident.starts_with("sandbox_proj")
-                || ident.starts_with("module_")
-                || ident.starts_with("dev_member_")
-            {
+            if !covers.contains_key(ident) {
+                let preferred = Self::deterministic_cover_symbol(ident, theme, salt);
+                let cover =
+                    vault.register_derived_with(ident, "IsomorphicSymbol", DerivedContext::PlainText, |_| preferred);
+                LayerStats::note(&mut stats.camouflage, ident, &cover);
+                covers.insert(ident, cover);
+            }
+            idents.push((m.start(), m.end(), covers[ident].clone()));
+        }
+        replacements.extend(idents);
+        replacements.sort_by_key(|r| r.0);
+
+        let mut out = String::with_capacity(text.len());
+        let mut last = 0;
+        for (s, e, rep) in replacements {
+            if s < last {
                 continue;
             }
-            // Target domain-specific identifiers (snake_case, camelCase, PascalCase, or >= 6 chars)
-            let is_compound = ident.contains('_')
-                || (ident.chars().any(|c| c.is_uppercase())
-                    && ident.chars().any(|c| c.is_lowercase()));
-            if (is_compound || ident.len() >= 6) && seen.insert(ident.to_string()) {
-                candidate_symbols.push(ident.to_string());
-            }
+            out.push_str(&text[last..s]);
+            out.push_str(&rep);
+            last = e;
         }
-
-        // Sort longest first so substring replacements don't collide
-        candidate_symbols.sort_by(|a, b| b.len().cmp(&a.len()));
-
-        let mut camouflaged_count = 0usize;
-        let mut sample_original = String::new();
-        let mut sample_cover = String::new();
-
-        for symbol in candidate_symbols {
-            let preferred_cover = Self::deterministic_cover_symbol(&symbol, theme, salt);
-            let cover_symbol =
-                vault.insert_explicit(&symbol, &preferred_cover, "IsomorphicSymbol");
-
-            // Word-boundary replacement so we never corrupt partial identifiers
-            let pattern = format!(r"\b{}\b", regex::escape(&symbol));
-            if let Ok(re) = Regex::new(&pattern) {
-                let replaced = re.replace_all(&result, cover_symbol.as_str()).to_string();
-                if replaced != result {
-                    if sample_original.is_empty() {
-                        sample_original = symbol.clone();
-                        sample_cover = cover_symbol.clone();
-                    }
-                    camouflaged_count += 1;
-                    result = replaced;
-                }
-            }
-        }
-
-        // 3. Put the final collision-free cover-domain comments into place
-        for (temp_placeholder, cover_comment) in comment_placeholders {
-            result = result.replace(&temp_placeholder, &cover_comment);
-        }
-
-        if camouflaged_count > 0 {
-            findings.push(LeakFinding {
-                kind: FindingKind::ProprietaryCodeSymbol,
-                label: format!("同构领域伪装 ({:?} 词表替换)", theme),
-                original_preview: format!(
-                    "{} 等 {} 个业务符号",
-                    mask_preview(&sample_original),
-                    camouflaged_count
-                ),
-                replacement_token: format!(
-                    "{} (+{})",
-                    sample_cover,
-                    camouflaged_count.saturating_sub(1)
-                ),
-                severity: "high".to_string(),
-                count: camouflaged_count,
-            });
-        }
-
-        (result, findings)
+        out.push_str(&text[last..]);
+        out
     }
 
     pub fn deterministic_cover_symbol(symbol: &str, theme: CoverTheme, salt: &str) -> String {
@@ -554,38 +588,31 @@ impl AllHideEngine {
             CoverTheme::LibraryCatalog => LIBRARY_NOUNS,
             CoverTheme::BakeryRecipe => BAKERY_NOUNS,
         };
-
         let w1 = wordlist[(digest[0] as usize) % wordlist.len()];
         let w2 = wordlist[(digest[1] as usize) % wordlist.len()];
         let suffix = u16::from_be_bytes([digest[2], digest[3]]) % 900 + 100;
 
-        // Preserve casing convention (PascalCase vs snake_case) so compiler/linter rules still hold!
-        let starts_upper = symbol
-            .chars()
-            .next()
-            .map(|c| c.is_uppercase())
-            .unwrap_or(false);
-        if starts_upper {
+        // Preserve casing convention (PascalCase / SCREAMING_SNAKE / snake_case).
+        if symbol.chars().all(|c| !c.is_lowercase()) {
+            format!("{}_{}_{}", w1, w2, suffix).to_uppercase()
+        } else if symbol.chars().next().is_some_and(|c| c.is_uppercase()) {
             format!("{}{}{}", capitalize(w1), capitalize(w2), suffix)
-        } else {
+        } else if symbol.contains('_') {
             format!("{}_{}_{}", w1, w2, suffix)
+        } else {
+            format!("{}{}{}", w1.replace('_', ""), capitalize(w2), suffix)
         }
     }
 
-    /// Encrypt text into keyed SHA-256 CTR Braille Cipher blocks (`⟦HIDE-CIPHER::...⟧`)
+    /// Encrypt text into a keyed SHA-256 CTR Braille cipher block (`⟦HIDE-CIPHER::...⟧`)
     /// bound to the Vault's 256-bit runtime secret key and `project_salt`.
-    pub fn apply_cipher_garble(
-        input: &str,
-        salt: &str,
-        vault: &PrivacyVault,
-    ) -> (String, Option<LeakFinding>) {
+    pub fn apply_cipher_garble(input: &str, salt: &str, vault: &PrivacyVault) -> (String, Option<LeakFinding>) {
         if input.trim().is_empty() {
             return (input.to_string(), None);
         }
-
         let preferred_cipher = Self::encode_keyed_braille_cipher(input, salt, vault);
-        let cipher_token = vault.insert_explicit(input, &preferred_cipher, "CipherGarble");
-
+        let cipher_token =
+            vault.register_derived_with(input, "CipherGarble", DerivedContext::PlainText, |_| preferred_cipher);
         let finding = LeakFinding {
             kind: FindingKind::ProprietaryCodeSymbol,
             label: "All-Hide 密钥流加密乱码 (Keyed Stream Cipher)".to_string(),
@@ -594,7 +621,6 @@ impl AllHideEngine {
             severity: "critical".to_string(),
             count: 1,
         };
-
         (cipher_token, Some(finding))
     }
 
@@ -603,33 +629,20 @@ impl AllHideEngine {
     pub fn encode_keyed_braille_cipher(raw: &str, salt: &str, vault: &PrivacyVault) -> String {
         let secret_key = vault.secret_key();
         let nonce = derive_cipher_nonce(&secret_key, salt, raw);
-
         let mut encoded = String::with_capacity((raw.len() + 8) * 3 + 32);
         encoded.push_str("⟦HIDE-CIPHER::");
-
-        // Prepend 8-byte nonce
-        for &nb in &nonce {
-            let ch = char::from_u32(0x2800 + (nb as u32)).unwrap_or('⣿');
-            encoded.push(ch);
-        }
-
-        for (i, &b) in raw.as_bytes().iter().enumerate() {
-            let ks = cipher_keystream_byte(&secret_key, salt, &nonce, i);
-            let masked = b ^ ks;
-            let ch = char::from_u32(0x2800 + (masked as u32)).unwrap_or('⣿');
-            encoded.push(ch);
-        }
+        let to_braille = |b: u8| char::from_u32(0x2800 + b as u32).unwrap_or('⣿');
+        nonce.iter().for_each(|&b| encoded.push(to_braille(b)));
+        let mut ks = Keystream::new(&secret_key, salt, &nonce);
+        raw.as_bytes()
+            .iter()
+            .for_each(|&b| encoded.push(to_braille(b ^ ks.next_byte())));
         encoded.push('⟧');
         encoded
     }
 
     /// Decrypt `⟦HIDE-CIPHER::...⟧` blocks using the local `PrivacyVault` (and `project_salt`).
-    /// Without the originating `PrivacyVault` or key, cipher blocks cannot be reversed to plaintext.
-    pub fn decode_braille_cipher_blocks(
-        text: &str,
-        vault: &PrivacyVault,
-        salt: &str,
-    ) -> String {
+    pub fn decode_braille_cipher_blocks(text: &str, vault: &PrivacyVault, salt: &str) -> String {
         let prefix = "⟦HIDE-CIPHER::";
         let suffix = "⟧";
         let secret_key = vault.secret_key();
@@ -639,110 +652,114 @@ impl AllHideEngine {
         while let Some(start) = rest.find(prefix) {
             output.push_str(&rest[..start]);
             let after_prefix = &rest[start + prefix.len()..];
-            if let Some(end) = after_prefix.find(suffix) {
-                let full_token = &rest[start..start + prefix.len() + end + suffix.len()];
-                if let Some(from_vault) = vault.get_raw_by_token(full_token) {
-                    output.push_str(&from_vault);
-                } else {
-                    let braille_body = &after_prefix[..end];
-                    let raw_bytes: Vec<u8> = braille_body
-                        .chars()
-                        .filter_map(|ch| {
-                            let code = ch as u32;
-                            if (0x2800..=0x28FF).contains(&code) {
-                                Some((code - 0x2800) as u8)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-
-                    if raw_bytes.len() > 8 {
-                        let mut nonce = [0u8; 8];
-                        nonce.copy_from_slice(&raw_bytes[..8]);
-                        let ciphertext = &raw_bytes[8..];
-                        let decrypted: Vec<u8> = ciphertext
-                            .iter()
-                            .enumerate()
-                            .map(|(i, &cb)| cb ^ cipher_keystream_byte(&secret_key, salt, &nonce, i))
-                            .collect();
-
-                        if let Ok(decoded_str) = String::from_utf8(decrypted) {
-                            output.push_str(&decoded_str);
-                        } else {
-                            output.push_str(full_token);
-                        }
-                    } else {
-                        output.push_str(full_token);
-                    }
-                }
-                rest = &after_prefix[end + suffix.len()..];
-            } else {
+            let Some(end) = after_prefix.find(suffix) else {
                 output.push_str(&rest[start..]);
                 return output;
+            };
+            let full_token = &rest[start..start + prefix.len() + end + suffix.len()];
+            if let Some(from_vault) = vault.get_raw_by_token(full_token) {
+                output.push_str(&from_vault);
+            } else {
+                let raw_bytes: Vec<u8> = after_prefix[..end]
+                    .chars()
+                    .filter_map(|ch| (ch as u32).checked_sub(0x2800).filter(|c| *c <= 0xFF).map(|c| c as u8))
+                    .collect();
+                let decoded = (raw_bytes.len() > 8)
+                    .then(|| {
+                        let nonce: [u8; 8] = raw_bytes[..8].try_into().unwrap();
+                        let mut ks = Keystream::new(&secret_key, salt, &nonce);
+                        String::from_utf8(raw_bytes[8..].iter().map(|&cb| cb ^ ks.next_byte()).collect()).ok()
+                    })
+                    .flatten();
+                output.push_str(decoded.as_deref().unwrap_or(full_token));
             }
+            rest = &after_prefix[end + suffix.len()..];
         }
         output.push_str(rest);
         output
     }
 
-    /// Generate realistic-looking decoy/chaff payload when a Harness attempts background telemetry or repo indexing
-    fn generate_chaff_payload(
-        category: TrafficCategory,
-        theme: CoverTheme,
-        original: &str,
-    ) -> String {
-        let noise_hash = {
-            let mut h = Sha256::new();
-            h.update(original.as_bytes());
-            hex::encode(&h.finalize()[..8])
-        };
-
-        match category {
-            TrafficCategory::Telemetry => serde_json::json!({
-                "status": "chaff_masked",
-                "telemetry_batch_id": format!("chaff-{}", noise_hash),
-                "events": [
-                    {
-                        "event": "heartbeat_noop",
-                        "workspace_fingerprint": "0000000000000000",
-                        "garble_stream": "⠷⠩⡬⡺⢵⣑⡬⠷⠩⡬⡺⢵⣑⡬"
-                    }
-                ]
-            })
-            .to_string(),
-            _ => {
-                let decoy_code = match theme {
-                    CoverTheme::BotanicalGarden => {
-                        "pub fn check_greenhouse_humidity(sensor_id: u32) -> f32 {\n    // Botanical watering schedule placeholder\n    42.5\n}"
-                    }
-                    CoverTheme::LibraryCatalog => {
-                        "pub fn lookup_dewey_shelf(book_isbn: &str) -> &'static str {\n    // Public library shelf catalog placeholder\n    \"Shelf-A01\"\n}"
-                    }
-                    CoverTheme::BakeryRecipe => {
-                        "pub fn compute_sourdough_hydration(flour_grams: f32) -> f32 {\n    // Artisan bakery recipe calculator\n    flour_grams * 0.75\n}"
-                    }
-                };
-                serde_json::json!({
-                    "index_snapshot": format!("decoy-{}", noise_hash),
-                    "files": [
-                        {
-                            "path": "/workspace/public_sandbox_demo/src/lib.rs",
-                            "content": decoy_code
-                        }
-                    ]
-                })
-                .to_string()
+    /// Decoy payloads. Telemetry gets a local acknowledgement body; indexing uploads keep
+    /// their exact JSON shape (keys, numbers, array lengths) and roughly their size, with every
+    /// content string swapped for decoy code from the cover theme.
+    fn generate_chaff_payload(category: TrafficCategory, theme: CoverTheme, original: &str) -> String {
+        if category == TrafficCategory::Telemetry {
+            return serde_json::json!({"status": "ok", "accepted": true}).to_string();
+        }
+        let decoy = match theme {
+            CoverTheme::BotanicalGarden => {
+                "pub fn check_greenhouse_humidity(sensor_id: u32) -> f32 {\n    // Botanical watering schedule\n    let base = 42.5;\n    base + sensor_id as f32 * 0.1\n}\n"
             }
+            CoverTheme::LibraryCatalog => {
+                "pub fn lookup_dewey_shelf(book_isbn: &str) -> &'static str {\n    // Public library shelf catalog\n    if book_isbn.is_empty() { \"Shelf-A01\" } else { \"Shelf-B07\" }\n}\n"
+            }
+            CoverTheme::BakeryRecipe => {
+                "pub fn compute_sourdough_hydration(flour_grams: f32) -> f32 {\n    // Artisan bakery recipe calculator\n    flour_grams * 0.75\n}\n"
+            }
+        };
+        let trimmed = original.trim();
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(mut value) => {
+                let mut n = 0usize;
+                decoy_json(&mut value, decoy, &mut n);
+                reserialize_like(trimmed, &value)
+            }
+            Err(_) => decoy_text(decoy, original.chars().count(), 0),
         }
     }
 }
 
-fn is_structural_json_key(key: &str) -> bool {
-    matches!(
-        key,
-        "role" | "model" | "harness" | "type" | "id" | "status" | "object" | "finish_reason"
-    )
+fn decoy_json(value: &mut Value, decoy: &str, n: &mut usize) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if is_structural_key(k) {
+                    continue;
+                }
+                if let Value::String(s) = v {
+                    if k == "path" || k == "file" || k == "filename" || k.ends_with("_path") {
+                        *n += 1;
+                        *s = format!("src/garden/module_{:02}.rs", *n);
+                        continue;
+                    }
+                }
+                decoy_json(v, decoy, n);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|v| decoy_json(v, decoy, n)),
+        Value::String(s) => {
+            *n += 1;
+            *s = decoy_text(decoy, s.chars().count(), *n);
+        }
+        _ => {}
+    }
+}
+
+fn decoy_text(decoy: &str, len: usize, offset: usize) -> String {
+    decoy
+        .chars()
+        .cycle()
+        .skip(offset * 17 % decoy.len())
+        .take(len)
+        .collect()
+}
+
+/// Identifiers worth camouflaging: compound code names (snake_case, camelCase, PascalCase,
+/// SCREAMING_SNAKE). Plain words stay readable so prose keeps its meaning.
+fn is_camouflage_candidate(ident: &str) -> bool {
+    if RESERVED_KEYWORDS.contains(ident) || OWN_TOKEN_PREFIXES.iter().any(|p| ident.starts_with(p)) {
+        return false;
+    }
+    let letters = ident.chars().filter(|c| c.is_alphabetic()).count();
+    if letters < 3 {
+        return false;
+    }
+    let snake = ident.trim_matches('_').contains('_');
+    let camel = ident
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase());
+    snake || camel
 }
 
 fn derive_cipher_nonce(secret_key: &[u8; 32], salt: &str, raw: &str) -> [u8; 8] {
@@ -758,23 +775,41 @@ fn derive_cipher_nonce(secret_key: &[u8; 32], salt: &str, raw: &str) -> [u8; 8] 
     nonce
 }
 
-fn cipher_keystream_byte(
-    secret_key: &[u8; 32],
-    salt: &str,
-    nonce: &[u8; 8],
+/// SHA-256 CTR keystream: one digest per 32-byte block.
+struct Keystream<'a> {
+    key: &'a [u8; 32],
+    salt: &'a str,
+    nonce: &'a [u8; 8],
+    block: [u8; 32],
     index: usize,
-) -> u8 {
-    let block_idx = (index / 32) as u64;
-    let byte_offset = index % 32;
-    let mut hasher = Sha256::new();
-    hasher.update(secret_key);
-    hasher.update(b":hide-go-ctr-v2:");
-    hasher.update(salt.as_bytes());
-    hasher.update(b":");
-    hasher.update(nonce);
-    hasher.update(block_idx.to_le_bytes());
-    let digest = hasher.finalize();
-    digest[byte_offset]
+}
+
+impl<'a> Keystream<'a> {
+    fn new(key: &'a [u8; 32], salt: &'a str, nonce: &'a [u8; 8]) -> Self {
+        Self {
+            key,
+            salt,
+            nonce,
+            block: [0; 32],
+            index: 0,
+        }
+    }
+
+    fn next_byte(&mut self) -> u8 {
+        let offset = self.index % 32;
+        if offset == 0 {
+            let mut hasher = Sha256::new();
+            hasher.update(self.key);
+            hasher.update(b":hide-go-ctr-v2:");
+            hasher.update(self.salt.as_bytes());
+            hasher.update(b":");
+            hasher.update(self.nonce);
+            hasher.update(((self.index / 32) as u64).to_le_bytes());
+            self.block.copy_from_slice(&hasher.finalize());
+        }
+        self.index += 1;
+        self.block[offset]
+    }
 }
 
 fn capitalize(word: &str) -> String {
@@ -785,3 +820,100 @@ fn capitalize(word: &str) -> String {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
+mod tests {
+    use super::*;
+    use crate::PrivacyMode;
+    use serde_json::json;
+
+    fn all_hide_cfg() -> HideConfig {
+        let mut cfg = HideConfig::default();
+        cfg.mode = PrivacyMode::AllHide;
+        cfg.all_hide.enable_cipher_garble = false;
+        cfg
+    }
+
+    #[test]
+    fn protocol_structure_survives_and_prose_stays_readable() {
+        let cfg = all_hide_cfg();
+        let vault = PrivacyVault::new();
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "tools": [{"name": "Read", "description": "Reads a file", "input_schema": {"type": "object",
+                "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Please explain why verify_margin_liquidation returns early"}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_01A2", "name": "Read",
+                    "input": {"file_path": "src/settle_engine.rs"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_01A2",
+                    "content": "fn verify_margin_liquidation() {} // https://docs.example.com"}]}
+            ]
+        });
+        let out = AllHideEngine::process(&body.to_string(), TrafficCategory::InteractivePrompt, &cfg, &vault);
+        let v: Value = serde_json::from_str(&out.vendor_payload).unwrap();
+        assert_eq!(v["tools"], body["tools"]);
+        assert_eq!(
+            v["messages"][1]["content"][0]["id"],
+            v["messages"][2]["content"][0]["tool_use_id"]
+        );
+        assert_eq!(v["messages"][1]["content"][0]["name"], "Read");
+        assert!(v["messages"][1]["content"][0]["input"].get("file_path").is_some());
+        let text = v["messages"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("Please explain why ") && !text.contains("verify_margin"),
+            "{text}"
+        );
+        let result = v["messages"][2]["content"][0]["content"].as_str().unwrap();
+        assert!(
+            !result.contains("verify_margin") && !result.contains("docs.example.com"),
+            "{result}"
+        );
+        assert_eq!(vault.restore_text(&out.vendor_payload).0, body.to_string());
+    }
+
+    #[test]
+    fn urls_are_not_comments() {
+        let cfg = all_hide_cfg();
+        let vault = PrivacyVault::new();
+        let out = AllHideEngine::process(
+            "see https://example.com/a_b for load_config",
+            TrafficCategory::InteractivePrompt,
+            &cfg,
+            &vault,
+        );
+        assert!(
+            out.vendor_payload.starts_with("see https://example.com/"),
+            "{}",
+            out.vendor_payload
+        );
+    }
+
+    #[test]
+    fn indexing_chaff_keeps_shape_and_size() {
+        let mut cfg = all_hide_cfg();
+        cfg.all_hide.enable_telemetry_chaff = true;
+        let vault = PrivacyVault::new();
+        let body =
+            json!({"model": "text-embedding-3-small", "input": ["fn secret_algo() { titan() }", "x".repeat(300)]});
+        let out = AllHideEngine::process(&body.to_string(), TrafficCategory::CodebaseIndexing, &cfg, &vault);
+        let v: Value = serde_json::from_str(&out.vendor_payload).unwrap();
+        assert_eq!(v["model"], "text-embedding-3-small");
+        assert_eq!(v["input"].as_array().unwrap().len(), 2);
+        assert_eq!(v["input"][1].as_str().unwrap().chars().count(), 300);
+        assert!(!out.vendor_payload.contains("secret_algo"));
+    }
+
+    #[test]
+    fn cipher_needs_matching_key_and_salt() {
+        let vault = PrivacyVault::new();
+        let text = "x".repeat(100) + "中文";
+        let enc = AllHideEngine::encode_keyed_braille_cipher(&text, "salt", &vault);
+        assert_ne!(
+            AllHideEngine::decode_braille_cipher_blocks(&enc, &PrivacyVault::new(), "salt"),
+            text
+        );
+        assert_ne!(AllHideEngine::decode_braille_cipher_blocks(&enc, &vault, "wrong"), text);
+        assert_eq!(AllHideEngine::decode_braille_cipher_blocks(&enc, &vault, "salt"), text);
+    }
+}

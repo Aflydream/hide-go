@@ -1,104 +1,151 @@
-use crate::vault::{is_valid_token_boundary, restore_with_sorted_pairs, PrivacyVault};
+use crate::vault::{Matcher, PrivacyVault};
+use std::sync::Arc;
 
-/// Streaming SSE / chunked response restorer with sliding window lookahead.
-/// Ensures that even if a semantic token or All-Hide camouflage identifier is split across
-/// two or more network chunks (e.g. Chunk 1 ends with `10.254.100.1` and Chunk 2 starts with `9`),
-/// it is seamlessly reassembled and restored to the local secret without premature short-token replacement.
+/// Streaming restorer with sliding-window lookahead.
+///
+/// Produces exactly what a one-shot `Matcher::restore` would produce over the concatenated
+/// stream: a token split across chunks (`198.18.0.1` + `9`) is held back until it can be
+/// decided, replacement values are never re-scanned, and the character just before the
+/// emitted prefix is remembered so identifier/number boundaries hold across chunks.
 pub struct StreamRestorer {
     vault: PrivacyVault,
+    matcher: Arc<Matcher>,
     pending_buffer: String,
+    left: Option<char>,
+    allow_secret: bool,
     total_restored: usize,
+    withheld: usize,
 }
 
 impl StreamRestorer {
     pub fn new(vault: PrivacyVault) -> Self {
+        Self::with_secret_policy(vault, true)
+    }
+
+    /// `allow_secret = false` keeps credential placeholders unresolved (tool-call arguments).
+    pub fn with_secret_policy(vault: PrivacyVault, allow_secret: bool) -> Self {
+        let matcher = vault.matcher();
         Self {
             vault,
+            matcher,
             pending_buffer: String::new(),
+            left: None,
+            allow_secret,
             total_restored: 0,
+            withheld: 0,
         }
+    }
+
+    /// Placeholders that were left in place because they stand for credentials.
+    pub fn withheld(&self) -> usize {
+        self.withheld
+    }
+
+    fn refresh(&mut self) {
+        self.matcher = self.vault.matcher();
     }
 
     /// Push a new incoming stream chunk and return the safely restored prefix that can be emitted immediately.
     pub fn push_chunk(&mut self, chunk: &str) -> String {
+        self.refresh();
         self.pending_buffer.push_str(chunk);
-
-        let pairs = self.vault.snapshot_pairs();
-        if pairs.is_empty() || self.pending_buffer.is_empty() {
+        if self.matcher.is_empty() {
+            self.left = self.pending_buffer.chars().next_back().or(self.left);
             return std::mem::take(&mut self.pending_buffer);
         }
 
-        let buf_len = self.pending_buffer.len();
-        let mut output = String::with_capacity(buf_len);
+        let buf = std::mem::take(&mut self.pending_buffer);
+        let mut output = String::with_capacity(buf.len());
         let mut pos = 0usize;
-
-        while pos < buf_len {
-            let rem = &self.pending_buffer[pos..];
-
-            // 1. If the remaining tail `rem` is a strict prefix of ANY registered token,
-            // we MUST hold `rem` back until more chunks arrive (or `finish()` is called).
-            let is_strict_prefix = pairs.iter().any(|(tok, _)| {
-                tok.len() > rem.len() && tok.as_bytes().starts_with(rem.as_bytes())
-            });
-            if is_strict_prefix {
+        while pos < buf.len() {
+            let rem = &buf[pos..];
+            if self.matcher.is_strict_prefix(rem) {
                 break;
             }
-
-            // 2. Find the longest matching token at `pos` (`pairs` is sorted by token length descending)
-            let mut matched: Option<(&str, &str)> = None;
-            for (token, real_val) in &pairs {
-                if token.len() < 2 || token.len() > rem.len() {
-                    continue;
-                }
-                if rem.starts_with(token.as_str())
-                    && is_valid_token_boundary(&self.pending_buffer, pos, token)
-                {
-                    matched = Some((token.as_str(), real_val.as_str()));
-                    break;
-                }
-            }
-
-            if let Some((token, real_val)) = matched {
-                // If this token match reaches the exact end of `pending_buffer` AND ends with an
-                // ASCII alphanumeric/underscore char, hold it back in case the next chunk continues
-                // a longer number/identifier (e.g. `10.254.100.1` followed by `9` in next chunk).
-                let ends_at_buffer_tail = pos + token.len() == buf_len;
-                let ends_with_word_or_digit = token
-                    .as_bytes()
+            if let Some(pair) = self.matcher.find_at(&buf, pos, self.left) {
+                // A word/digit-final token at the very end could still be the start of a longer
+                // identifier or number: wait for the next chunk.
+                let at_tail = pos + pair.token.len() == buf.len();
+                let word_final = pair
+                    .token
+                    .bytes()
                     .last()
-                    .map(|b| b.is_ascii_alphanumeric() || *b == b'_')
-                    .unwrap_or(false);
-
-                if ends_at_buffer_tail && ends_with_word_or_digit {
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_');
+                if at_tail && word_final {
                     break;
                 }
-
-                let (unwrapped, extra) = restore_with_sorted_pairs(real_val, &pairs);
-                output.push_str(&unwrapped);
-                self.total_restored += 1 + extra;
-                pos += token.len();
+                if pair.secret && !self.allow_secret {
+                    output.push_str(&pair.token);
+                    self.withheld += 1;
+                } else {
+                    output.push_str(&pair.original);
+                    self.total_restored += 1;
+                }
+                pos += pair.token.len();
             } else {
                 let ch = rem.chars().next().unwrap();
                 output.push(ch);
                 pos += ch.len_utf8();
             }
         }
-
-        if pos >= buf_len {
-            self.pending_buffer.clear();
-        } else if pos > 0 {
-            self.pending_buffer = self.pending_buffer[pos..].to_string();
+        if pos > 0 {
+            self.left = buf[..pos].chars().next_back();
         }
-
+        self.pending_buffer = buf[pos..].to_string();
         output
     }
 
     /// Flush remaining buffered content when the stream ends.
     pub fn finish(&mut self) -> (String, usize) {
+        self.refresh();
         let remaining = std::mem::take(&mut self.pending_buffer);
-        let (restored, count) = self.vault.restore_text(&remaining);
+        let (restored, count, withheld) = self.matcher.restore(&remaining, self.left, self.allow_secret);
         self.total_restored += count;
+        self.withheld += withheld;
         (restored, self.total_restored)
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(vault: &PrivacyVault, chunks: &[&str]) -> String {
+        let mut s = StreamRestorer::new(vault.clone());
+        let mut out: String = chunks.iter().map(|c| s.push_chunk(c)).collect();
+        out.push_str(&s.finish().0);
+        out
+    }
+
+    #[test]
+    fn streaming_matches_batch_without_rescanning_originals() {
+        let vault = PrivacyVault::new();
+        vault.insert_explicit("note: TOKEN_B", "TOKEN_A", "x");
+        vault.insert_explicit("real-b", "TOKEN_B", "x");
+        assert_eq!(stream(&vault, &["TOKEN_A "]), vault.restore_plain_text("TOKEN_A ").0);
+        assert_eq!(stream(&vault, &["TOKEN_A "]), "note: TOKEN_B ");
+    }
+
+    #[test]
+    fn identifier_boundary_holds_across_chunks() {
+        let vault = PrivacyVault::new();
+        vault.insert_explicit("real", "MASK", "x");
+        assert_eq!(stream(&vault, &["XX", "MASK done"]), "XXMASK done");
+        assert_eq!(stream(&vault, &["XX ", "MASK done"]), "XX real done");
+    }
+
+    #[test]
+    fn every_split_point_equals_batch() {
+        let vault = PrivacyVault::new();
+        vault.insert_explicit("10.0.0.10", "198.18.0.1", "InternalIp");
+        vault.insert_explicit("10.0.0.19", "198.18.0.19", "InternalIp");
+        vault.insert_explicit("real_fn", "fern_moss_100", "IsomorphicSymbol");
+        let text = "at 198.18.0.19:80 and 198.18.0.1 call fern_moss_100() not xfern_moss_100";
+        let batch = vault.restore_plain_text(text).0;
+        for i in 0..text.len() {
+            if text.is_char_boundary(i) {
+                assert_eq!(stream(&vault, &[&text[..i], &text[i..]]), batch, "split at {i}");
+            }
+        }
+    }
+}
