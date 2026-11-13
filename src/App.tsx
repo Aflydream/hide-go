@@ -1,498 +1,215 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef, type ReactNode } from 'react';
 import {
-  Activity,
-  Sliders,
-  Terminal,
-  BookMarked,
-  Eye,
+  ChartLineUp,
+  ArrowsLeftRight,
   ShieldCheck,
-  EyeOff,
-} from 'lucide-react';
-import {
-  HarnessKind,
-  HarnessProfile,
-  HideConfig,
-  PrivacyMode,
-  TrafficAuditRecord,
-  TrafficCategory,
-  VaultEntry,
-} from './types';
-import { TrafficMonitor } from './components/TrafficMonitor';
-import { HarnessManager } from './components/HarnessManager';
-import { PrivacyModeSelector } from './components/PrivacyModeSelector';
-import { VaultInspector } from './components/VaultInspector';
-import { LOGO_ICON_DATA_URL, LOGO_WORDMARK_DATA_URL } from './logoAssets';
+  Plugs,
+  Vault as VaultIcon,
+  BracketsAngle,
+  Eye,
+  EyeSlash,
+  Lightning,
+  PaperPlaneTilt,
+  WifiSlash,
+} from '@phosphor-icons/react';
+import { StoreProvider, isAuthError, useStore } from './store';
+import { Button, Segmented, ToastProvider, cx, type SegmentTone } from './components/ui';
+import type { Route } from './lib/hooks';
+import { MODE_LABEL, formatCount, formatDuration } from './lib/format';
+import type { PrivacyMode } from './types';
+import { Overview } from './views/Overview';
+import { Traffic } from './views/Traffic';
+import { Policy } from './views/Policy';
+import { Integrations } from './views/Integrations';
+import { VaultView } from './views/Vault';
+import { Rules } from './views/Rules';
+import { SimulateDialog } from './views/SimulateDialog';
+import logoMark from './assets/logo-mark.png';
+import logoWordmark from './assets/logo-wordmark.png';
 
-type TabKey = 'traffic' | 'privacy' | 'harnesses' | 'vault';
+const NAV: Array<{ route: Route; label: string; icon: ReactNode; title: string; description: string }> = [
+  { route: 'overview', label: '概览', icon: <ChartLineUp size={18} />, title: '概览', description: '网关运行状态、保护范围与最近流量' },
+  { route: 'traffic', label: '流量', icon: <ArrowsLeftRight size={18} />, title: '流量检视', description: '逐条比对本地请求、厂商实际收到的内容与还原后的响应' },
+  { route: 'policy', label: '保护策略', icon: <ShieldCheck size={18} />, title: '保护策略', description: '决定出站请求如何改写、哪些数据需要拦截' },
+  { route: 'rules', label: '自定义规则', icon: <BracketsAngle size={18} />, title: '自定义规则', description: '为项目代号、内部域名等补充识别规则' },
+  { route: 'vault', label: '映射表', icon: <VaultIcon size={18} />, title: '映射表', description: '占位符与真实值的对应关系，仅保存在本机内存中' },
+  { route: 'integrations', label: '工具接入', icon: <Plugs size={18} />, title: '工具接入', description: '把 AI 编程工具的 API 地址指向本地网关' },
+];
 
-const DEFAULT_CONFIG: HideConfig = {
-  proxyPort: 18787,
-  mode: 'audit-only',
-  allHide: {
-    enableIsomorphicCamouflage: true,
-    coverTheme: 'botanical-garden',
-    enableCipherGarble: true,
-    enableTelemetryChaff: true,
-    strictLiteralMasking: true,
-  },
-  blockSilentTelemetry: true,
-  protectProjectPaths: true,
-  protectSecretsAndKeys: true,
-  protectInternalNetwork: true,
-  projectSalt: 'hide-go-quantum-salt-2026',
-  customRules: [
-    {
-      id: 'rule-1',
-      name: '核心项目代号',
-      pattern: 'ProjectTitan|AflyCore|QuantumPay',
-      replacementHint: 'GreenhouseApp',
-      enabled: true,
-    },
-    {
-      id: 'rule-2',
-      name: '内部私有仓库域名',
-      pattern: '[a-zA-Z0-9-]+\\.corp\\.internal',
-      replacementHint: 'node-01.garden.example',
-      enabled: true,
-    },
-  ],
-};
+// The active segment takes the colour of what the mode means: ochre = nothing is cloaked,
+// ink green = cloaked and restored, solid ink = everything blacked out.
+const MODE_OPTIONS: Array<{ value: PrivacyMode; label: string; icon: ReactNode; title: string; tone: SegmentTone }> = [
+  { value: 'audit-only', label: MODE_LABEL['audit-only'], icon: <Eye size={14} />, title: '只记录，不修改请求', tone: 'warn' },
+  { value: 'auto-desensitize', label: MODE_LABEL['auto-desensitize'], icon: <ShieldCheck size={14} />, title: '替换密钥、路径与内网信息，返回时还原', tone: 'brand' },
+  { value: 'all-hide', label: MODE_LABEL['all-hide'], icon: <EyeSlash size={14} />, title: '在脱敏基础上伪装代码标识符与字面量', tone: 'ink' },
+];
 
-function getApiHeaders(json = false): Record<string, string> {
-  const headers: Record<string, string> = {};
-  const winToken = (window as unknown as { __HIDE_GO_TOKEN__?: string }).__HIDE_GO_TOKEN__;
-  const queryToken = new URLSearchParams(window.location.search).get('token');
-  const token = winToken || queryToken || '';
-  if (token) {
-    headers['X-Hide-Go-Token'] = token;
-  }
-  if (json) {
-    headers['Content-Type'] = 'application/json';
-  }
-  return headers;
+function Sidebar() {
+  const { route, navigate, logs, vault, status, config, statusError } = useStore();
+  const liveCount = logs.filter((l) => !l.simulated).length;
+  const online = !!status && !statusError;
+  const counts: Partial<Record<Route, number>> = {
+    traffic: liveCount,
+    vault: status?.activeVaultTokens ?? vault.length,
+    rules: config?.customRules.length,
+  };
+  return (
+    <aside className="flex w-56 shrink-0 flex-col border-r border-line bg-bg max-[1180px]:w-14" aria-label="主导航">
+      <div className="flex h-14 items-center gap-2.5 px-4 max-[1180px]:justify-center max-[1180px]:px-0">
+        <img src={logoMark} alt="" className="h-6 w-6 shrink-0" />
+        <img src={logoWordmark} alt="Hide-Go" className="h-[18px] w-auto max-[1180px]:hidden" />
+      </div>
+      <nav className="flex-1 space-y-0.5 px-2 pt-2">
+        {NAV.map((item) => {
+          const active = item.route === route;
+          const count = counts[item.route];
+          return (
+            <button
+              key={item.route}
+              type="button"
+              onClick={() => navigate(item.route)}
+              aria-current={active ? 'page' : undefined}
+              title={item.label}
+              className={cx(
+                'relative flex h-9 w-full items-center gap-3 rounded px-2.5 text-sm transition-colors max-[1180px]:justify-center max-[1180px]:px-0',
+                active ? 'bg-surface font-medium text-fg shadow-[0_0_0_1px_rgb(var(--line-strong))]' : 'text-fg-muted hover:bg-surface-3/70 hover:text-fg',
+              )}
+            >
+              {active && <span aria-hidden="true" className="absolute inset-y-2 left-0 w-0.5 rounded-full bg-brand" />}
+              <span aria-hidden="true" className={cx('flex', active && 'text-brand')}>
+                {item.icon}
+              </span>
+              <span className="flex-1 truncate text-left max-[1180px]:sr-only">{item.label}</span>
+              {count !== undefined && count > 0 && (
+                <span className="tabular text-2xs text-fg-subtle max-[1180px]:hidden">{formatCount(count)}</span>
+              )}
+            </button>
+          );
+        })}
+      </nav>
+
+      <div className="border-t border-line p-3 max-[1180px]:hidden">
+        <div role="status" aria-live="polite">
+          <div className="flex items-center gap-2 text-xs">
+            <span aria-hidden="true" className={cx('h-2 w-2 rounded-full', online ? 'bg-brand' : 'bg-danger')} />
+            <span className="font-medium text-fg">{online ? '网关运行中' : '网关未连接'}</span>
+            {config && <span className="tabular ml-auto font-mono text-2xs text-fg-subtle">:{config.proxyPort}</span>}
+          </div>
+          {status && <p className="tabular mt-1 pl-4 text-2xs text-fg-subtle">已运行 {formatDuration(status.uptimeSecs)} · v{status.version}</p>}
+        </div>
+      </div>
+    </aside>
+  );
 }
 
-export const App: React.FC = () => {
-  const initialTab = (new URLSearchParams(window.location.search).get('tab') as TabKey) || 'traffic';
-  const [activeTab, setActiveTab] = useState<TabKey>(initialTab);
-  const [config, setConfig] = useState<HideConfig>(DEFAULT_CONFIG);
-  const [records, setRecords] = useState<TrafficAuditRecord[]>([]);
-  const [harnesses, setHarnesses] = useState<HarnessProfile[]>([]);
-  const [vaultEntries, setVaultEntries] = useState<VaultEntry[]>([]);
-  const [backendConnected, setBackendConnected] = useState<boolean>(false);
-  const [syncError, setSyncError] = useState<string | null>(null);
-
-  const fetchAllState = useCallback(async () => {
-    try {
-      const reqInit: RequestInit = {
-        headers: getApiHeaders(),
-        credentials: 'same-origin',
-      };
-      const [cfgRes, logsRes, harnRes, vaultRes] = await Promise.all([
-        fetch('/api/config', reqInit),
-        fetch('/api/logs', reqInit),
-        fetch('/api/harnesses', reqInit),
-        fetch('/api/vault', reqInit),
-      ]);
-      if (cfgRes.ok && logsRes.ok && harnRes.ok && vaultRes.ok) {
-        const [cfgData, logsData, harnData, vaultData] = await Promise.all([
-          cfgRes.json(),
-          logsRes.json(),
-          harnRes.json(),
-          vaultRes.json(),
-        ]);
-        setConfig(cfgData);
-        setRecords(logsData);
-        setHarnesses(harnData);
-        setVaultEntries(vaultData);
-        setBackendConnected(true);
-      } else {
-        setBackendConnected(false);
-      }
-    } catch {
-      setBackendConnected(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchAllState();
-    const timer = setInterval(fetchAllState, 3500);
-    return () => clearInterval(timer);
-  }, [fetchAllState]);
-
-  const handleUpdateConfig = async (nextConfig: HideConfig) => {
-    const previousConfig = config;
-    try {
-      const res = await fetch('/api/config', {
-        method: 'POST',
-        headers: getApiHeaders(true),
-        credentials: 'same-origin',
-        body: JSON.stringify(nextConfig),
-      });
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
-      const updated = await res.json();
-      setConfig(updated);
-      setBackendConnected(true);
-      setSyncError(null);
-    } catch {
-      // Roll back to confirmed backend config and display explicit error alert
-      setConfig(previousConfig);
-      setBackendConnected(false);
-      setSyncError('保存失败：无法将保护配置同步至本地网关，界面已回滚为后端实际生效状态。');
-      try {
-        const actualRes = await fetch('/api/config', {
-          headers: getApiHeaders(),
-          credentials: 'same-origin',
-        });
-        if (actualRes.ok) {
-          const actualCfg = await actualRes.json();
-          setConfig(actualCfg);
-          setBackendConnected(true);
-        }
-      } catch {
-        // Gateway remains unreachable
-      }
-    }
-  };
-
-  const handleQuickModeChange = (mode: PrivacyMode) => {
-    handleUpdateConfig({
-      ...config,
-      mode,
-    });
-  };
-
-  const handleSimulate = async (
-    harness: HarnessKind,
-    category: TrafficCategory,
-    customPayload?: string
-  ) => {
-    try {
-      const res = await fetch('/api/simulate', {
-        method: 'POST',
-        headers: getApiHeaders(true),
-        credentials: 'same-origin',
-        body: JSON.stringify({
-          harness,
-          category,
-          customPayload: customPayload ?? null,
-        }),
-      });
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
-      setSyncError(null);
-      await fetchAllState();
-      setActiveTab('traffic');
-    } catch {
-      setBackendConnected(false);
-      setSyncError('模拟请求发送失败：本地代理网关未响应或未授权。');
-    }
-  };
-
-  const handleClearLogs = async () => {
-    try {
-      const res = await fetch('/api/logs', {
-        method: 'DELETE',
-        headers: getApiHeaders(),
-        credentials: 'same-origin',
-      });
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
-      await fetchAllState();
-    } catch {
-      setBackendConnected(false);
-      setSyncError('清空日志失败：本地代理网关未响应。');
-    }
-  };
-
-  const handleClearVault = async () => {
-    try {
-      const res = await fetch('/api/vault', {
-        method: 'DELETE',
-        headers: getApiHeaders(),
-        credentials: 'same-origin',
-      });
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
-      await fetchAllState();
-    } catch {
-      setBackendConnected(false);
-      setSyncError('清空词表失败：本地代理网关未响应。');
-    }
-  };
-
-  const totalFindings = records.reduce((acc, r) => acc + r.findings.length, 0);
-  const totalRestored = records.reduce((acc, r) => acc + r.restoredCount, 0);
-
+function TopBar() {
+  const { route, config, saveConfig, openSimulator } = useStore();
+  const item = NAV.find((n) => n.route === route) ?? NAV[0];
   return (
-    <div className="h-screen w-screen overflow-hidden bg-canvas text-warm-900 flex select-none p-2 gap-2">
-      {/* Left Navigation Sidebar */}
-      <aside className="w-52 shrink-0 flex flex-col justify-between px-2 py-2.5">
-        <div className="space-y-5">
-          {/* Brand Logo */}
-          <div className="px-2.5 flex items-center gap-2.5">
-            <img
-              src={LOGO_ICON_DATA_URL}
-              alt="HG"
-              className="w-6 h-6 object-contain shrink-0"
-            />
-            <img
-              src={LOGO_WORDMARK_DATA_URL}
-              alt="Hide-Go"
-              className="h-[18px] w-auto object-contain"
-            />
-          </div>
-
-          {/* Primary Navigation */}
-          <nav className="space-y-1" aria-label="主导航">
-            <button
-              type="button"
-              onClick={() => setActiveTab('traffic')}
-              className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-[13px] transition-all duration-150 cursor-pointer ${
-                activeTab === 'traffic'
-                  ? 'bg-paper text-warm-900 font-semibold shadow-pill ring-1 ring-warm-200/80'
-                  : 'text-warm-600 hover:bg-warm-200/40 hover:text-warm-900'
-              }`}
-            >
-              <span className="flex items-center gap-2.5">
-                <Activity
-                  className={`w-4 h-4 ${
-                    activeTab === 'traffic' ? 'text-brand' : 'text-warm-500'
-                  }`}
-                />
-                <span>抓包检视</span>
-              </span>
-              <span className="font-mono text-[11px] text-warm-500 tabular-nums">
-                {records.length}
-              </span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setActiveTab('privacy')}
-              className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-[13px] transition-all duration-150 cursor-pointer ${
-                activeTab === 'privacy'
-                  ? 'bg-paper text-warm-900 font-semibold shadow-pill ring-1 ring-warm-200/80'
-                  : 'text-warm-600 hover:bg-warm-200/40 hover:text-warm-900'
-              }`}
-            >
-              <span className="flex items-center gap-2.5">
-                <Sliders
-                  className={`w-4 h-4 ${
-                    activeTab === 'privacy' ? 'text-brand' : 'text-warm-500'
-                  }`}
-                />
-                <span>隐私引擎</span>
-              </span>
-              <span className="w-1.5 h-1.5 rounded-full bg-brand" />
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setActiveTab('harnesses')}
-              className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-[13px] transition-all duration-150 cursor-pointer ${
-                activeTab === 'harnesses'
-                  ? 'bg-paper text-warm-900 font-semibold shadow-pill ring-1 ring-warm-200/80'
-                  : 'text-warm-600 hover:bg-warm-200/40 hover:text-warm-900'
-              }`}
-            >
-              <span className="flex items-center gap-2.5">
-                <Terminal
-                  className={`w-4 h-4 ${
-                    activeTab === 'harnesses' ? 'text-brand' : 'text-warm-500'
-                  }`}
-                />
-                <span>工具接入</span>
-              </span>
-              <span className="font-mono text-[11px] text-warm-500 tabular-nums">
-                {harnesses.length}
-              </span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setActiveTab('vault')}
-              className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-[13px] transition-all duration-150 cursor-pointer ${
-                activeTab === 'vault'
-                  ? 'bg-paper text-warm-900 font-semibold shadow-pill ring-1 ring-warm-200/80'
-                  : 'text-warm-600 hover:bg-warm-200/40 hover:text-warm-900'
-              }`}
-            >
-              <span className="flex items-center gap-2.5">
-                <BookMarked
-                  className={`w-4 h-4 ${
-                    activeTab === 'vault' ? 'text-brand' : 'text-warm-500'
-                  }`}
-                />
-                <span>映射词表</span>
-              </span>
-              <span className="font-mono text-[11px] text-warm-500 tabular-nums">
-                {vaultEntries.length}
-              </span>
-            </button>
-          </nav>
-        </div>
-
-        {/* Bottom Gateway Card */}
-        <div className="bg-warm-50/90 border border-warm-200/90 rounded-xl p-3 space-y-2.5">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  backendConnected ? 'bg-brand' : 'bg-amber-500'
-                }`}
-              />
-              <span className="text-xs font-medium text-warm-900">
-                {backendConnected ? '本地网关就绪' : '正在连接网关'}
-              </span>
-            </div>
-            <span className="text-[11px] font-mono text-warm-500 tabular-nums">
-              :{config.proxyPort}
-            </span>
-          </div>
-
-          <div className="grid grid-cols-2 gap-2 pt-2 border-t border-warm-200/70">
-            <div>
-              <div className="text-[11px] text-warm-500">已过滤敏感项</div>
-              <div className="text-sm font-mono font-semibold text-warm-900 tabular-nums mt-0.5">
-                {totalFindings}
-              </div>
-            </div>
-            <div>
-              <div className="text-[11px] text-warm-500">流式无损还原</div>
-              <div className="text-sm font-mono font-semibold text-brand-dark tabular-nums mt-0.5">
-                {totalRestored}
-              </div>
-            </div>
-          </div>
-        </div>
-      </aside>
-
-      {/* Main Recessed Window Surface */}
-      <div className="flex-1 bg-paper rounded-xl border border-warm-200 shadow-panel flex flex-col min-w-0 overflow-hidden">
-        {/* Window Top Header */}
-        <header className="h-12 shrink-0 px-5 border-b border-warm-200 flex items-center justify-between gap-4 bg-paper">
-          <div className="flex items-center gap-3">
-            <h1 className="text-[14px] font-semibold text-warm-900">
-              {activeTab === 'traffic' && '抓包检视'}
-              {activeTab === 'privacy' && '隐私引擎'}
-              {activeTab === 'harnesses' && '工具接入'}
-              {activeTab === 'vault' && '映射词表'}
-            </h1>
-            <span className="text-xs text-warm-500 hidden md:inline">
-              {activeTab === 'traffic' && '实时比对本地发送载荷与云端模型实际接收内容'}
-              {activeTab === 'privacy' && '配置出站脱敏等级、All-Hide 伪装词库与扫描规则'}
-              {activeTab === 'harnesses' && '查看各 AI 编程客户端的本地代理地址与环境变量'}
-              {activeTab === 'vault' && '检视当前驻留内存的占位符映射关系与自定义正则'}
-            </span>
-          </div>
-
-          {/* Native-style Segmented Mode Control */}
-          <div
-            role="group"
-            aria-label="全局隐私模式"
-            className="inline-flex items-center bg-warm-100 p-0.5 rounded-lg border border-warm-200"
-          >
-            <button
-              type="button"
-              onClick={() => handleQuickModeChange('audit-only')}
-              className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs transition-all duration-150 cursor-pointer ${
-                config.mode === 'audit-only'
-                  ? 'bg-paper text-warm-900 font-medium shadow-pill'
-                  : 'text-warm-600 hover:text-warm-900'
-              }`}
-            >
-              <Eye className="w-3.5 h-3.5 text-warm-500" />
-              仅审计
-            </button>
-            <button
-              type="button"
-              onClick={() => handleQuickModeChange('auto-desensitize')}
-              className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs transition-all duration-150 cursor-pointer ${
-                config.mode === 'auto-desensitize'
-                  ? 'bg-paper text-brand-dark font-semibold shadow-pill'
-                  : 'text-warm-600 hover:text-warm-900'
-              }`}
-            >
-              <ShieldCheck className="w-3.5 h-3.5 text-brand" />
-              自动脱敏
-            </button>
-            <button
-              type="button"
-              onClick={() => handleQuickModeChange('all-hide')}
-              className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs transition-all duration-150 cursor-pointer ${
-                config.mode === 'all-hide'
-                  ? 'bg-warm-900 text-white font-medium shadow-pill'
-                  : 'text-warm-600 hover:text-warm-900'
-              }`}
-            >
-              <EyeOff className="w-3.5 h-3.5" />
-              All-Hide
-            </button>
-          </div>
-        </header>
-
-        {syncError && (
-          <div
-            role="alert"
-            className="shrink-0 px-5 py-2.5 bg-danger-bg border-b border-danger-border flex items-center justify-between gap-4 text-xs text-danger-text"
-          >
-            <span className="font-medium">{syncError}</span>
-            <button
-              type="button"
-              onClick={() => setSyncError(null)}
-              className="px-2 py-0.5 rounded border border-danger-border/60 hover:bg-paper/60 text-[11px] cursor-pointer"
-            >
-              关闭
-            </button>
-          </div>
-        )}
-
-        {/* Main View Content */}
-        <main className="flex-1 min-h-0 overflow-y-auto">
-          {activeTab === 'traffic' && (
-            <TrafficMonitor
-              records={records}
-              currentMode={config.mode}
-              onSimulate={handleSimulate}
-              onClearLogs={handleClearLogs}
-            />
-          )}
-
-          {activeTab === 'privacy' && (
-            <PrivacyModeSelector
-              config={config}
-              onUpdateConfig={handleUpdateConfig}
-            />
-          )}
-
-          {activeTab === 'harnesses' && (
-            <HarnessManager
-              profiles={harnesses}
-              proxyPort={config.proxyPort}
-              onSimulateHarness={(harness, category) =>
-                handleSimulate(harness, category)
-              }
-            />
-          )}
-
-          {activeTab === 'vault' && (
-            <VaultInspector
-              entries={vaultEntries}
-              config={config}
-              onUpdateConfig={handleUpdateConfig}
-              onClearVault={handleClearVault}
-            />
-          )}
-        </main>
+    <header className="flex h-14 shrink-0 items-center justify-between gap-4 border-b border-line bg-surface px-6">
+      <div className="min-w-0">
+        <h1 className="truncate text-base font-semibold text-fg">{item.title}</h1>
+        <p className="truncate text-xs text-fg-subtle max-[1100px]:hidden">{item.description}</p>
       </div>
+      <div className="flex shrink-0 items-center gap-3">
+        <Button size="sm" variant="ghost" icon={<PaperPlaneTilt size={14} />} onClick={openSimulator}>
+          模拟请求
+        </Button>
+        <span aria-hidden="true" className="h-5 w-px bg-line" />
+        <span className="label-caps max-[1280px]:hidden" id="mode-label">
+          处理模式
+        </span>
+        {config ? (
+          <Segmented
+            label="全局处理模式"
+            value={config.mode}
+            onChange={(mode) => mode !== config.mode && saveConfig({ ...config, mode }, `已切换为「${MODE_LABEL[mode]}」`)}
+            options={MODE_OPTIONS}
+          />
+        ) : (
+          <span className="h-8 w-[260px] animate-pulse rounded bg-surface-3" aria-hidden="true" />
+        )}
+      </div>
+    </header>
+  );
+}
+
+function ConnectionBanner() {
+  const { statusError } = useStore();
+  if (!statusError) return null;
+  const auth = isAuthError(statusError);
+  return (
+    <div role="alert" className="flex items-center gap-3 border-b border-danger/40 bg-danger/10 px-6 py-2.5 text-sm text-danger">
+      <WifiSlash aria-hidden="true" size={16} weight="bold" />
+      <span className="font-medium">{auth ? '管理令牌无效' : '无法连接本地网关'}</span>
+      <span className="text-xs text-fg-muted">
+        {auth ? '请关闭此页面，并从 Hide-Go 桌面程序重新打开控制台。' : '界面数据可能已过期，正在自动重试…'}
+      </span>
     </div>
   );
-};
+}
 
-export default App;
+function AuditWarning() {
+  const { config, route, navigate } = useStore();
+  if (!config || config.mode !== 'audit-only' || route === 'policy') return null;
+  return (
+    <div className="flex items-center gap-3 border-b border-warn/40 bg-warn/10 px-6 py-2 text-xs">
+      <Lightning aria-hidden="true" size={14} weight="fill" className="text-warn" />
+      <span className="font-medium text-warn">仅审计模式</span>
+      <span className="text-fg-muted">密钥、路径和内网地址会原样发送给模型厂商。</span>
+      <button type="button" onClick={() => navigate('policy')} className="ml-auto font-medium text-fg underline-offset-2 hover:underline">
+        查看保护策略
+      </button>
+    </div>
+  );
+}
+
+function Main() {
+  const { route } = useStore();
+  const mainRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    mainRef.current?.scrollTo({ top: 0 });
+  }, [route]);
+  return (
+    <main ref={mainRef} id="main" tabIndex={-1} className="min-h-0 flex-1 overflow-y-auto focus:outline-none">
+      {route === 'overview' && <Overview />}
+      {route === 'traffic' && <Traffic />}
+      {route === 'policy' && <Policy />}
+      {route === 'rules' && <Rules />}
+      {route === 'vault' && <VaultView />}
+      {route === 'integrations' && <Integrations />}
+    </main>
+  );
+}
+
+function Shell() {
+  const { simulatorOpen, closeSimulator, status } = useStore();
+  useEffect(() => {
+    document.title = status ? `Hide-Go · ${formatCount(status.totalRequests)} 请求` : 'Hide-Go 控制台';
+  }, [status]);
+  return (
+    <div className="flex h-full min-w-[960px]">
+      <a href="#main" className="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-[70] focus:rounded focus:bg-surface focus:px-3 focus:py-2 focus:text-sm">
+        跳到主要内容
+      </a>
+      <Sidebar />
+      <div className="flex min-w-0 flex-1 flex-col">
+        <TopBar />
+        <ConnectionBanner />
+        <AuditWarning />
+        <Main />
+      </div>
+      <SimulateDialog open={simulatorOpen} onClose={closeSimulator} />
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ToastProvider>
+      <StoreProvider>
+        <Shell />
+      </StoreProvider>
+    </ToastProvider>
+  );
+}

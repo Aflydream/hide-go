@@ -2,45 +2,123 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Self-hosted fonts (Latin subsets; CJK falls back to PingFang SC / Microsoft YaHei). */
+@font-face {
+  font-family: 'IBM Plex Sans Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 700;
+  src: url('../node_modules/@fontsource-variable/ibm-plex-sans/files/ibm-plex-sans-latin-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'JetBrains Mono Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 800;
+  src: url('../node_modules/@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/*
+ * Design tokens — see design-system/hide-go/MASTER.md ("查验台": paper, ink and two signal inks).
+ * The console is light-only. Neutrals are warm paper and ink rather than blue-grey; colour is
+ * reserved for meaning: ink green = cloaked and cleared to leave, vermilion = real value that
+ * stays on this machine, ochre = intercepted.
+ * Values are RGB channels so Tailwind alpha modifiers work (bg-brand/10).
+ * Every text token is >= 4.5:1 on every surface; control boundaries >= 3:1.
+ */
 @layer base {
   :root {
     color-scheme: light;
+    --bg: 244 242 236;
+    --surface: 253 252 249;
+    --surface-2: 248 246 241;
+    --surface-3: 238 235 227;
+    --line: 229 225 215;
+    --line-strong: 208 203 190;
+    --line-control: 140 135 121;
+    --fg: 26 28 24;
+    --fg-muted: 78 80 72;
+    --fg-subtle: 104 106 95;
+    --brand: 6 95 70;
+    --brand-solid: 4 120 87;
+    --brand-on: 255 255 255;
+    --danger: 168 40 24;
+    --danger-solid: 185 45 28;
+    --warn: 138 82 8;
+    --info: 38 84 150;
+    --focus: 4 120 87;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
   }
 
   body {
-    background-color: #F2F1ED;
-    color: #131B20;
-    @apply font-sans antialiased text-[13px] leading-normal;
-    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    @apply bg-bg text-fg font-sans text-sm antialiased;
+    font-feature-settings: 'cv05', 'ss01';
   }
 
-  .tabular-nums {
+  code,
+  kbd,
+  pre,
+  .font-mono {
+    font-variant-ligatures: none;
+  }
+
+  :focus {
+    outline: none;
+  }
+  :focus-visible {
+    outline: 2px solid rgb(var(--focus));
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+
+  ::selection {
+    background: rgb(var(--brand) / 0.28);
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--line-strong)) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgb(var(--line-strong));
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 999px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer components {
+  .tabular {
     font-variant-numeric: tabular-nums;
   }
-
-  *:focus-visible {
-    outline: 2px solid #00A87E;
-    outline-offset: 1px;
+  .label-caps {
+    @apply text-2xs font-medium uppercase tracking-[0.06em] text-fg-subtle;
   }
-}
-
-/* Subtle Desktop Scrollbars */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-::-webkit-scrollbar-thumb {
-  background: #D4D1C7;
-  border-radius: 3px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: #A19E93;
+  .hairline {
+    @apply border-line;
+  }
+  .mark-token {
+    @apply rounded-sm bg-brand/15 text-brand;
+    box-shadow: inset 0 -1px 0 rgb(var(--brand) / 0.55);
+  }
+  .mark-secret {
+    @apply rounded-sm bg-danger/15 text-danger;
+    box-shadow: inset 0 -1px 0 rgb(var(--danger) / 0.55);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

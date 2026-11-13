@@ -1,71 +1,60 @@
-# Design System Master File (Swiss Editorial Light & Anti-AI Precision)
+# Hide-Go 控制台设计系统 ——「查验台」
 
-> **LOGIC:** Global Source of Truth for Hide-Go Desktop UI.
-> **Style:** `minimalism-and-swiss-style` (Swiss Grid / Technical Inspector)
-> **Design Dials:** Variance `2/10` (Strict Grid) | Motion `2/10` (150ms Subtle) | Density `9/10` (High-Density Inspector)
+> 控制台界面的唯一设计依据。实现见 `src/index.css`（令牌）、`tailwind.config.js`（刻度）、`src/components/ui.tsx`（组件）。
 
----
+## 1. 立意
 
-## 1. Anti-AI Design Rules (Mandatory)
+Hide-Go 做的事是在数据出境前逐条查验、涂黑、放行。界面因此取「查验台」的样子：一张纸、一种墨，加两种只用来表达含义的印色。
 
-1. **Zero Floating Card Soup**: Do NOT wrap every section in `rounded-xl p-5 shadow-sm`. Use continuous 1px hairlines (`#E4E4E7`), flush split panes, and tabular rows.
-2. **Zero Soft Pastel Pill Spam**: Do NOT scatter colorful rounded-full pills across every card. Status indicators must be sharp (`rounded-[3px]`), compact (`11px` uppercase monospace), and neutral by default, reserving color strictly for semantic signals.
-3. **Zero Decorative Icon Boxes**: Do NOT put every heading icon inside a `p-2 rounded-lg bg-slate-50 border` container. Use typography, index numbers (`01`, `02`, `03`), or bare 14px SVG icons aligned to the baseline.
-4. **Zero Emoji & Zero AI Copy**: No emojis anywhere. No bilingual filler titles or marketing slogans. Use concise, technical, desktop utility terminology.
-5. **Strict Border Radius & Shadow**: Maximum radius is `4px` (`rounded`) or `0px` (flush grid). `box-shadow: none` across all static surfaces.
+- **只有浅色**。不提供深色主题，也不跟随系统的深色偏好。
+- **纸与墨**。中性色是偏暖的纸色与墨色，不用蓝灰。
+- **颜色只表达含义**，从不用于装饰：
 
----
-
-## 2. Three-Layer Token Architecture
-
-### Layer 1: Primitive Tokens
-- `--zinc-50`: `#FAFAFA`
-- `--zinc-100`: `#F4F4F5`
-- `--zinc-200`: `#E4E4E7`
-- `--zinc-300`: `#D4D4D8`
-- `--zinc-500`: `#71717A`
-- `--zinc-600`: `#52525B`
-- `--zinc-800`: `#27272A`
-- `--zinc-950`: `#09090B`
-- `--emerald-600`: `#059669`
-- `--emerald-700`: `#047857`
-- `--emerald-50`: `#ECFDF5`
-- `--amber-700`: `#B45309`
-- `--amber-50`: `#FFFBEB`
-- `--red-600`: `#DC2626`
-- `--red-50`: `#FEF2F2`
-
-### Layer 2: Semantic Tokens (Light Mode)
-| Token | Value | Role |
+| 印色 | 令牌 | 含义 |
 |---|---|---|
-| `--bg-canvas` | `#F4F4F5` | App outer frame / recessed well |
-| `--bg-surface` | `#FFFFFF` | Primary work surface / inspector pane |
-| `--bg-subtle` | `#FAFAFA` | Table header / code gutter / inactive bar |
-| `--text-primary` | `#09090B` | Primary headings, active labels, code |
-| `--text-secondary` | `#52525B` | Body descriptions, secondary cells |
-| `--text-muted` | `#71717A` | Timestamps, endpoints, metadata |
-| `--border-hairline` | `#E4E4E7` | Primary 1px grid divider |
-| `--border-strong` | `#09090B` | Active selection border / primary focus |
-| `--accent-brand` | `#059669` | Hide-Go emerald status & active restoration |
-| `--signal-danger` | `#DC2626` | Raw secret / unmasked leak indicator |
-| `--signal-warn` | `#B45309` | Chaff / telemetry interception |
+| 墨绿 | `--brand` | 已伪装，可以出境（占位符、厂商可见的内容） |
+| 朱红 | `--danger` | 真实值，只留在本机（密钥、原始路径） |
+| 赭黄 | `--warn` | 被拦截，或没有受到保护（遥测、仅审计模式） |
+| 靛蓝 | `--info` | 中性提示（模拟记录） |
 
-### Layer 3: Density 9/10 Spacing Scale
-- `--space-xs`: `2px`
-- `--space-sm`: `4px`
-- `--space-md`: `8px`
-- `--space-lg`: `12px`
-- `--space-xl`: `16px`
-- `--space-2xl`: `24px`
+同一对颜色贯穿所有页面：流量对照里「本地发出」一栏是朱红、「厂商收到」一栏是墨绿；映射表左列墨绿、右列朱红；顶栏的处理模式按含义着色——仅审计为赭黄、自动脱敏为墨绿、All-Hide 为实心墨色。
 
----
+## 2. 令牌
 
-## 3. Typography & Scannability
+值为 RGB 通道，以便使用 Tailwind 的透明度修饰（`bg-brand/10`）。
 
-- **UI Sans**: `'Inter'`, `-apple-system`, `BlinkMacSystemFont`, `'PingFang SC'`, `'Microsoft YaHei'`, `sans-serif`
-- **Technical Mono**: `'JetBrains Mono'`, `'SFMono-Regular'`, `'Menlo'`, `'Consolas'`, `monospace`
-- **Numeric Discipline**: `font-variant-numeric: tabular-nums` on all counters, latencies, timestamps, and ports.
-- **Hierarchy**:
-  - Section Index / Column Header: `11px` (`0.6875rem`), `font-mono`, `uppercase`, `tracking-wider`, `text-zinc-500`
-  - Body / Table Cell: `12px` (`0.75rem`) – `13px` (`0.8125rem`), `text-zinc-900`
-  - Pane Title: `13px` (`0.8125rem`), `font-semibold`, `tracking-tight`, `text-zinc-950`
+| 令牌 | 值 | 用途 |
+|---|---|---|
+| `--bg` | `244 242 236` | 应用底色、侧栏 |
+| `--surface` | `253 252 249` | 工作面：面板、表格、对话框 |
+| `--surface-2` | `248 246 241` | 表头、代码栏标题、悬停 |
+| `--surface-3` | `238 235 227` | 凹陷块、骨架屏、中性徽标 |
+| `--line` | `229 225 215` | 1px 分隔线 |
+| `--line-strong` | `208 203 190` | 面板与分段控件边框 |
+| `--line-control` | `140 135 121` | 输入框、开关边框（≥ 3:1） |
+| `--fg` / `--fg-muted` / `--fg-subtle` | `26 28 24` / `78 80 72` / `104 106 95` | 正文 / 次要 / 辅助文字 |
+| `--brand` / `--brand-solid` | `6 95 70` / `4 120 87` | 墨绿文字 / 实心填充 |
+| `--danger` / `--danger-solid` | `168 40 24` / `185 45 28` | 朱红文字 / 实心填充 |
+| `--warn` | `138 82 8` | 赭黄 |
+| `--info` | `38 84 150` | 靛蓝 |
+
+**对比度约束**：所有文字令牌在所有表面上 ≥ 4.5:1，控件边界 ≥ 3:1，带色底的徽标与标记同样 ≥ 4.5:1。改动色板后必须重新核对，不凭目测。
+
+## 3. 字体与刻度
+
+- 界面：IBM Plex Sans Variable；等宽：JetBrains Mono Variable。均为自托管的拉丁子集，中文回退到 PingFang SC / Microsoft YaHei。
+- 字号：11 / 12 / 13（正文）/ 14 / 16 / 20 / 24 / 30。
+- 计数、耗时、时间戳、端口一律 `tabular-nums`。
+- 圆角：3 / 4 / 6 / 8px，不用更大的圆角。
+- 阴影只用于浮层（对话框、通知）；静态表面不加阴影。
+- 动效：150ms，`cubic-bezier(0.2, 0, 0, 1)`；尊重 `prefers-reduced-motion`。
+
+## 4. 规则
+
+1. 不堆卡片：用连续的 1px 分隔线、贴边分栏与表格行组织内容。
+2. 徽标保持小而方（3px 圆角、11px），默认中性，只有表达上表中的含义时才上色。
+3. 不给图标加装饰底框；标题用字重、序号（`01`、`02`）或裸图标。
+4. 不用表情符号与宣传语；文案用简明的工具术语。
+5. 颜色从不作为唯一信号：每处着色都配有文字或图标（「仅本机」「厂商可见」「凭据」等）。
+6. 所有控件有可访问名称，可用键盘操作，焦点环为 2px 墨绿。
+7. 最小窗口宽度 960px；1180px 以下侧栏收为图标栏。

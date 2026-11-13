@@ -18,16 +18,12 @@ export default defineConfig({
         }
       : undefined,
     watch: {
-      ignored: ['**/src-tauri/**'],
+      ignored: ['**/desktop/**', '**/target/**'],
     },
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:18787',
-        changeOrigin: true,
-      },
-      '/proxy': {
-        target: 'http://127.0.0.1:18787',
-        changeOrigin: true,
+        changeOrigin: false,
       },
     },
   },
