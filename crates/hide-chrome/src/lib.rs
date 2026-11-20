@@ -68,16 +68,15 @@ fn parse_resize_dir(dir: &str) -> Option<ResizeDirection> {
 
 /// Returns `true` when the environment has a display server capable of hosting a desktop window.
 pub fn can_open_gui() -> bool {
-    if std::env::var_os("HIDE_GO_HEADLESS").is_some() {
-        return false;
-    }
     #[cfg(target_os = "linux")]
     {
-        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            return false;
-        }
+        std::env::var_os("HIDE_GO_HEADLESS").is_none()
+            && (std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some())
     }
-    true
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::var_os("HIDE_GO_HEADLESS").is_none()
+    }
 }
 
 /// Launch a frameless native OS window hosting the local WebView pointing at `opts.url`.
@@ -514,10 +513,11 @@ pub fn open_browser_fallback(url: &str) {
 /// Returns `true` when `name` is a Hide-Go runtime binary (desktop console or background daemon),
 /// explicitly excluding installers/uninstallers so Setup never terminates itself.
 pub fn is_hide_go_runtime_process_name(name: &str) -> bool {
-    let base = std::path::Path::new(name)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(name)
+    let trimmed = name.trim_end_matches(['/', '\\']);
+    let base = trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(trimmed)
         .to_ascii_lowercase();
     let stem = base.strip_suffix(".exe").unwrap_or(&base);
     stem == "hide-go-desktop"
@@ -748,6 +748,7 @@ mod tests {
         assert!(is_hide_go_runtime_process_name("hide-go-daemon.exe"));
         assert!(is_hide_go_runtime_process_name("hide-go-daemon"));
         assert!(is_hide_go_runtime_process_name(r"E:\app\hide-go-desktop.exe"));
+        assert!(is_hide_go_runtime_process_name("/opt/hide-go/hide-go-desktop"));
 
         assert!(!is_hide_go_runtime_process_name("hide-go-setup.exe"));
         assert!(!is_hide_go_runtime_process_name("hide-go-uninstall.exe"));

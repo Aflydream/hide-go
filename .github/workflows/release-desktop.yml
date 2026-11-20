@@ -133,7 +133,8 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           awk -v ver="$VERSION" '
-            $0 ~ "^## \\[" ver "\\]" { found=1; print; next }
+            { sub(/\r$/, "") }
+            index($0, "## [" ver "]") == 1 { found=1; print; next }
             found && /^## \[/ { exit }
             found { print }
           ' CHANGELOG.md > release-notes.md

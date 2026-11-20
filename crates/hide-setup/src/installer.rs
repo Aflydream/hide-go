@@ -160,20 +160,17 @@ pub fn manifest_path(install_dir: &Path) -> PathBuf {
 }
 
 pub fn is_reparse_or_symlink(path: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return true;
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        #[cfg(windows)]
+        {
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
         }
-    }
-    false
+        #[cfg(not(windows))]
+        {
+            meta.file_type().is_symlink()
+        }
+    })
 }
 
 fn normalize_path_lexical(path: &Path) -> PathBuf {
@@ -1478,6 +1475,7 @@ pub fn perform_uninstall_with(
 }
 
 fn default_webview_data_dir() -> Option<PathBuf> {
+    #[cfg(not(target_os = "macos"))]
     let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     #[cfg(windows)]
     {

@@ -788,27 +788,17 @@ fn nonnull(value: &Value, field: &str) -> bool {
 }
 
 fn is_length_truncation_event(value: &Value, kind: &str) -> bool {
-    if kind == "response.incomplete" {
-        return true;
-    }
-    if value.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens")
+    kind == "response.incomplete"
+        || value.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens")
         || value.get("stop_reason").and_then(Value::as_str) == Some("max_tokens")
-    {
-        return true;
-    }
-    if value.get("choices").and_then(Value::as_array).is_some_and(|cs| {
-        cs.iter()
-            .any(|c| c.get("finish_reason").and_then(Value::as_str) == Some("length"))
-    }) {
-        return true;
-    }
-    if value.get("candidates").and_then(Value::as_array).is_some_and(|cs| {
-        cs.iter()
-            .any(|c| c.get("finishReason").and_then(Value::as_str) == Some("MAX_TOKENS"))
-    }) {
-        return true;
-    }
-    false
+        || value.get("choices").and_then(Value::as_array).is_some_and(|cs| {
+            cs.iter()
+                .any(|c| c.get("finish_reason").and_then(Value::as_str) == Some("length"))
+        })
+        || value.get("candidates").and_then(Value::as_array).is_some_and(|cs| {
+            cs.iter()
+                .any(|c| c.get("finishReason").and_then(Value::as_str) == Some("MAX_TOKENS"))
+        })
 }
 
 fn chat_envelope(value: &Value) -> Value {
