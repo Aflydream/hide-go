@@ -1039,10 +1039,7 @@ fn upstream_response_headers(headers: &HeaderMap, preserve_origin_headers: bool)
                 return false;
             }
             if preserve_origin_headers {
-                if *name == header::SET_COOKIE && is_hide_go_session_set_cookie(value) {
-                    return false;
-                }
-                true
+                !(*name == header::SET_COOKIE && is_hide_go_session_set_cookie(value))
             } else {
                 *name != header::SET_COOKIE && !name.as_str().starts_with("access-control-")
             }
@@ -1422,10 +1419,7 @@ fn upstream_binary_response_headers(headers: &HeaderMap, preserve_origin_headers
                 return false;
             }
             if preserve_origin_headers {
-                if *name == header::SET_COOKIE && is_hide_go_session_set_cookie(value) {
-                    return false;
-                }
-                true
+                !(*name == header::SET_COOKIE && is_hide_go_session_set_cookie(value))
             } else {
                 *name != header::SET_COOKIE && !name.as_str().starts_with("access-control-")
             }

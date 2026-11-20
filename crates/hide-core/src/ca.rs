@@ -4,6 +4,7 @@
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
+#[cfg(windows)]
 use once_cell::sync::OnceCell;
 use parking_lot::{Mutex, RwLock};
 use ring::rand::SystemRandom;
@@ -32,6 +33,7 @@ const LEAF_TTL_DAYS: i64 = 90;
 const LEAF_CACHE_REFRESH_SECS: u64 = 60 * 60 * 24 * 60; // Refresh cached leaf after 60 days
 const MAX_CONCURRENT_LEAF_MINTS: usize = 4;
 const TRUST_CMD_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(any(windows, target_os = "macos"))]
 const SYSTEM_ROOTS_TIMEOUT: Duration = Duration::from_secs(25);
 
 static TRUST_CMD_LOCK: Mutex<()> = Mutex::new(());

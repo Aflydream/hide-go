@@ -4,7 +4,9 @@ use crate::harness::{get_all_harness_profiles, AutoConnectMode, HarnessProfile};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(windows)]
+use std::collections::BTreeMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

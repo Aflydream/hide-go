@@ -473,7 +473,7 @@ fn is_browser_cross_site_proxy_trigger(headers: &HeaderMap) -> bool {
     false
 }
 
-async fn read_limited_body<B>(body: B) -> Result<Bytes, Response>
+async fn read_limited_body<B>(body: B) -> Result<Bytes, Box<Response>>
 where
     B: hyper::body::Body + Send,
     B::Data: Send,
@@ -483,17 +483,17 @@ where
         Ok(collected) => Ok(collected.to_bytes()),
         Err(err) => {
             if err.downcast_ref::<LengthLimitError>().is_some() {
-                Err(connect_error(
+                Err(Box::new(connect_error(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "payload_too_large",
                     "request body exceeds gateway limit",
-                ))
+                )))
             } else {
-                Err(connect_error(
+                Err(Box::new(connect_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_body",
                     format!("failed to read request body: {err}"),
-                ))
+                )))
             }
         }
     }
@@ -664,7 +664,7 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
                 let (parts, incoming) = inner_req.into_parts();
                 let body_bytes = match read_limited_body(incoming).await {
                     Ok(bytes) => bytes,
-                    Err(err_resp) => return Ok::<_, Infallible>(err_resp),
+                    Err(err_resp) => return Ok::<_, Infallible>(*err_resp),
                 };
                 let resp = handle_mitm_http_request(
                     state,
@@ -941,7 +941,7 @@ async fn handle_absolute_proxy_request(state: GatewayState, req: Request<Body>) 
     let (parts, body) = req.into_parts();
     let body_bytes = match read_limited_body(body).await {
         Ok(bytes) => bytes,
-        Err(err_resp) => return err_resp,
+        Err(err_resp) => return *err_resp,
     };
     handle_forward_http_request(state, parts.method, parts.uri, parts.headers, body_bytes, mitm_inspect).await
 }
