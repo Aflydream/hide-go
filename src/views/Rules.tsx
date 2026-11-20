@@ -39,24 +39,33 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
   const { config, saveConfig, saving } = useStore();
   const configRef = useRef(config);
   configRef.current = config;
-  const [check, setCheck] = useState<RuleValidation | null>(null);
+  const [check, setCheck] = useState<{ pattern: string; sample: string; result: RuleValidation } | null>(null);
+  const [checkError, setCheckError] = useState<{ pattern: string; message: string } | null>(null);
   const [submitted, setSubmitted] = useState(false);
   const pattern = draft.pattern.trim();
   const debouncedPattern = useDebounced(pattern, 300);
   const debouncedSample = useDebounced(draft.sample, 300);
-  const settled = pattern === debouncedPattern && draft.sample === debouncedSample;
 
   // Validate with the gateway itself: it compiles rules with a different engine than the browser's.
   useEffect(() => {
     if (!debouncedPattern) {
       setCheck(null);
+      setCheckError(null);
       return;
     }
     let cancelled = false;
     api
       .validateRule(debouncedPattern, debouncedSample || undefined)
-      .then((r) => !cancelled && setCheck(r))
-      .catch(() => !cancelled && setCheck(null));
+      .then((result) => {
+        if (cancelled) return;
+        setCheck({ pattern: debouncedPattern, sample: debouncedSample, result });
+        setCheckError(null);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setCheck(null);
+        setCheckError({ pattern: debouncedPattern, message: (e as Error).message });
+      });
     return () => {
       cancelled = true;
     };
@@ -65,19 +74,37 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
   useEffect(() => setSubmitted(false), [draft.id]);
 
   if (!config) return null;
-  const result = pattern && settled ? check : null;
+  const result = pattern && check?.pattern === pattern ? check.result : null;
+  const sampleMatched = result && check?.sample === draft.sample;
+  const validationErr = checkError?.pattern === pattern ? `无法校验表达式：${checkError.message}` : null;
   const nameError = submitted && !draft.name.trim() ? '请填写规则名称' : null;
-  const patternError = result && !result.valid ? explainRegexError(result.message ?? '') : submitted && !pattern ? '请填写正则表达式' : null;
-  const matches = result?.valid ? (result.matches ?? []) : [];
+  const trimmedHint = draft.replacementHint.trim();
+  const hintError =
+    trimmedHint && !/^[A-Za-z0-9_-]{1,48}$/.test(trimmedHint)
+      ? '替换前缀仅支持 1–48 位字母、数字、下划线或短横线'
+      : null;
+  const patternError =
+    result && !result.valid
+      ? explainRegexError(result.message ?? '')
+      : validationErr ?? (submitted && !pattern ? '请填写正则表达式' : null);
+  const matches = result?.valid && sampleMatched ? (result.matches ?? []) : [];
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     setSubmitted(true);
-    if (!draft.name.trim() || !pattern) return;
+    if (!draft.name.trim() || !pattern || hintError) return;
     // Re-check on submit so a pattern typed faster than the debounce cannot slip through.
-    const verdict = await api.validateRule(pattern).catch(() => null);
-    if (verdict && !verdict.valid) {
-      setCheck(verdict);
+    let verdict: RuleValidation;
+    try {
+      verdict = await api.validateRule(pattern, draft.sample || undefined);
+      setCheck({ pattern, sample: draft.sample, result: verdict });
+      setCheckError(null);
+    } catch (err) {
+      setCheck(null);
+      setCheckError({ pattern, message: (err as Error).message });
+      return;
+    }
+    if (!verdict.valid) {
       return;
     }
     const latestConfig = configRef.current;
@@ -95,7 +122,7 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
   };
 
   return (
-    <Panel title={draft.id ? '编辑规则' : '新建规则'} description="命中的内容在出站前替换，响应返回时还原">
+    <Panel title={draft.id ? '编辑规则' : '新建规则'} description="出站替换 · 返回还原">
       <form onSubmit={submit} noValidate className="space-y-4 p-4">
         <Field label="名称" htmlFor="rule-name" error={nameError}>
           <input
@@ -117,10 +144,10 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
             result?.valid ? (
               <span className="flex items-center gap-1 text-brand">
                 <CheckCircle aria-hidden="true" size={13} weight="bold" />
-                网关可以编译该表达式
+                语法有效
               </span>
             ) : (
-              '使用 Rust regex 语法，由网关编译校验；不支持环视与反向引用。'
+              'Rust regex 语法，不支持环视 (?=…) 与反向引用'
             )
           }
         >
@@ -140,9 +167,10 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
         <Field
           label="替换前缀（可选）"
           htmlFor="rule-hint"
+          error={hintError}
           hint={
             <>
-              厂商看到的是 <code className="font-mono text-brand">{replacementPreview(draft.replacementHint)}</code>，序号按出现顺序递增。
+              示例输出 <code className="font-mono text-brand">{replacementPreview(draft.replacementHint)}</code>
             </>
           }
         >
@@ -154,11 +182,12 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
             value={draft.replacementHint}
             onChange={(e) => onChange({ ...draft, replacementHint: e.target.value })}
             placeholder="GreenhouseApp"
-            aria-describedby="rule-hint-hint"
+            aria-invalid={!!hintError}
+            aria-describedby={hintError ? 'rule-hint-error' : 'rule-hint-hint'}
             className={cx(inputClass, 'h-8 w-full font-mono text-xs')}
           />
         </Field>
-        <Field label="测试文本（可选）" htmlFor="rule-sample" hint="仅用于预览命中结果，不会保存。">
+        <Field label="测试文本（可选）" htmlFor="rule-sample" hint="仅用于预览命中，不保存">
           <textarea
             id="rule-sample"
             rows={3}
@@ -170,7 +199,7 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
             className={cx(inputClass, 'w-full resize-y py-2 font-mono text-xs leading-5')}
           />
         </Field>
-        {result?.valid && draft.sample.trim() && (
+        {result?.valid && sampleMatched && draft.sample.trim() && (
           <div role="status" className="rounded border border-line bg-surface-2 px-3 py-2.5">
             <p className="label-caps">{matches.length ? `命中 ${matches.length}${matches.length === 20 ? '+' : ''} 处` : '测试文本中没有命中'}</p>
             {matches.length > 0 && (
@@ -221,8 +250,8 @@ export function Rules() {
     <div className="mx-auto grid max-w-[1360px] grid-cols-1 items-start gap-5 p-6 xl:grid-cols-[minmax(0,1fr)_400px]">
       <Panel title="规则列表" description={rules.length ? `${rules.length} 条规则，${enabledCount} 条生效中` : '尚未添加规则'}>
         {rules.length === 0 ? (
-          <EmptyState icon={<BracketsAngle size={20} />} title="还没有自定义规则">
-            内置检测器已覆盖常见密钥、连接串、内网地址与本机路径。项目代号、内部域名等只有你知道的内容，在这里补充。
+          <EmptyState icon={<BracketsAngle size={20} />} title="暂无自定义规则">
+            在右侧添加内部项目代号、私有域名等正则规则
           </EmptyState>
         ) : (
           <table className="w-full table-fixed text-left text-xs">
@@ -285,7 +314,7 @@ export function Rules() {
           await saveConfig({ ...config, customRules: rules.filter((r) => r.id !== target.id) }, '规则已删除');
         }}
         title={`删除规则「${deleting?.name ?? ''}」？`}
-        description="此后该规则命中的内容将不再被替换。映射表中已有的对应条目不受影响，仍可还原。"
+        description="后续请求不再匹配该规则；映射表已有条目保留。"
         confirmLabel="删除规则"
       />
     </div>

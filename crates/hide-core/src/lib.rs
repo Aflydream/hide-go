@@ -1,9 +1,12 @@
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
 pub mod all_hide;
+pub mod ca;
 pub mod config;
+pub mod connect;
 pub mod desensitizer;
 pub mod harness;
+pub mod harness_detect;
 pub mod protocol;
 pub mod proxy;
 pub mod restore;
@@ -12,8 +15,12 @@ pub mod sse_restorer;
 pub mod stream_restorer;
 pub mod vault;
 
+pub use ca::{CaManager, CaStatus, CaTrustAdapter, MockCaTrustAdapter, RealCaTrustAdapter};
 pub use config::*;
-pub use proxy::{build_router, GatewayState};
+pub use connect::{
+    build_gateway_proxy_service, build_gateway_service, should_mitm_host, GatewayMakeService, GatewayProxyService,
+};
+pub use proxy::{build_router, GatewayState, MIN_ADMIN_TOKEN_LEN};
 
 #[cfg(test)]
 mod tests {
@@ -376,7 +383,8 @@ pub fn verify_margin_liquidation(wallet_signature: &str) -> bool {
         });
 
         // 2. Start Hide-Go gateway
-        let state = GatewayState::with_admin_token(HideConfig::default(), "test-admin-secret-123");
+        let state = GatewayState::with_admin_token(HideConfig::default(), "test-admin-secret-123")
+            .with_loopback_for_tests(true);
         let app = build_router(state);
         let gateway_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gateway_addr = gateway_listener.local_addr().unwrap();
@@ -424,6 +432,7 @@ pub fn verify_margin_liquidation(wallet_signature: &str) -> bool {
         });
         let proxy_res = client
             .post(format!("http://{}/claude-code/v1/messages", gateway_addr))
+            .header("X-Hide-Go-Token", "test-admin-secret-123")
             .header("X-Hide-Go-Upstream", format!("http://{}", upstream_addr))
             .json(&req_body)
             .send()
@@ -447,6 +456,7 @@ pub fn verify_margin_liquidation(wallet_signature: &str) -> bool {
         });
         let stream_res = client
             .post(format!("http://{}/claude-code/v1/messages", gateway_addr))
+            .header("X-Hide-Go-Token", "test-admin-secret-123")
             .header("X-Hide-Go-Upstream", format!("http://{}", upstream_addr))
             .json(&stream_req_body)
             .send()

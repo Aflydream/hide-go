@@ -1,6 +1,9 @@
 use crate::vault::{Matcher, PrivacyVault};
 use std::sync::Arc;
 
+/// Hard upper bound on lookahead bytes retained across incomplete stream chunks.
+pub(crate) const MAX_PENDING_BUFFER_BYTES: usize = 1024 * 1024;
+
 /// Streaming restorer with sliding-window lookahead.
 ///
 /// Produces exactly what a one-shot `Matcher::restore` would produce over the concatenated
@@ -9,6 +12,7 @@ use std::sync::Arc;
 /// emitted prefix is remembered so identifier/number boundaries hold across chunks.
 pub struct StreamRestorer {
     vault: PrivacyVault,
+    scope: Option<String>,
     matcher: Arc<Matcher>,
     pending_buffer: String,
     left: Option<char>,
@@ -24,9 +28,15 @@ impl StreamRestorer {
 
     /// `allow_secret = false` keeps credential placeholders unresolved (tool-call arguments).
     pub fn with_secret_policy(vault: PrivacyVault, allow_secret: bool) -> Self {
-        let matcher = vault.matcher();
+        Self::with_secret_policy_scoped(vault, None, allow_secret)
+    }
+
+    /// Scope-aware streaming restorer so only tokens bound to `scope` are matched.
+    pub fn with_secret_policy_scoped(vault: PrivacyVault, scope: Option<String>, allow_secret: bool) -> Self {
+        let matcher = vault.matcher_for_scope(scope.as_deref());
         Self {
             vault,
+            scope,
             matcher,
             pending_buffer: String::new(),
             left: None,
@@ -42,7 +52,7 @@ impl StreamRestorer {
     }
 
     fn refresh(&mut self) {
-        self.matcher = self.vault.matcher();
+        self.matcher = self.vault.matcher_for_scope(self.scope.as_deref());
     }
 
     /// Push a new incoming stream chunk and return the safely restored prefix that can be emitted immediately.
@@ -59,7 +69,7 @@ impl StreamRestorer {
         let mut pos = 0usize;
         while pos < buf.len() {
             let rem = &buf[pos..];
-            if self.matcher.is_strict_prefix(rem) {
+            if rem.len() <= MAX_PENDING_BUFFER_BYTES && self.matcher.is_strict_prefix(rem) {
                 break;
             }
             if let Some(pair) = self.matcher.find_at(&buf, pos, self.left) {
@@ -71,7 +81,7 @@ impl StreamRestorer {
                     .bytes()
                     .last()
                     .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_');
-                if at_tail && word_final {
+                if at_tail && word_final && rem.len() <= MAX_PENDING_BUFFER_BYTES {
                     break;
                 }
                 if pair.secret && !self.allow_secret {
@@ -83,7 +93,9 @@ impl StreamRestorer {
                 }
                 pos += pair.token.len();
             } else {
-                let ch = rem.chars().next().unwrap();
+                let Some(ch) = rem.chars().next() else {
+                    break;
+                };
                 output.push(ch);
                 pos += ch.len_utf8();
             }

@@ -80,6 +80,19 @@ export function VaultView() {
           <Switch checked={secretsOnly} onChange={setSecretsOnly} label="只看凭据" />
           只看凭据
         </label>
+        {filtersActive && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => {
+              setQuery('');
+              setCategory('all');
+              setSecretsOnly(false);
+            }}
+          >
+            重置筛选
+          </Button>
+        )}
         <div className="ml-auto flex items-center gap-2">
           <span className="tabular text-xs text-fg-subtle" role="status">
             {formatCount(rows.length)} / {formatCount(vault.length)} 条
@@ -108,8 +121,8 @@ export function VaultView() {
           </div>
         ) : rows.length === 0 ? (
           filtersActive ? (
-            <EmptyState icon={<Funnel size={20} />} title="没有符合条件的条目">
-              调整筛选条件，或清除搜索关键字。
+            <EmptyState icon={<Funnel size={20} />} title="无匹配条目">
+              调整筛选或搜索条件
             </EmptyState>
           ) : (
             <EmptyState
@@ -121,7 +134,7 @@ export function VaultView() {
                 </Button>
               }
             >
-              在「自动脱敏」或「All-Hide」模式下处理请求后，占位符与真实值的对应关系会出现在这里。
+              脱敏或 All-Hide 命中后显示映射关系
             </EmptyState>
           )
         ) : (
@@ -184,7 +197,7 @@ export function VaultView() {
       </div>
 
       <p className="shrink-0 border-t border-line bg-surface px-6 py-2 text-xs text-fg-subtle">
-        映射表只驻留在网关进程的内存中，退出即清空；最多保留 50,000 条，超出后淘汰最久未使用的条目。
+        仅驻留内存，退出清空 · 上限 50,000 条（LRU 淘汰）
       </p>
 
       <ConfirmDialog
@@ -193,7 +206,7 @@ export function VaultView() {
         onConfirm={clear}
         busy={clearing}
         title="清空映射表？"
-        description="进行中的对话里，模型此后引用的旧占位符将无法还原为真实值。新请求会重新分配占位符。"
+        description="进行中对话引用的旧占位符将无法继续还原，新请求重新分配。"
         confirmLabel="清空映射表"
       />
     </div>

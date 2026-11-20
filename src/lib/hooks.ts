@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 
 /**
  * Poll an async source. Pauses while the window is hidden, never overlaps requests and
@@ -8,33 +9,40 @@ export function usePoll<T>(fetcher: () => Promise<T>, intervalMs: number, enable
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const [loading, setLoading] = useState(true);
-  const inFlight = useRef(false);
+  const inFlight = useRef<Promise<T> | null>(null);
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
 
   const refresh = useCallback(async () => {
-    if (inFlight.current) return;
-    inFlight.current = true;
-    try {
-      const next = await fetcherRef.current();
-      setData(next);
-      setError(null);
-    } catch (e) {
-      setError(e as Error);
-    } finally {
-      inFlight.current = false;
-      setLoading(false);
-    }
+    if (inFlight.current) return inFlight.current;
+    const p = (async () => {
+      try {
+        const next = await fetcherRef.current();
+        setData(next);
+        setError(null);
+        return next;
+      } catch (e) {
+        setError(e as Error);
+        throw e;
+      } finally {
+        inFlight.current = null;
+        setLoading(false);
+      }
+    })();
+    inFlight.current = p;
+    return p;
   }, []);
 
   useEffect(() => {
     if (!enabled) return;
-    refresh();
+    refresh().catch(() => {});
     const tick = () => {
-      if (!document.hidden) refresh();
+      if (!document.hidden) refresh().catch(() => {});
     };
     const timer = window.setInterval(tick, intervalMs);
-    const onVisible = () => !document.hidden && refresh();
+    const onVisible = () => {
+      if (!document.hidden) refresh().catch(() => {});
+    };
     document.addEventListener('visibilitychange', onVisible);
     return () => {
       window.clearInterval(timer);
@@ -56,8 +64,26 @@ export function useRoute() {
     return { route, params: new URLSearchParams(query) };
   };
   const [state, setState] = useState(parse);
+  const routeRef = useRef(state.route);
+  routeRef.current = state.route;
+
   useEffect(() => {
-    const onHash = () => setState(parse());
+    const onHash = () => {
+      const next = parse();
+      const routeChanged = next.route !== routeRef.current;
+      const focusHeading = () => document.getElementById('view-title')?.focus({ preventScroll: true });
+
+      if (!routeChanged || typeof document.startViewTransition !== 'function') {
+        setState(next);
+        if (routeChanged) queueMicrotask(focusHeading);
+        return;
+      }
+
+      const transition = document.startViewTransition(() => {
+        flushSync(() => setState(next));
+      });
+      transition.finished.finally(focusHeading);
+    };
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);

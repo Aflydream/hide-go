@@ -1,7 +1,16 @@
 use crate::config::{HarnessKind, TrafficCategory};
 use serde::{Deserialize, Serialize};
 
-/// Metadata and interception profile for a supported AI Coding Harness
+/// Whether Hide-Go can automatically wire this harness to the local proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AutoConnectMode {
+    ConfigFile,
+    EnvVar,
+    Manual,
+}
+
+/// Metadata, interception profile, and live detection state for a supported AI Coding Harness
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessProfile {
@@ -17,7 +26,28 @@ pub struct HarnessProfile {
     pub env_setup_powershell: String,
     /// Known limitation of routing this tool through a local gateway, if any.
     pub integration_note: Option<String>,
+    /// True only when live gateway traffic has been observed for this harness.
     pub detected_active: bool,
+    /// True when the CLI binary, desktop app, or user config dir is found on this machine.
+    pub installed: bool,
+    /// Binary or configuration paths discovered on this machine.
+    pub install_paths: Vec<String>,
+    /// True when a local config file or persistent env var already routes through Hide-Go.
+    pub configured: bool,
+    /// Where the Hide-Go gateway route is configured, if detected.
+    pub configured_via: Option<String>,
+    /// How automatic integration works for this harness.
+    pub auto_connect_mode: AutoConnectMode,
+    /// True when this harness requires local Root CA trust (HTTPS CONNECT MITM or TLS bundle).
+    #[serde(default)]
+    pub requires_ca_trust: bool,
+    /// Concrete local targets (files, user env vars, OS CA store) touched by one-click connect.
+    #[serde(default)]
+    pub auto_connect_targets: Vec<String>,
+    /// Number of requests observed for this harness during this gateway session.
+    pub traffic_count: u64,
+    /// Local timestamp (`HH:MM:SS`) of the most recent request, if any.
+    pub last_seen_at: Option<String>,
 }
 
 /// Returns rich, accurate profiles for all 7 supported AI coding harnesses
@@ -40,15 +70,29 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "高频发送后台遥测事件 (/api/event_logging/batch)".to_string(),
             ],
             env_setup_bash: format!(
-                "export ANTHROPIC_BASE_URL=\"{}/claude-code\"\nclaude",
+                "export ANTHROPIC_BASE_URL=\"{}/claude-code\"\nexport NO_PROXY=\"localhost,127.0.0.1,::1\"\nclaude",
                 base
             ),
             env_setup_powershell: format!(
-                "$env:ANTHROPIC_BASE_URL=\"{}/claude-code\"\nclaude",
+                "$env:ANTHROPIC_BASE_URL=\"{}/claude-code\"\n$env:NO_PROXY=\"localhost,127.0.0.1,::1\"\nclaude",
                 base
             ),
-            integration_note: None,
-            detected_active: true,
+            integration_note: Some(
+                "写入 ~/.claude/settings.json 的 env.ANTHROPIC_BASE_URL（保留已有本地网关作为上级转发），并在存在代理变量时补充 NO_PROXY。"
+                    .to_string(),
+            ),
+            detected_active: false,
+            installed: false,
+            install_paths: Vec::new(),
+            configured: false,
+            configured_via: None,
+            auto_connect_mode: AutoConnectMode::ConfigFile,
+            requires_ca_trust: false,
+            auto_connect_targets: vec![
+                "~/.claude/settings.json (env.ANTHROPIC_BASE_URL / NO_PROXY)".to_string(),
+            ],
+            traffic_count: 0,
+            last_seen_at: None,
         },
         HarnessProfile {
             kind: HarnessKind::Codex,
@@ -65,15 +109,30 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "长会话状态持久化在云端存储中保留原始项目符号".to_string(),
             ],
             env_setup_bash: format!(
-                "export OPENAI_BASE_URL=\"{}/codex/v1\"\ncodex",
-                base
+                "export OPENAI_BASE_URL=\"{}/codex/v1\"\nexport HTTPS_PROXY=\"{}\"\nexport NO_PROXY=\"localhost,127.0.0.1,::1\"\ncodex",
+                base, base
             ),
             env_setup_powershell: format!(
-                "$env:OPENAI_BASE_URL=\"{}/codex/v1\"\ncodex",
-                base
+                "$env:OPENAI_BASE_URL=\"{}/codex/v1\"\n$env:HTTPS_PROXY=\"{}\"\n$env:NO_PROXY=\"localhost,127.0.0.1,::1\"\ncodex",
+                base, base
             ),
-            integration_note: None,
-            detected_active: true,
+            integration_note: Some(
+                "修改 ~/.codex/config.toml 中当前激活的 provider base_url（保留已有上游配置），并通过 ~/.hide-go/env.ps1 或 Shell 配置文件注入 OPENAI_BASE_URL、HTTPS_PROXY 与 CODEX_CA_CERTIFICATE。"
+                    .to_string(),
+            ),
+            detected_active: false,
+            installed: false,
+            install_paths: Vec::new(),
+            configured: false,
+            configured_via: None,
+            auto_connect_mode: AutoConnectMode::ConfigFile,
+            requires_ca_trust: true,
+            auto_connect_targets: vec![
+                "~/.codex/config.toml ([model_providers].base_url)".to_string(),
+                "~/.hide-go/env.ps1 / Shell 配置文件 (OPENAI_BASE_URL, HTTPS_PROXY, CODEX_CA_CERTIFICATE, SSL_CERT_FILE)".to_string(),
+            ],
+            traffic_count: 0,
+            last_seen_at: None,
         },
         HarnessProfile {
             kind: HarnessKind::Antigravity,
@@ -89,10 +148,31 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "系统提示词中包含宿主机用户名、工作区目录结构与 Git 远端地址".to_string(),
                 "长上下文窗口一次性聚合大量私有架构设计与内部接口定义".to_string(),
             ],
-            env_setup_bash: format!("export ANTIGRAVITY_API_BASE=\"{}/antigravity\"", base),
-            env_setup_powershell: format!("$env:ANTIGRAVITY_API_BASE=\"{}/antigravity\"", base),
-            integration_note: Some("需客户端支持自定义 Gemini Base URL；Hide-Go 不是 HTTPS CONNECT 代理，不能通过 HTTPS_PROXY 接入。".to_string()),
-            detected_active: true,
+            env_setup_bash: format!(
+                "export HTTPS_PROXY=\"{}\"\nexport HTTP_PROXY=\"{}\"\nexport NO_PROXY=\"localhost,127.0.0.1,::1\"\nagy",
+                base, base
+            ),
+            env_setup_powershell: format!(
+                "$env:HTTPS_PROXY=\"{}\"\n$env:HTTP_PROXY=\"{}\"\n$env:NO_PROXY=\"localhost,127.0.0.1,::1\"\nagy",
+                base, base
+            ),
+            integration_note: Some(
+                "配置 Antigravity IDE 的 User/settings.json 代理项及终端环境变量（HTTPS_PROXY / NODE_EXTRA_CA_CERTS）；二进制 Connect RPC 流量原样透传。"
+                    .to_string(),
+            ),
+            detected_active: false,
+            installed: false,
+            install_paths: Vec::new(),
+            configured: false,
+            configured_via: None,
+            auto_connect_mode: AutoConnectMode::ConfigFile,
+            requires_ca_trust: true,
+            auto_connect_targets: vec![
+                "Antigravity IDE/User/settings.json (http.proxy, http.proxySupport, terminal.integrated.env.*)".to_string(),
+                "~/.hide-go/env.ps1 / Shell 配置文件 (HTTPS_PROXY, HTTP_PROXY, NO_PROXY, NODE_EXTRA_CA_CERTS)".to_string(),
+            ],
+            traffic_count: 0,
+            last_seen_at: None,
         },
         HarnessProfile {
             kind: HarnessKind::Zcode,
@@ -109,21 +189,35 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "诊断日志同步可能附带本地编译错误中的绝对路径与敏感字面量".to_string(),
             ],
             env_setup_bash: format!(
-                "export ZCODE_API_BASE=\"{}/zcode/v1\"\nexport OPENAI_BASE_URL=\"{}/zcode/v1\"",
+                "export ZCODE_HTTP_PROXY=\"{}\"\nexport ZCODE_NO_PROXY=\"localhost,127.0.0.1,::1\"\nexport HTTPS_PROXY=\"{}\"",
                 base, base
             ),
             env_setup_powershell: format!(
-                "$env:ZCODE_API_BASE=\"{}/zcode/v1\"\n$env:OPENAI_BASE_URL=\"{}/zcode/v1\"",
+                "$env:ZCODE_HTTP_PROXY=\"{}\"\n$env:ZCODE_NO_PROXY=\"localhost,127.0.0.1,::1\"\n$env:HTTPS_PROXY=\"{}\"",
                 base, base
             ),
-            integration_note: None,
-            detected_active: true,
+            integration_note: Some(
+                "通过 ~/.hide-go/env.ps1 或 Shell 配置文件写入 ZCODE_HTTP_PROXY、ZCODE_NO_PROXY、ZCODE_AGENT_CA_CERT 与 HTTPS_PROXY / NODE_EXTRA_CA_CERTS。"
+                    .to_string(),
+            ),
+            detected_active: false,
+            installed: false,
+            install_paths: Vec::new(),
+            configured: false,
+            configured_via: None,
+            auto_connect_mode: AutoConnectMode::EnvVar,
+            requires_ca_trust: true,
+            auto_connect_targets: vec![
+                "~/.hide-go/env.ps1 / Shell 配置文件 (ZCODE_HTTP_PROXY, ZCODE_NO_PROXY, ZCODE_AGENT_CA_CERT, HTTPS_PROXY, NODE_EXTRA_CA_CERTS)".to_string(),
+            ],
+            traffic_count: 0,
+            last_seen_at: None,
         },
         HarnessProfile {
             kind: HarnessKind::Qoder,
             name: "Qoder".to_string(),
             vendor_name: "Qoder AI IDE & Indexing Cloud".to_string(),
-            default_upstream: "https://api.qoder.com".to_string(),
+            default_upstream: "https://api1.qoder.sh".to_string(),
             local_proxy_route: "/qoder".to_string(),
             protocol_family: "Qoder Agent & Codebase Vector Sync API".to_string(),
             description: "面向大型工程的 AI 研发 IDE，内置全量代码库向量索引器与自主任务执行器。"
@@ -133,10 +227,31 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "跨模块调用链分析会将核心算法实现与内部 RPC 协议发送至云端".to_string(),
                 "持续心跳与行为遥测记录开发者编辑历史".to_string(),
             ],
-            env_setup_bash: format!("export QODER_BASE_URL=\"{}/qoder\"\nqoder", base),
-            env_setup_powershell: format!("$env:QODER_BASE_URL=\"{}/qoder\"\nqoder", base),
-            integration_note: Some("仅当客户端允许覆盖 API Base URL 时可接入；内置索引通道若不读取该变量将不会经过网关。".to_string()),
-            detected_active: true,
+            env_setup_bash: format!(
+                "export HTTPS_PROXY=\"{}\"\nexport NO_PROXY=\"localhost,127.0.0.1,::1\"\nqoder",
+                base
+            ),
+            env_setup_powershell: format!(
+                "$env:HTTPS_PROXY=\"{}\"\n$env:NO_PROXY=\"localhost,127.0.0.1,::1\"\nqoder",
+                base
+            ),
+            integration_note: Some(
+                "同时写入 Qoder 与 QoderCN 的 User/settings.json 代理设置及终端环境变量，拦截 api1.qoder.sh 与 gateway.qoder.com.cn 等主机。"
+                    .to_string(),
+            ),
+            detected_active: false,
+            installed: false,
+            install_paths: Vec::new(),
+            configured: false,
+            configured_via: None,
+            auto_connect_mode: AutoConnectMode::ConfigFile,
+            requires_ca_trust: true,
+            auto_connect_targets: vec![
+                "Qoder & QoderCN User/settings.json (app.configAdvancedProxyMode/URL, http.proxy, terminal.integrated.env.*)".to_string(),
+                "~/.hide-go/env.ps1 / Shell 配置文件 (HTTPS_PROXY, NODE_EXTRA_CA_CERTS)".to_string(),
+            ],
+            traffic_count: 0,
+            last_seen_at: None,
         },
         HarnessProfile {
             kind: HarnessKind::Cursor,
@@ -153,15 +268,30 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "Composer Agent 自动读取工作区配置文件与终端历史记录".to_string(),
             ],
             env_setup_bash: format!(
-                "# Cursor Settings -> Models -> Override OpenAI Base URL:\n{}/cursor/v1",
+                "export HTTPS_PROXY=\"{}\"\nexport NO_PROXY=\"localhost,127.0.0.1,::1\"",
                 base
             ),
             env_setup_powershell: format!(
-                "# Cursor Settings -> Models -> Override OpenAI Base URL:\n{}/cursor/v1",
+                "$env:HTTPS_PROXY=\"{}\"\n$env:NO_PROXY=\"localhost,127.0.0.1,::1\"",
                 base
             ),
-            integration_note: Some("Cursor 的自定义 Base URL 请求由 Cursor 服务器转发，无法直接访问 127.0.0.1；需要通过你自己的 HTTPS 隧道暴露网关，并自行承担暴露风险。".to_string()),
-            detected_active: true,
+            integration_note: Some(
+                "配置 Cursor User/settings.json 代理项（含 cursor.general.disableHttp2=true）及终端环境变量（HTTPS_PROXY / NODE_EXTRA_CA_CERTS）。"
+                    .to_string(),
+            ),
+            detected_active: false,
+            installed: false,
+            install_paths: Vec::new(),
+            configured: false,
+            configured_via: None,
+            auto_connect_mode: AutoConnectMode::ConfigFile,
+            requires_ca_trust: true,
+            auto_connect_targets: vec![
+                "Cursor User/settings.json (http.proxy, http.proxySupport, cursor.general.disableHttp2, terminal.integrated.env.*)".to_string(),
+                "~/.hide-go/env.ps1 / Shell 配置文件 (HTTPS_PROXY, NODE_EXTRA_CA_CERTS)".to_string(),
+            ],
+            traffic_count: 0,
+            last_seen_at: None,
         },
         HarnessProfile {
             kind: HarnessKind::GrokBuild,
@@ -178,15 +308,29 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "高频流式推理请求中包含未脱敏的内网服务端点与认证 Token".to_string(),
             ],
             env_setup_bash: format!(
-                "export XAI_BASE_URL=\"{}/grok-build/v1\"\ngrok-build",
-                base
+                "export GROK_XAI_API_BASE_URL=\"{}/grok-build/v1\"\nexport GROK_CLI_CHAT_PROXY_BASE_URL=\"{}/grok-build\"\nexport HTTPS_PROXY=\"{}\"\nexport NO_PROXY=\"localhost,127.0.0.1,::1\"\ngrok",
+                base, base, base
             ),
             env_setup_powershell: format!(
-                "$env:XAI_BASE_URL=\"{}/grok-build/v1\"\ngrok-build",
-                base
+                "$env:GROK_XAI_API_BASE_URL=\"{}/grok-build/v1\"\n$env:GROK_CLI_CHAT_PROXY_BASE_URL=\"{}/grok-build\"\n$env:HTTPS_PROXY=\"{}\"\n$env:NO_PROXY=\"localhost,127.0.0.1,::1\"\ngrok",
+                base, base, base
             ),
-            integration_note: None,
-            detected_active: true,
+            integration_note: Some(
+                "通过 ~/.hide-go/env.ps1 或 Shell 配置文件写入 GROK_XAI_API_BASE_URL、GROK_CLI_CHAT_PROXY_BASE_URL 与 HTTPS_PROXY；支持 gzip/deflate 请求体解压脱敏，未知压缩编码可在「仅审计」模式直通。"
+                    .to_string(),
+            ),
+            detected_active: false,
+            installed: false,
+            install_paths: Vec::new(),
+            configured: false,
+            configured_via: None,
+            auto_connect_mode: AutoConnectMode::EnvVar,
+            requires_ca_trust: true,
+            auto_connect_targets: vec![
+                "~/.hide-go/env.ps1 / Shell 配置文件 (GROK_XAI_API_BASE_URL, GROK_CLI_CHAT_PROXY_BASE_URL, GROK_CLI_BASE_URL, HTTPS_PROXY, NODE_EXTRA_CA_CERTS)".to_string(),
+            ],
+            traffic_count: 0,
+            last_seen_at: None,
         },
     ]
 }

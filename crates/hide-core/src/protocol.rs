@@ -19,6 +19,8 @@ pub fn is_structural_key(key: &str) -> bool {
             | "response_id"
             | "previous_response_id"
             | "signature"
+            | "thoughtSignature"
+            | "thought_signature"
             | "encrypted_content"
             | "stop_reason"
             | "finish_reason"
@@ -99,26 +101,33 @@ pub fn is_tool_call_object(map: &Map<String, Value>) -> bool {
 }
 
 /// Blocks that must be forwarded verbatim: signed reasoning and binary attachments.
+/// Checks both block type and required protocol shape so arbitrary user JSON objects
+/// containing a `"signature"` or `"type": "document"` field cannot bypass desensitization.
 pub fn is_opaque_block(map: &Map<String, Value>) -> bool {
-    if map.contains_key("signature") || map.contains_key("encrypted_content") {
+    if map
+        .get("inlineData")
+        .or_else(|| map.get("inline_data"))
+        .is_some_and(Value::is_object)
+    {
         return true;
     }
-    if map.contains_key("inlineData") || map.contains_key("inline_data") {
+    if map.get("encrypted_content").is_some_and(Value::is_string) && !map.contains_key("messages") {
         return true;
     }
-    matches!(
-        map.get("type").and_then(Value::as_str),
-        Some(
-            "thinking"
-                | "redacted_thinking"
-                | "image"
-                | "input_image"
-                | "document"
-                | "input_file"
-                | "reasoning"
-                | "base64"
-        )
-    )
+    match map.get("type").and_then(Value::as_str) {
+        Some("thinking") => map.contains_key("thinking") || map.contains_key("signature"),
+        Some("redacted_thinking") => map.contains_key("data"),
+        Some("reasoning") => map.contains_key("encrypted_content") || map.contains_key("summary"),
+        Some("image" | "document") => map.contains_key("source"),
+        Some("input_image" | "input_file") => {
+            map.contains_key("image_url")
+                || map.contains_key("file_data")
+                || map.contains_key("file_id")
+                || map.contains_key("file_url")
+        }
+        Some("base64") => map.contains_key("data") && map.contains_key("media_type"),
+        _ => false,
+    }
 }
 
 /// Keys under which a string may hold a nested JSON document (tool arguments).

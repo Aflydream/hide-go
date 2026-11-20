@@ -112,17 +112,17 @@ You can mix and match these four sub-modes inside the All-Hide configuration pan
 
 ## Supported harnesses
 
-Hide-Go ships with request fingerprinting and dedicated local routes for 7 tools:
+Hide-Go scans your machine for installed AI coding tools (`PATH` binaries, standard install directories, and config files), shows live traffic counts per harness, and provides **reversible one-click integration** (serving both reverse-proxy routes and selective `HTTPS CONNECT` MITM on a single port, with lossless config backups and one-click rollback):
 
-| Tool | Local Proxy Route | What Hide-Go watches for |
-| :--- | :--- | :--- |
-| **Claude Code** | `http://127.0.0.1:18787/claude-code` | `CLAUDE.md` context injection, `Read`/`Bash` tool outputs, `/api/event_logging` telemetry |
-| **OpenAI Codex** | `http://127.0.0.1:18787/codex` | Sandbox file trees, shell execution logs containing secrets |
-| **Antigravity** | `http://127.0.0.1:18787/antigravity` | Mounted workspace paths, cross-file context snippets |
-| **ZCode** | `http://127.0.0.1:18787/zcode` | Open buffer snapshots, completion context |
-| **Qoder** | `http://127.0.0.1:18787/qoder` | Background codebase vector indexing uploads |
-| **Cursor** | `http://127.0.0.1:18787/cursor` | Composer multi-file context, `repo-service` chunk uploads |
-| **Grok Build** | `http://127.0.0.1:18787/grok-build` | Build context bundles, internal hostnames in compiler logs |
+| Tool | Local Proxy Route | Auto-Connect Mode | What Hide-Go watches for |
+| :--- | :--- | :--- | :--- |
+| **Claude Code** | `http://127.0.0.1:18787/claude-code` | `~/.claude/settings.json` (chains existing upstream proxies) | `CLAUDE.md` context injection, `Read`/`Bash` tool outputs, `/api/event_logging` telemetry |
+| **OpenAI Codex** | `/codex` + selective HTTPS MITM | `~/.codex/config.toml` + managed env script (`OPENAI_BASE_URL`, `HTTPS_PROXY`, `CODEX_CA_CERTIFICATE`) | Sandbox file trees, shell execution logs containing secrets |
+| **Antigravity** | Selective HTTPS MITM (HTTP/2 enabled) | IDE `User/settings.json` + managed env script (`HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`) | Mounted workspace paths, cross-file context snippets (binary Proto RPC streams pass through untouched) |
+| **ZCode** | Selective HTTPS MITM | Managed env script (`ZCODE_HTTP_PROXY`, `ZCODE_AGENT_CA_CERT`, `HTTPS_PROXY`) | Open buffer snapshots, completion context |
+| **Qoder** | Selective HTTPS MITM | `Qoder` / `QoderCN` `User/settings.json` + managed env script | Background codebase vector indexing uploads |
+| **Cursor** | Selective HTTPS MITM | `Cursor/User/settings.json` + managed env script (`http.proxy`, `http.proxySupport`) | Composer multi-file context, `repo-service` chunk uploads |
+| **Grok Build** | `/grok-build` + selective HTTPS MITM | Managed env script (`GROK_XAI_API_BASE_URL`, `GROK_CLI_CHAT_PROXY_BASE_URL`, `HTTPS_PROXY`) | Build context bundles, internal hostnames in compiler logs |
 
 <details>
 <summary><b>📋 One-line environment setup (Bash / Zsh / PowerShell)</b></summary>
@@ -131,26 +131,32 @@ Hide-Go ships with request fingerprinting and dedicated local routes for 7 tools
 ```bash
 # Claude Code
 export ANTHROPIC_BASE_URL="http://127.0.0.1:18787/claude-code"
+export NO_PROXY="localhost,127.0.0.1,::1"
 
 # OpenAI Codex
 export OPENAI_BASE_URL="http://127.0.0.1:18787/codex/v1"
+export HTTPS_PROXY="http://127.0.0.1:18787"
+export NO_PROXY="localhost,127.0.0.1,::1"
 
 # Grok Build
-export XAI_BASE_URL="http://127.0.0.1:18787/grok-build/v1"
+export GROK_XAI_API_BASE_URL="http://127.0.0.1:18787/grok-build/v1"
+export HTTPS_PROXY="http://127.0.0.1:18787"
+export NO_PROXY="localhost,127.0.0.1,::1"
 ```
 
 **Windows (PowerShell)**
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:18787/claude-code"
 $env:OPENAI_BASE_URL    = "http://127.0.0.1:18787/codex/v1"
-$env:XAI_BASE_URL       = "http://127.0.0.1:18787/grok-build/v1"
+$env:HTTPS_PROXY        = "http://127.0.0.1:18787"
+$env:NO_PROXY           = "localhost,127.0.0.1,::1"
 ```
 
 </details>
 
-> **Integration limits**: Hide-Go is a reverse-proxy gateway, not an HTTPS forward proxy. **It cannot be wired in through `HTTPS_PROXY`**: the gateway does not serve CONNECT, so that setting would only break every HTTPS request made from your shell. A tool has to support a custom API base URL. Two more known boundaries:
-> * **Cursor** relays custom base URL requests through Cursor's own servers, which cannot reach `127.0.0.1` on your machine. You would have to expose the gateway through an HTTPS tunnel yourself and accept the exposure that comes with it.
-> * **Qoder**'s built-in indexing channel bypasses the gateway if it does not read the base URL variable.
+> **Selective TLS inspection & compatibility guarantees**:
+> * **AI hosts only, zero interference elsewhere**: `HTTPS_PROXY` / `CONNECT` traffic only performs TLS inspection for built-in or configured AI API hosts (such as `api.openai.com`, `api2.cursor.sh`, `*.qoder.sh`). OAuth/login origins and all general hosts (GitHub, npm, Cargo, etc.) are bridged as raw TCP passthrough without decryption. Both HTTP/1.1, HTTP/2, and WebSocket (`wss://`) upgrades inside MITM tunnels are supported.
+> * **Explicit CA trust & liveness-guarded env scripts**: Managed `~/.hide-go/env.ps1` and shell RC blocks probe `127.0.0.1:<port>` before exporting proxy variables, so closing Hide-Go never breaks terminal networking. Root CA trust is installed only when explicitly triggered in the UI ("安装并信任根证书") and never silently modifies the Windows Registry.
 
 ## Secrets in tool calls are restored only for file writes by default
 
@@ -160,19 +166,33 @@ Tool calls issued by the model (shell commands, network requests, file writes) r
 
 ## Downloads
 
-Grab the standalone binary for your OS from the [Releases page](https://github.com/Aflydream/hide-go/releases). The compiled frontend is embedded via `include_bytes!`, so you don't need Node.js or external assets at runtime:
+Grab the **Hide-Go Setup Installer** (recommended — installs `hide-go-desktop`, `hide-go-daemon`, uninstaller, shortcuts, `PATH`, and optional AI harness auto-connect) or the standalone portable binary from the [Releases page](https://github.com/Aflydream/hide-go/releases). Both UIs are embedded statically via `include_bytes!`, so Node.js is not required at runtime:
 
-* **Windows (x64)**: Download and run `hide-go-desktop-windows-x64.exe`
+### Interactive Setup Wizard (Recommended)
+
+* **Windows (x64)**: Download and run `Hide-Go-Setup-windows-x64.exe` (registers cleanly in Windows Installed Apps for full uninstall & rollback)
 * **macOS (Apple Silicon)**:
   ```bash
-  chmod +x hide-go-desktop-macos-arm64 && ./hide-go-desktop-macos-arm64
+  chmod +x Hide-Go-Setup-macos-arm64 && ./Hide-Go-Setup-macos-arm64
   ```
 * **Linux (x86_64)**:
   ```bash
-  chmod +x hide-go-desktop-linux-x86_64 && ./hide-go-desktop-linux-x86_64
+  chmod +x Hide-Go-Setup-linux-x86_64 && ./Hide-Go-Setup-linux-x86_64
   ```
 
-Launching the binary starts the local proxy on `127.0.0.1:18787` and opens the desktop console window. Set `HIDE_GO_HEADLESS=1` if you want to run the gateway on a headless server without spawning a window.
+Silent CLI flags are also supported for automated provisioning or removal:
+
+```bash
+# Silent install and auto-connect detected harnesses
+Hide-Go-Setup --silent --install --dir /path/to/Hide-Go --auto-connect
+
+# Silent uninstall and roll back managed harness configs
+Hide-Go-Setup --silent --uninstall --dir /path/to/Hide-Go
+```
+
+### Portable Single Binary
+
+If you prefer zero installation, run `hide-go-desktop-*` directly to start the proxy on `127.0.0.1:18787` and open the desktop console. Set `HIDE_GO_HEADLESS=1` (or run `hide-go-daemon`) for headless server mode.
 
 | Environment variable | Effect |
 | :--- | :--- |
@@ -197,19 +217,24 @@ Launching the binary starts the local proxy on `127.0.0.1:18787` and opens the d
 Prerequisites: Rust `1.80+` and Node.js `20+` (only needed when rebuilding the embedded frontend bundle).
 
 ```bash
-# 1. Run unit tests (harness fingerprinting, semantic vault, isomorphic camouflage, SSE chunk boundary restoration)
+# 1. Run workspace unit & integration tests (engine, desktop, and setup installer)
 cargo test --workspace
 
-# 2. Build the frontend bundle and compile the single-file desktop executable
+# 2. Build the frontend bundles (desktop console + setup wizard) and release binaries
 npm install && npm run build
-cargo build --release -p hide-go-desktop
+cargo build --release -p hide-core -p hide-go-desktop
+
+# 3. Build the self-contained Setup installer (macOS / Linux bash example)
+export HIDE_GO_BUNDLE_DESKTOP="$PWD/target/release/hide-go-desktop"
+export HIDE_GO_BUNDLE_DAEMON="$PWD/target/release/hide-go-daemon"
+cargo build --release -p hide-setup
 ```
 
 ### Repository layout
 
 ```text
 hide-go/
-├── crates/hide-core/          # Core Rust library & standalone daemon
+├── crates/hide-core/          # Core Rust library & standalone daemon (hide-go-daemon)
 │   ├── src/
 │   │   ├── scanner.rs         # Scanner for keys, DB URLs, private IPs, paths, and custom rules
 │   │   ├── vault.rs           # Thread-safe bidirectional placeholder <-> raw value table, size-capped
@@ -219,9 +244,11 @@ hide-go/
 │   │   ├── restore.rs         # JSON response restoration and the tool-call secret policy
 │   │   ├── sse_restorer.rs    # Protocol-aware, per-channel SSE stream restorer
 │   │   ├── stream_restorer.rs # Sliding-window text restorer across arbitrary chunk splits
-│   │   ├── harness.rs         # Detection, routes, and setup scripts for the 7 tools
+│   │   ├── harness.rs         # Routing, profiles, and script generation for the 7 tools
+│   │   ├── harness_detect.rs  # Local tool detection, reversible auto-connect, and config backups
 │   │   └── proxy.rs           # Axum reverse proxy, management API, and offline simulator
 │   └── tests/                 # Regression tests for the code-review findings
-├── src/                       # Desktop UI (overview, traffic inspector, policy, custom rules, mapping table, integrations)
+├── crates/hide-setup/         # Self-contained Setup installer & uninstaller wizard
+├── src/                       # Desktop console & Setup wizard UIs (React + Vite + Tailwind)
 └── desktop/                   # Single-binary asset embedder & console window launcher
 ```

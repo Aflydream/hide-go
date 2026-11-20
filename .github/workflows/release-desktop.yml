@@ -28,6 +28,8 @@ jobs:
           npm run build
       - name: Verify committed dist/ matches sources
         run: git diff --exit-code -- dist
+      - name: Install Linux WebView dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev
       - name: Rust format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -45,14 +47,23 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: hide-go-desktop-linux-x86_64
             bin_name: hide-go-desktop
+            daemon_bin_name: hide-go-daemon
+            setup_artifact_name: Hide-Go-Setup-linux-x86_64
+            setup_bin_name: hide-go-setup
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: hide-go-desktop-macos-arm64
             bin_name: hide-go-desktop
+            daemon_bin_name: hide-go-daemon
+            setup_artifact_name: Hide-Go-Setup-macos-arm64
+            setup_bin_name: hide-go-setup
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: hide-go-desktop-windows-x64.exe
             bin_name: hide-go-desktop.exe
+            daemon_bin_name: hide-go-daemon.exe
+            setup_artifact_name: Hide-Go-Setup-windows-x64.exe
+            setup_bin_name: hide-go-setup.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -63,22 +74,44 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Install Linux WebView dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev
       - name: Build frontend
         run: |
           npm ci
           npm run build
-      - name: Build desktop binary
-        run: cargo build --release --locked -p hide-go-desktop --target ${{ matrix.target }}
-      - name: Package binary and checksum
+      - name: Build daemon and desktop binaries
+        run: cargo build --release --locked -p hide-core -p hide-go-desktop --target ${{ matrix.target }}
+      - name: Build setup installer
         shell: bash
         run: |
+          if command -v cygpath >/dev/null 2>&1; then
+            WS_ROOT="$(cygpath -w "$PWD")"
+          else
+            WS_ROOT="$PWD"
+          fi
+          export HIDE_GO_BUNDLE_DESKTOP="${WS_ROOT}/target/${{ matrix.target }}/release/${{ matrix.bin_name }}"
+          export HIDE_GO_BUNDLE_DAEMON="${WS_ROOT}/target/${{ matrix.target }}/release/${{ matrix.daemon_bin_name }}"
+          cargo build --release --locked -p hide-setup --target ${{ matrix.target }}
+      - name: Package installer, portable binary, and checksums
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/${{ matrix.setup_bin_name }}" "${{ matrix.setup_artifact_name }}"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "${{ matrix.artifact_name }}"
-          if command -v sha256sum >/dev/null; then sha256sum "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256"; \
-          else shasum -a 256 "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256"; fi
+          if command -v sha256sum >/dev/null; then
+            sha256sum "${{ matrix.setup_artifact_name }}" > "${{ matrix.setup_artifact_name }}.sha256"
+            sha256sum "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.setup_artifact_name }}" > "${{ matrix.setup_artifact_name }}.sha256"
+            shasum -a 256 "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: |
+            ${{ matrix.setup_artifact_name }}
+            ${{ matrix.setup_artifact_name }}.sha256
             ${{ matrix.artifact_name }}
             ${{ matrix.artifact_name }}.sha256
 
@@ -90,16 +123,27 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+      - name: Extract release notes from CHANGELOG.md
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { found=1; print; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "Hide-Go ${GITHUB_REF_NAME}" > release-notes.md
+          fi
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: Hide-Go ${{ github.ref_name }}
-          body: |
-            Hide-Go 单文件桌面端（内嵌控制台界面，启动后在 127.0.0.1 运行本地隐私网关）。
-            每个二进制附带 `.sha256` 校验文件。macOS / Windows 版本未做代码签名，首次运行需手动放行。
+          body_path: release-notes.md
           files: artifacts/*
           fail_on_unmatched_files: true

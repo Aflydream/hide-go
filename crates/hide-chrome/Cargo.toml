@@ -1,0 +1,19 @@
+[package]
+name = "hide-chrome"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Frameless native desktop WebView window host for Hide-Go desktop and setup wizard"
+
+[dependencies]
+tao.workspace = true
+tracing.workspace = true
+wry.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }

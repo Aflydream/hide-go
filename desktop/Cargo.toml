@@ -10,6 +10,7 @@ name = "hide_go_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
+hide-chrome = { path = "../crates/hide-chrome" }
 hide-core = { path = "../crates/hide-core" }
 axum.workspace = true
 serde.workspace = true

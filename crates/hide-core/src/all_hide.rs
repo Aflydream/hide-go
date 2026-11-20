@@ -2,9 +2,11 @@ use crate::config::{CoverTheme, FindingKind, HideConfig, LeakFinding, TrafficCat
 use crate::desensitizer::SemanticDesensitizer;
 use crate::protocol::{is_opaque_block, is_schema_key, is_structural_key};
 use crate::scanner::is_placeholder_token;
-use crate::vault::{mask_preview, reserialize_like, DerivedContext, PrivacyVault};
+use crate::vault::{mask_preview, reserialize_like, DerivedContext, PrivacyVault, MAX_JSON_DEPTH};
 use once_cell::sync::Lazy;
 use regex::Regex;
+use ring::hmac;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -287,8 +289,11 @@ const OWN_TOKEN_PREFIXES: &[&str] = &[
     "app_schema_",
     "user_",
     "dev_member_",
-    "svc",
+    "svc-node-",
     "sk-sem",
+    "CustomConcept_",
+    "sym_entity_",
+    "git-ref-placeholder-",
 ];
 
 #[derive(Default)]
@@ -328,6 +333,16 @@ impl AllHideEngine {
         config: &HideConfig,
         vault: &PrivacyVault,
     ) -> AllHideOutput {
+        Self::process_with_scope(payload, category, config, vault, None)
+    }
+
+    pub fn process_with_scope(
+        payload: &str,
+        category: TrafficCategory,
+        config: &HideConfig,
+        vault: &PrivacyVault,
+        scope: Option<&str>,
+    ) -> AllHideOutput {
         if config.all_hide.enable_telemetry_chaff
             && matches!(category, TrafficCategory::Telemetry | TrafficCategory::CodebaseIndexing)
         {
@@ -349,7 +364,7 @@ impl AllHideEngine {
             };
         }
 
-        let base = SemanticDesensitizer::process(payload, config, vault);
+        let base = SemanticDesensitizer::process_with_scope(payload, config, vault, scope);
         let mut findings = base.findings;
         let mut stats = LayerStats::default();
         let current = base.transformed_payload;
@@ -360,10 +375,10 @@ impl AllHideEngine {
             .filter(|_| trimmed.starts_with(['{', '[']))
         {
             Some(mut value) => {
-                Self::transform_json_content(&mut value, config, vault, &mut stats);
+                Self::transform_json_content(&mut value, config, vault, scope, &mut stats, 0);
                 reserialize_like(trimmed, &value)
             }
-            None => Self::transform_text(&current, config, vault, &mut stats),
+            None => Self::transform_text(&current, config, vault, scope, &mut stats),
         };
 
         let mut actions = Vec::new();
@@ -412,7 +427,20 @@ impl AllHideEngine {
     }
 
     /// Walk only content-bearing positions of a request document.
-    fn transform_json_content(value: &mut Value, config: &HideConfig, vault: &PrivacyVault, stats: &mut LayerStats) {
+    fn transform_json_content(
+        value: &mut Value,
+        config: &HideConfig,
+        vault: &PrivacyVault,
+        scope: Option<&str>,
+        stats: &mut LayerStats,
+        depth: usize,
+    ) {
+        if depth >= MAX_JSON_DEPTH {
+            if let Value::String(s) = value {
+                *s = Self::transform_text(s, config, vault, scope, stats);
+            }
+            return;
+        }
         match value {
             Value::Object(map) => {
                 if is_opaque_block(map) {
@@ -422,42 +450,48 @@ impl AllHideEngine {
                     if is_structural_key(key) || is_schema_key(key) {
                         continue;
                     }
-                    Self::transform_json_content(item, config, vault, stats);
+                    Self::transform_json_content(item, config, vault, scope, stats, depth + 1);
                 }
             }
             Value::Array(items) => items
                 .iter_mut()
-                .for_each(|v| Self::transform_json_content(v, config, vault, stats)),
+                .for_each(|v| Self::transform_json_content(v, config, vault, scope, stats, depth + 1)),
             Value::String(s) => {
                 let st = s.trim();
-                if st.starts_with(['{', '[']) {
+                if st.starts_with(['{', '[']) && depth + 1 < MAX_JSON_DEPTH {
                     if let Ok(mut inner) = serde_json::from_str::<Value>(st) {
                         // Nested tool arguments: transform values, keep the parameter names.
-                        Self::transform_json_content(&mut inner, config, vault, stats);
+                        Self::transform_json_content(&mut inner, config, vault, scope, stats, depth + 1);
                         *s = reserialize_like(st, &inner);
                         return;
                     }
                 }
-                *s = Self::transform_text(s, config, vault, stats);
+                *s = Self::transform_text(s, config, vault, scope, stats);
             }
             _ => {}
         }
     }
 
-    fn transform_text(text: &str, config: &HideConfig, vault: &PrivacyVault, stats: &mut LayerStats) -> String {
+    fn transform_text(
+        text: &str,
+        config: &HideConfig,
+        vault: &PrivacyVault,
+        scope: Option<&str>,
+        stats: &mut LayerStats,
+    ) -> String {
         if text.trim().is_empty() {
             return text.to_string();
         }
         let ah = &config.all_hide;
         let mut out = text.to_string();
         if ah.strict_literal_masking {
-            out = Self::mask_quoted_literals(&out, vault, stats);
+            out = Self::mask_quoted_literals(&out, vault, scope, stats);
         }
         if ah.enable_isomorphic_camouflage {
-            out = Self::camouflage(&out, ah.cover_theme, &config.project_salt, vault, stats);
+            out = Self::camouflage(&out, ah.cover_theme, &config.project_salt, vault, scope, stats);
         }
         if ah.enable_cipher_garble {
-            let (garbled, _) = Self::apply_cipher_garble(&out, &config.project_salt, vault);
+            let (garbled, _) = Self::apply_cipher_garble_scoped(&out, &config.project_salt, vault, scope);
             LayerStats::note(&mut stats.cipher, &out, &garbled);
             out = garbled;
         }
@@ -467,7 +501,7 @@ impl AllHideEngine {
     /// Mask quoted code string literals with Vault-only tokens (single pass).
     pub fn apply_strict_literal_masking(input: &str, vault: &PrivacyVault) -> (String, Vec<LeakFinding>) {
         let mut stats = LayerStats::default();
-        let out = Self::mask_quoted_literals(input, vault, &mut stats);
+        let out = Self::mask_quoted_literals(input, vault, None, &mut stats);
         let findings = (stats.literal.0 > 0)
             .then(|| LeakFinding {
                 kind: FindingKind::ProprietaryCodeSymbol,
@@ -482,13 +516,27 @@ impl AllHideEngine {
         (out, findings)
     }
 
-    fn mask_quoted_literals(text: &str, vault: &PrivacyVault, stats: &mut LayerStats) -> String {
-        let tokens = vault.matcher().token_ranges(text);
+    fn mask_quoted_literals(text: &str, vault: &PrivacyVault, scope: Option<&str>, stats: &mut LayerStats) -> String {
+        let tokens = vault.matcher_for_scope(scope).token_ranges(text);
         let mut out = String::with_capacity(text.len());
         let mut last = 0;
         for m in QUOTED_LITERAL_RE.find_iter(text) {
             let lit = m.as_str();
             let inner = &lit[1..lit.len() - 1];
+            // Avoid mistaking English contractions (e.g. "don't think it's") for single-quoted string literals.
+            if lit.starts_with('\'') {
+                let prev_alnum = text[..m.start()]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
+                let next_alnum = text[m.end()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
+                if prev_alnum || next_alnum {
+                    continue;
+                }
+            }
             if lit.len() < 4
                 || is_placeholder_token(inner)
                 || inner.starts_with("<<HIDE_")
@@ -497,9 +545,16 @@ impl AllHideEngine {
                 continue;
             }
             let quote = &lit[..1];
-            let tok = vault.register_derived_with(inner, "StrictStringLiteral", DerivedContext::PlainText, |idx| {
-                format!("<<HIDE_STR_{:03}>>", idx)
-            });
+            let tok = vault.register_derived_scoped_with(
+                scope,
+                inner,
+                "StrictStringLiteral",
+                DerivedContext::PlainText,
+                |idx| {
+                    let tag = vault.keyed_tag("StrictStringLiteral", scope, idx, 8);
+                    format!("<<HIDE_STR_{tag}_{idx:03}>>")
+                },
+            );
             LayerStats::note(&mut stats.literal, inner, &tok);
             out.push_str(&text[last..m.start()]);
             out.push_str(quote);
@@ -512,33 +567,82 @@ impl AllHideEngine {
     }
 
     /// Single-pass cover-domain mapping of `//` comments and compound identifiers.
-    fn camouflage(text: &str, theme: CoverTheme, salt: &str, vault: &PrivacyVault, stats: &mut LayerStats) -> String {
-        let tokens = vault.matcher().token_ranges(text);
+    fn camouflage(
+        text: &str,
+        theme: CoverTheme,
+        salt: &str,
+        vault: &PrivacyVault,
+        scope: Option<&str>,
+        stats: &mut LayerStats,
+    ) -> String {
+        let tokens = vault.matcher_for_scope(scope).token_ranges(text);
         let overlaps_token = |s: usize, e: usize| tokens.iter().any(|&(a, b)| s < b && a < e);
+        let scoped_salt = format!("{salt}:{}", vault.keyed_tag("cover", scope, 0, 12));
 
-        // 1. Comments become numbered cover comments.
+        // 1. Comments become numbered cover comments. When a comment contains already-masked
+        // tokens (paths, keys, strict literals), camouflage the unmasked prose segments around
+        // those tokens instead of skipping the whole comment.
         let mut replacements: Vec<(usize, usize, String)> = Vec::new();
-        for caps in LINE_COMMENT_RE.captures_iter(text) {
-            let m = caps.get(1).unwrap();
-            if overlaps_token(m.start(), m.end()) {
-                continue;
-            }
-            let n = replacements.len() + 1;
-            let preferred = match theme {
+        let cover_phrase = |theme: CoverTheme, n: usize, tag: &str, with_slashes: bool| {
+            let body = match theme {
                 CoverTheme::BotanicalGarden => {
-                    format!("// [BotanicalSensor-{n:02}] Calibrate greenhouse soil humidity and mist interval")
+                    format!("[BotanicalSensor-{tag}-{n:02}] Calibrate greenhouse soil humidity and mist interval")
                 }
                 CoverTheme::LibraryCatalog => {
-                    format!("// [CatalogIndex-{n:02}] Verify shelf Dewey decimal classification order")
+                    format!("[CatalogIndex-{tag}-{n:02}] Verify shelf Dewey decimal classification order")
                 }
                 CoverTheme::BakeryRecipe => {
-                    format!("// [OvenController-{n:02}] Adjust sourdough fermentation thermal curve")
+                    format!("[OvenController-{tag}-{n:02}] Adjust sourdough fermentation thermal curve")
                 }
             };
-            let cover =
-                vault.register_derived_with(m.as_str(), "CoverComment", DerivedContext::PlainText, |_| preferred);
-            LayerStats::note(&mut stats.camouflage, m.as_str(), &cover);
-            replacements.push((m.start(), m.end(), cover));
+            if with_slashes {
+                format!("// {body}")
+            } else {
+                body
+            }
+        };
+        for caps in LINE_COMMENT_RE.captures_iter(text) {
+            let Some(m) = caps.get(1) else {
+                continue;
+            };
+            let mut sub_spans: Vec<(usize, usize)> = Vec::new();
+            let mut cursor = m.start();
+            for &(tok_s, tok_e) in &tokens {
+                if tok_e <= m.start() || tok_s >= m.end() {
+                    continue;
+                }
+                if cursor < tok_s {
+                    sub_spans.push((cursor, tok_s));
+                }
+                cursor = cursor.max(tok_e.min(m.end()));
+            }
+            if cursor < m.end() {
+                sub_spans.push((cursor, m.end()));
+            }
+
+            for (s, e) in sub_spans {
+                let slice = &text[s..e];
+                let lead_ws = slice.len() - slice.trim_start().len();
+                let trail_ws = slice.len() - slice.trim_end().len();
+                let seg_s = s + lead_ws;
+                let seg_e = e.saturating_sub(trail_ws);
+                if seg_s >= seg_e {
+                    continue;
+                }
+                let seg = &text[seg_s..seg_e];
+                if !seg.chars().any(|c| c.is_alphanumeric()) {
+                    continue;
+                }
+                let n = replacements.len() + 1;
+                let tag = vault.keyed_tag("CoverComment", scope, n, 8);
+                let preferred = cover_phrase(theme, n, &tag, seg.starts_with("//"));
+                let cover =
+                    vault.register_derived_scoped_with(scope, seg, "CoverComment", DerivedContext::PlainText, |_| {
+                        preferred
+                    });
+                LayerStats::note(&mut stats.camouflage, seg, &cover);
+                replacements.push((seg_s, seg_e, cover));
+            }
         }
 
         // 2. Compound identifiers outside comments and existing tokens.
@@ -551,9 +655,14 @@ impl AllHideEngine {
                 continue;
             }
             if !covers.contains_key(ident) {
-                let preferred = Self::deterministic_cover_symbol(ident, theme, salt);
-                let cover =
-                    vault.register_derived_with(ident, "IsomorphicSymbol", DerivedContext::PlainText, |_| preferred);
+                let preferred = Self::deterministic_cover_symbol(ident, theme, &scoped_salt);
+                let cover = vault.register_derived_scoped_with(
+                    scope,
+                    ident,
+                    "IsomorphicSymbol",
+                    DerivedContext::PlainText,
+                    |_| preferred,
+                );
                 LayerStats::note(&mut stats.camouflage, ident, &cover);
                 covers.insert(ident, cover);
             }
@@ -604,15 +713,25 @@ impl AllHideEngine {
         }
     }
 
-    /// Encrypt text into a keyed SHA-256 CTR Braille cipher block (`⟦HIDE-CIPHER::...⟧`)
+    /// Encrypt text into an authenticated keyed SHA-256 CTR Braille cipher block (`⟦HIDE-CIPHER::...⟧`)
     /// bound to the Vault's 256-bit runtime secret key and `project_salt`.
     pub fn apply_cipher_garble(input: &str, salt: &str, vault: &PrivacyVault) -> (String, Option<LeakFinding>) {
+        Self::apply_cipher_garble_scoped(input, salt, vault, None)
+    }
+
+    fn apply_cipher_garble_scoped(
+        input: &str,
+        salt: &str,
+        vault: &PrivacyVault,
+        scope: Option<&str>,
+    ) -> (String, Option<LeakFinding>) {
         if input.trim().is_empty() {
             return (input.to_string(), None);
         }
-        let preferred_cipher = Self::encode_keyed_braille_cipher(input, salt, vault);
         let cipher_token =
-            vault.register_derived_with(input, "CipherGarble", DerivedContext::PlainText, |_| preferred_cipher);
+            vault.register_derived_scoped_with(scope, input, "CipherGarble", DerivedContext::PlainText, |_| {
+                Self::encode_keyed_braille_cipher(input, salt, vault)
+            });
         let finding = LeakFinding {
             kind: FindingKind::ProprietaryCodeSymbol,
             label: "All-Hide 密钥流加密乱码 (Keyed Stream Cipher)".to_string(),
@@ -624,24 +743,31 @@ impl AllHideEngine {
         (cipher_token, Some(finding))
     }
 
-    /// Encrypt UTF-8 bytes using a SHA-256 CTR keystream derived from `vault.secret_key()` + `salt` + 8-byte nonce,
-    /// rendered in the Unicode Braille block (U+2800..U+28FF). Cannot be reversed without the Vault's secret key.
+    /// Encrypt UTF-8 bytes using a SHA-256 CTR keystream with a 16-byte random nonce and 16-byte
+    /// HMAC-SHA256 authentication tag derived from `vault.secret_key()` + `salt`,
+    /// rendered in the Unicode Braille block (U+2800..U+28FF).
     pub fn encode_keyed_braille_cipher(raw: &str, salt: &str, vault: &PrivacyVault) -> String {
         let secret_key = vault.secret_key();
-        let nonce = derive_cipher_nonce(&secret_key, salt, raw);
-        let mut encoded = String::with_capacity((raw.len() + 8) * 3 + 32);
+        let nonce = random_cipher_nonce(&secret_key, salt, raw);
+        let mut ciphertext = Vec::with_capacity(raw.len());
+        let mut ks = Keystream::new(&secret_key, salt, &nonce);
+        for &b in raw.as_bytes() {
+            ciphertext.push(b ^ ks.next_byte());
+        }
+        let tag = compute_cipher_tag(&secret_key, salt, &nonce, &ciphertext);
+
+        let mut encoded = String::with_capacity((nonce.len() + ciphertext.len() + 16) * 3 + 32);
         encoded.push_str("⟦HIDE-CIPHER::");
         let to_braille = |b: u8| char::from_u32(0x2800 + b as u32).unwrap_or('⣿');
         nonce.iter().for_each(|&b| encoded.push(to_braille(b)));
-        let mut ks = Keystream::new(&secret_key, salt, &nonce);
-        raw.as_bytes()
-            .iter()
-            .for_each(|&b| encoded.push(to_braille(b ^ ks.next_byte())));
+        ciphertext.iter().for_each(|&b| encoded.push(to_braille(b)));
+        tag.iter().for_each(|&b| encoded.push(to_braille(b)));
         encoded.push('⟧');
         encoded
     }
 
-    /// Decrypt `⟦HIDE-CIPHER::...⟧` blocks using the local `PrivacyVault` (and `project_salt`).
+    /// Decrypt authenticated `⟦HIDE-CIPHER::...⟧` blocks using the local `PrivacyVault` (and `project_salt`).
+    /// Unauthenticated, truncated, or tampered blocks are rejected and left untouched.
     pub fn decode_braille_cipher_blocks(text: &str, vault: &PrivacyVault, salt: &str) -> String {
         let prefix = "⟦HIDE-CIPHER::";
         let suffix = "⟧";
@@ -660,17 +786,26 @@ impl AllHideEngine {
             if let Some(from_vault) = vault.get_raw_by_token(full_token) {
                 output.push_str(&from_vault);
             } else {
-                let raw_bytes: Vec<u8> = after_prefix[..end]
+                let body = &after_prefix[..end];
+                let raw_bytes: Option<Vec<u8>> = body
                     .chars()
-                    .filter_map(|ch| (ch as u32).checked_sub(0x2800).filter(|c| *c <= 0xFF).map(|c| c as u8))
+                    .map(|ch| (ch as u32).checked_sub(0x2800).filter(|c| *c <= 0xFF).map(|c| c as u8))
                     .collect();
-                let decoded = (raw_bytes.len() > 8)
-                    .then(|| {
-                        let nonce: [u8; 8] = raw_bytes[..8].try_into().unwrap();
-                        let mut ks = Keystream::new(&secret_key, salt, &nonce);
-                        String::from_utf8(raw_bytes[8..].iter().map(|&cb| cb ^ ks.next_byte()).collect()).ok()
-                    })
-                    .flatten();
+                let decoded = raw_bytes.and_then(|bytes| {
+                    // Layout: 16-byte nonce + >=1 byte ciphertext + 16-byte HMAC-SHA256 tag.
+                    if bytes.len() <= 32 {
+                        return None;
+                    }
+                    let nonce: [u8; 16] = bytes[..16].try_into().ok()?;
+                    let ct_end = bytes.len() - 16;
+                    let ciphertext = &bytes[16..ct_end];
+                    let tag = &bytes[ct_end..];
+                    if !verify_cipher_tag(&secret_key, salt, &nonce, ciphertext, tag) {
+                        return None;
+                    }
+                    let mut ks = Keystream::new(&secret_key, salt, &nonce);
+                    String::from_utf8(ciphertext.iter().map(|&cb| cb ^ ks.next_byte()).collect()).ok()
+                });
                 output.push_str(decoded.as_deref().unwrap_or(full_token));
             }
             rest = &after_prefix[end + suffix.len()..];
@@ -701,7 +836,7 @@ impl AllHideEngine {
         match serde_json::from_str::<Value>(trimmed) {
             Ok(mut value) => {
                 let mut n = 0usize;
-                decoy_json(&mut value, decoy, &mut n);
+                decoy_json(&mut value, decoy, &mut n, 0);
                 reserialize_like(trimmed, &value)
             }
             Err(_) => decoy_text(decoy, original.chars().count(), 0),
@@ -709,7 +844,14 @@ impl AllHideEngine {
     }
 }
 
-fn decoy_json(value: &mut Value, decoy: &str, n: &mut usize) {
+fn decoy_json(value: &mut Value, decoy: &str, n: &mut usize, depth: usize) {
+    if depth >= MAX_JSON_DEPTH {
+        if let Value::String(s) = value {
+            *n += 1;
+            *s = decoy_text(decoy, s.chars().count(), *n);
+        }
+        return;
+    }
     match value {
         Value::Object(map) => {
             for (k, v) in map.iter_mut() {
@@ -723,10 +865,10 @@ fn decoy_json(value: &mut Value, decoy: &str, n: &mut usize) {
                         continue;
                     }
                 }
-                decoy_json(v, decoy, n);
+                decoy_json(v, decoy, n, depth + 1);
             }
         }
-        Value::Array(items) => items.iter_mut().for_each(|v| decoy_json(v, decoy, n)),
+        Value::Array(items) => items.iter_mut().for_each(|v| decoy_json(v, decoy, n, depth + 1)),
         Value::String(s) => {
             *n += 1;
             *s = decoy_text(decoy, s.chars().count(), *n);
@@ -762,30 +904,63 @@ fn is_camouflage_candidate(ident: &str) -> bool {
     snake || camel
 }
 
-fn derive_cipher_nonce(secret_key: &[u8; 32], salt: &str, raw: &str) -> [u8; 8] {
-    let mut hasher = Sha256::new();
-    hasher.update(secret_key);
-    hasher.update(b":nonce:");
-    hasher.update(salt.as_bytes());
-    hasher.update(b":");
-    hasher.update(raw.as_bytes());
-    let digest = hasher.finalize();
-    let mut nonce = [0u8; 8];
-    nonce.copy_from_slice(&digest[..8]);
+fn random_cipher_nonce(secret_key: &[u8; 32], salt: &str, raw: &str) -> [u8; 16] {
+    let mut nonce = [0u8; 16];
+    if SystemRandom::new().fill(&mut nonce).is_ok() {
+        return nonce;
+    }
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret_key);
+    let mut ctx = hmac::Context::with_key(&key);
+    ctx.update(b"hide-go-nonce-fallback:");
+    ctx.update(salt.as_bytes());
+    ctx.update(b":");
+    ctx.update(raw.as_bytes());
+    nonce.copy_from_slice(&ctx.sign().as_ref()[..16]);
     nonce
+}
+
+fn cipher_auth_key(secret_key: &[u8; 32], salt: &str) -> hmac::Key {
+    let root = hmac::Key::new(hmac::HMAC_SHA256, secret_key);
+    let mut sub = hmac::Context::with_key(&root);
+    sub.update(b"hide-go-cipher-auth-v3:");
+    sub.update(salt.as_bytes());
+    hmac::Key::new(hmac::HMAC_SHA256, sub.sign().as_ref())
+}
+
+fn compute_cipher_tag(secret_key: &[u8; 32], salt: &str, nonce: &[u8; 16], ciphertext: &[u8]) -> [u8; 16] {
+    let key = cipher_auth_key(secret_key, salt);
+    let mut ctx = hmac::Context::with_key(&key);
+    ctx.update(nonce);
+    ctx.update(&(ciphertext.len() as u64).to_le_bytes());
+    ctx.update(ciphertext);
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&ctx.sign().as_ref()[..16]);
+    tag
+}
+
+fn verify_cipher_tag(secret_key: &[u8; 32], salt: &str, nonce: &[u8; 16], ciphertext: &[u8], tag: &[u8]) -> bool {
+    if tag.len() != 16 {
+        return false;
+    }
+    let expected = compute_cipher_tag(secret_key, salt, nonce, ciphertext);
+    let mut diff = 0u8;
+    for (a, b) in expected.iter().zip(tag.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 /// SHA-256 CTR keystream: one digest per 32-byte block.
 struct Keystream<'a> {
     key: &'a [u8; 32],
     salt: &'a str,
-    nonce: &'a [u8; 8],
+    nonce: &'a [u8; 16],
     block: [u8; 32],
     index: usize,
 }
 
 impl<'a> Keystream<'a> {
-    fn new(key: &'a [u8; 32], salt: &'a str, nonce: &'a [u8; 8]) -> Self {
+    fn new(key: &'a [u8; 32], salt: &'a str, nonce: &'a [u8; 16]) -> Self {
         Self {
             key,
             salt,
@@ -800,7 +975,7 @@ impl<'a> Keystream<'a> {
         if offset == 0 {
             let mut hasher = Sha256::new();
             hasher.update(self.key);
-            hasher.update(b":hide-go-ctr-v2:");
+            hasher.update(b":hide-go-ctr-v3:");
             hasher.update(self.salt.as_bytes());
             hasher.update(b":");
             hasher.update(self.nonce);
@@ -915,5 +1090,36 @@ mod tests {
         );
         assert_ne!(AllHideEngine::decode_braille_cipher_blocks(&enc, &vault, "wrong"), text);
         assert_eq!(AllHideEngine::decode_braille_cipher_blocks(&enc, &vault, "salt"), text);
+    }
+
+    #[test]
+    fn cipher_rejects_tampered_blocks() {
+        let vault = PrivacyVault::new();
+        let text = "secret kernel parameter";
+        let enc = AllHideEngine::encode_keyed_braille_cipher(text, "salt", &vault);
+        let mut chars: Vec<char> = enc.chars().collect();
+        let idx = chars.len() - 2; // inside the trailing 16-byte MAC tag
+        chars[idx] = if chars[idx] == '⠀' { '⠁' } else { '⠀' };
+        let tampered: String = chars.into_iter().collect();
+        assert_eq!(
+            AllHideEngine::decode_braille_cipher_blocks(&tampered, &vault, "salt"),
+            tampered
+        );
+    }
+
+    #[test]
+    fn comments_with_masked_tokens_still_camouflage_surrounding_prose() {
+        let mut cfg = all_hide_cfg();
+        cfg.all_hide.strict_literal_masking = true;
+        let vault = PrivacyVault::new();
+        let src =
+            "// Proprietary ledger check in /home/alice/secret_repo with \"internal flag\"\npub fn settle_trade() {}";
+        let out = AllHideEngine::process(src, TrafficCategory::InteractivePrompt, &cfg, &vault);
+        assert!(!out.vendor_payload.contains("Proprietary"), "{}", out.vendor_payload);
+        assert!(!out.vendor_payload.contains("ledger"), "{}", out.vendor_payload);
+        assert!(!out.vendor_payload.contains("internal flag"), "{}", out.vendor_payload);
+        assert!(!out.vendor_payload.contains("/home/alice"), "{}", out.vendor_payload);
+        assert!(out.vendor_payload.contains("BotanicalSensor"), "{}", out.vendor_payload);
+        assert_eq!(vault.restore_text(&out.vendor_payload).0, src);
     }
 }

@@ -106,6 +106,8 @@ export interface TrafficAuditRecord {
   withheldCount: number;
 }
 
+export type AutoConnectMode = 'configFile' | 'envVar' | 'manual';
+
 export interface HarnessProfile {
   kind: HarnessKind;
   name: string;
@@ -119,6 +121,37 @@ export interface HarnessProfile {
   envSetupPowershell: string;
   integrationNote: string | null;
   detectedActive: boolean;
+  installed: boolean;
+  installPaths: string[];
+  configured: boolean;
+  configuredVia: string | null;
+  autoConnectMode: AutoConnectMode;
+  requiresCaTrust?: boolean;
+  autoConnectTargets?: string[];
+  trafficCount: number;
+  lastSeenAt: string | null;
+}
+
+export interface CaStatus {
+  ready: boolean;
+  caCertPath: string;
+  caBundlePath: string;
+  fingerprintSha1: string;
+  fingerprintSha256: string;
+  subject: string;
+  notAfter: string;
+  installedInOsStore: boolean;
+  osTrustSupported: boolean;
+  osTrustDetail: string;
+}
+
+export interface HarnessActionResult {
+  kind: HarnessKind;
+  ok: boolean;
+  connected: boolean;
+  message: string;
+  changedTarget: string | null;
+  backupPath: string | null;
 }
 
 export interface VaultEntry {

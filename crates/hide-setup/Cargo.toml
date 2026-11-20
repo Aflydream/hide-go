@@ -1,0 +1,24 @@
+[package]
+name = "hide-setup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hide-Go interactive setup wizard, installer, and uninstaller"
+
+[[bin]]
+name = "hide-go-setup"
+path = "src/main.rs"
+
+[dependencies]
+hide-chrome = { path = "../hide-chrome" }
+hide-core = { path = "../hide-core" }
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tower = "0.5"

@@ -1,5 +1,7 @@
 import type {
+  CaStatus,
   GatewayStatus,
+  HarnessActionResult,
   HarnessKind,
   HarnessProfile,
   HideConfig,
@@ -19,12 +21,19 @@ declare global {
 const TOKEN_KEY = 'hg-dev-token';
 
 /**
- * The desktop binary injects the management token into the page. During `npm run dev`
- * it can be passed once as `?token=…`; it is then moved to sessionStorage and removed
- * from the address bar so it does not linger in history.
+ * The desktop binary injects the management token into the page and deletes it immediately
+ * on first read. During `npm run dev` it can also be passed once as `?token=…`; it is then
+ * moved to sessionStorage and removed from the address bar so it does not linger in history.
  */
 function resolveToken(): string {
-  if (window.__HIDE_GO_TOKEN__) return window.__HIDE_GO_TOKEN__;
+  const injected = window.__HIDE_GO_TOKEN__;
+  if (injected) {
+    delete window.__HIDE_GO_TOKEN__;
+    return injected;
+  }
+  if (!import.meta.env.DEV) {
+    return '';
+  }
   const url = new URL(window.location.href);
   const fromQuery = url.searchParams.get('token');
   if (fromQuery) {
@@ -47,7 +56,7 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function authorizedFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   if (token) headers.set('X-Hide-Go-Token', token);
   if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
@@ -68,6 +77,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     if (res.status === 401) message = '管理令牌无效：请通过 Hide-Go 桌面程序打开控制台';
     throw new ApiError(res.status, message);
   }
+  return res;
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await authorizedFetch(path, init);
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
@@ -81,6 +95,18 @@ export const api = {
   log: (id: string) => request<TrafficAuditRecord>(`/api/logs/${encodeURIComponent(id)}`),
   clearLogs: () => request<void>('/api/logs', { method: 'DELETE' }),
   harnesses: () => request<HarnessProfile[]>('/api/harnesses'),
+  connectHarness: (kind: HarnessKind) =>
+    request<HarnessActionResult>(`/api/harnesses/${encodeURIComponent(kind)}/connect`, { method: 'POST' }),
+  disconnectHarness: (kind: HarnessKind) =>
+    request<HarnessActionResult>(`/api/harnesses/${encodeURIComponent(kind)}/disconnect`, { method: 'POST' }),
+  connectAllHarnesses: () => request<HarnessActionResult[]>('/api/harnesses/connect-all', { method: 'POST' }),
+  getCaStatus: () => request<CaStatus>('/api/ca/status'),
+  trustCa: () => request<CaStatus>('/api/ca/trust', { method: 'POST' }),
+  untrustCa: () => request<CaStatus>('/api/ca/trust', { method: 'DELETE' }),
+  downloadCaCert: async () => {
+    const res = await authorizedFetch('/api/ca/cert');
+    return await res.blob();
+  },
   vault: () => request<VaultEntry[]>('/api/vault'),
   clearVault: () => request<void>('/api/vault', { method: 'DELETE' }),
   simulate: (harness: HarnessKind, category: TrafficCategory, customPayload?: string) =>

@@ -47,7 +47,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       ref={ref}
       type={type}
       className={cx(
-        'inline-flex shrink-0 items-center justify-center whitespace-nowrap rounded font-medium transition-colors',
+        'inline-flex shrink-0 cursor-pointer items-center justify-center whitespace-nowrap rounded font-medium transition-colors motion-safe:active:scale-[0.99]',
         'disabled:pointer-events-none disabled:opacity-45',
         BUTTON_VARIANT[variant],
         BUTTON_SIZE[size],
@@ -79,7 +79,7 @@ export function IconButton({
       title={label}
       aria-pressed={pressed}
       className={cx(
-        'inline-flex h-7 w-7 shrink-0 items-center justify-center rounded text-fg-muted transition-colors',
+        'inline-flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded text-fg-muted transition-colors',
         'hover:bg-surface-3 hover:text-fg disabled:pointer-events-none disabled:opacity-45',
         pressed && 'bg-surface-3 text-fg',
         className,
@@ -118,7 +118,7 @@ export function Switch({
       disabled={disabled}
       onClick={() => onChange(!checked)}
       className={cx(
-        'relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors',
+        'relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border transition-colors',
         'disabled:cursor-not-allowed disabled:opacity-45',
         checked ? 'border-brand-solid bg-brand-solid' : 'border-line-control bg-surface-3',
       )}
@@ -127,7 +127,7 @@ export function Switch({
         aria-hidden="true"
         className={cx(
           'inline-block h-3.5 w-3.5 rounded-full transition-transform',
-          checked ? 'translate-x-[18px] bg-brand-on' : 'translate-x-[2px] bg-fg-muted',
+          checked ? 'translate-x-[17px] bg-brand-on' : 'translate-x-[2px] bg-fg-muted',
         )}
       />
     </button>
@@ -183,9 +183,9 @@ export function Segmented<T extends string>({
             onClick={() => onChange(opt.value)}
             onKeyDown={(e) => onKey(e, i)}
             className={cx(
-              'inline-flex items-center gap-1.5 rounded-sm font-medium transition-colors',
+              'inline-flex cursor-pointer items-center gap-1.5 rounded-sm font-medium transition-colors',
               size === 'sm' ? 'h-6 px-2 text-2xs' : 'h-7 px-2.5 text-xs',
-              active ? SEGMENT_ACTIVE[opt.tone ?? 'plain'] : 'text-fg-muted hover:text-fg',
+              active ? SEGMENT_ACTIVE[opt.tone ?? 'plain'] : 'text-fg-muted hover:bg-surface/60 hover:text-fg',
             )}
           >
             {opt.icon && (
@@ -250,7 +250,7 @@ export function Panel({
   return (
     <section aria-labelledby={title ? headingId : undefined} id={id} className={cx('rounded-md border border-line bg-surface', className)}>
       {(title || actions) && (
-        <header className="flex min-h-11 items-center justify-between gap-3 border-b border-line px-4 py-2">
+        <header className="flex min-h-11 items-center justify-between gap-3 border-b border-line px-4 py-2.5">
           <div className="min-w-0">
             {title && (
               <h2 id={headingId} className="truncate text-sm font-semibold text-fg">
@@ -385,74 +385,100 @@ export function Dialog({
   footer?: ReactNode;
   width?: string;
 }) {
-  const panel = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
   const titleId = useId();
   const descId = useId();
-  // Callers pass inline closures that change on every poll-driven render; reading the latest
-  // one through a ref keeps the focus trap from re-running (and stealing focus) each time.
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+
   useEffect(() => {
-    if (!open) return;
-    const previous = document.activeElement as HTMLElement | null;
-    const focusables = () =>
-      Array.from(
-        panel.current?.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input:not([disabled]), select, textarea, [tabindex]:not([tabindex="-1"])') ?? [],
-      );
-    (panel.current?.querySelector<HTMLElement>('[data-autofocus]') ?? focusables()[0])?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
-        onCloseRef.current();
-      } else if (e.key === 'Tab') {
-        const items = focusables();
-        if (!items.length) return;
-        const first = items[0];
-        const last = items[items.length - 1];
-        if (e.shiftKey && document.activeElement === first) {
-          e.preventDefault();
-          last.focus();
-        } else if (!e.shiftKey && document.activeElement === last) {
-          e.preventDefault();
-          first.focus();
-        }
-      }
-    };
-    document.addEventListener('keydown', onKey, true);
-    return () => {
-      document.removeEventListener('keydown', onKey, true);
-      previous?.focus();
-    };
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (open && !dialog.open) {
+      dialog.showModal();
+      const target = dialog.querySelector<HTMLElement>('[data-autofocus], [autofocus]');
+      target?.focus();
+    } else if (!open && dialog.open) {
+      dialog.close();
+    }
   }, [open]);
-  if (!open) return null;
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+
+    const handleClose = () => {
+      dialog.returnValue = '';
+      onCloseRef.current();
+    };
+    const handleCancel = (e: Event) => {
+      e.preventDefault();
+      handleClose();
+    };
+
+    dialog.addEventListener('close', handleClose);
+    dialog.addEventListener('cancel', handleCancel);
+
+    // Progressive-enhancement fallback for click-outside light dismiss where `closedby` is unsupported.
+    let cleanupOutside: (() => void) | undefined;
+    if (!('closedBy' in HTMLDialogElement.prototype)) {
+      let pressedOutside = false;
+      const isOutside = (e: PointerEvent) => {
+        const r = dialog.getBoundingClientRect();
+        return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
+      };
+      const onDown = (e: PointerEvent) => {
+        pressedOutside = isOutside(e);
+      };
+      const onUp = (e: PointerEvent) => {
+        if (pressedOutside && isOutside(e)) {
+          dialog.close();
+        }
+        pressedOutside = false;
+      };
+      dialog.addEventListener('pointerdown', onDown);
+      dialog.addEventListener('pointerup', onUp);
+      cleanupOutside = () => {
+        dialog.removeEventListener('pointerdown', onDown);
+        dialog.removeEventListener('pointerup', onUp);
+      };
+    }
+
+    return () => {
+      dialog.removeEventListener('close', handleClose);
+      dialog.removeEventListener('cancel', handleCancel);
+      cleanupOutside?.();
+    };
+  }, []);
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-6">
-      <div aria-hidden="true" className="absolute inset-0 bg-fg/45" onClick={onClose} />
-      <div
-        ref={panel}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        aria-describedby={description ? descId : undefined}
-        className={cx('relative flex max-h-full w-full flex-col rounded-lg bg-surface shadow-overlay', width)}
-      >
-        <header className="flex items-start justify-between gap-4 border-b border-line px-5 py-4">
-          <div>
-            <h2 id={titleId} className="text-base font-semibold text-fg">
-              {title}
-            </h2>
-            {description && (
-              <div id={descId} className="mt-1 text-xs leading-5 text-fg-muted">
-                {description}
-              </div>
-            )}
-          </div>
-          <IconButton label="关闭" icon={<X size={16} />} onClick={onClose} className="-mr-1.5 -mt-0.5" />
-        </header>
-        {children && <div className="min-h-0 overflow-y-auto px-5 py-4">{children}</div>}
-        {footer && <footer className="flex justify-end gap-2 border-t border-line px-5 py-3">{footer}</footer>}
-      </div>
-    </div>
+    <dialog
+      ref={dialogRef}
+      aria-labelledby={titleId}
+      aria-describedby={description ? descId : undefined}
+      {...({ closedby: 'any' } as Record<string, unknown>)}
+      className={cx(
+        'hg-dialog m-auto w-[calc(100vw-3rem)] flex-col overflow-hidden rounded-lg border border-line-strong bg-surface p-0 shadow-overlay open:flex',
+        'max-h-[calc(100vh-3rem)]',
+        width,
+      )}
+    >
+      <header className="flex shrink-0 items-start justify-between gap-4 border-b border-line px-5 py-4">
+        <div>
+          <h2 id={titleId} className="text-base font-semibold text-fg">
+            {title}
+          </h2>
+          {description && (
+            <div id={descId} className="mt-1 text-xs leading-5 text-fg-muted">
+              {description}
+            </div>
+          )}
+        </div>
+        <IconButton label="关闭" icon={<X size={16} />} onClick={() => dialogRef.current?.close()} className="-mr-1.5 -mt-0.5" />
+      </header>
+      {children && <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div>}
+      {footer && <footer className="flex shrink-0 justify-end gap-2 border-t border-line px-5 py-3">{footer}</footer>}
+    </dialog>
   );
 }
 
@@ -531,7 +557,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             <div
               key={t.id}
               role={t.tone === 'danger' ? 'alert' : 'status'}
-              className="pointer-events-auto flex gap-2.5 rounded-md bg-surface px-3.5 py-3 shadow-overlay"
+              className="hg-toast pointer-events-auto flex gap-2.5 rounded-md border border-line-strong bg-surface px-3.5 py-3 shadow-overlay"
             >
               <Icon
                 aria-hidden="true"
@@ -592,7 +618,7 @@ export function Tabs<T extends string>({
               onChange(tabs[next].value);
             }}
             className={cx(
-              '-mb-px inline-flex h-10 items-center gap-1.5 border-b-2 text-xs font-medium transition-colors',
+              '-mb-px inline-flex h-10 cursor-pointer items-center gap-1.5 border-b-2 text-xs font-medium transition-colors',
               active ? 'border-brand text-fg' : 'border-transparent text-fg-muted hover:text-fg',
             )}
           >

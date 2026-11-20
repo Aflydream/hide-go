@@ -1,4 +1,5 @@
 use crate::config::{CustomRule, FindingKind, HideConfig};
+use crate::vault::MAX_JSON_DEPTH;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use regex::{Regex, RegexBuilder};
@@ -30,7 +31,7 @@ static BUILTIN_RULES: Lazy<Vec<BuiltinRule>> = Lazy::new(|| {
             PrivateKey,
             "PEM Private Key",
             "critical",
-            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----|[A-Za-z0-9+/=\r\n\t \\]*)",
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----|[A-Za-z0-9+/=\r\n\t \\]{0,16384})",
             0,
         ),
         // `\b` keeps kebab-case words such as `risk-assessment` from matching `sk-…`.
@@ -213,18 +214,32 @@ pub fn is_sensitive_secret_key(key: &str) -> bool {
     )
 }
 
+/// True when `s` is an RFC 2544 benchmark IPv4 address (`198.18.0.0/15`) used for IP placeholders.
+fn is_benchmark_ipv4(s: &str) -> bool {
+    let mut parts = s.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some("198"), Some(b), Some(c), Some(d), None)
+            if matches!(b, "18" | "19") && c.parse::<u8>().is_ok() && d.parse::<u8>().is_ok()
+    )
+}
+
 /// Check if a value is already a Hide-Go placeholder token
 pub fn is_placeholder_token(val: &str) -> bool {
     let trimmed = val.trim();
     (trimmed.starts_with("<<") && trimmed.ends_with(">>"))
         || trimmed.starts_with("⟦HIDE-CIPHER::")
-        || trimmed.starts_with("sk-sem-placeholder-key-")
+        || trimmed.starts_with("sk-sem-")
         || trimmed.contains("db_pass_placeholder_")
         || trimmed.contains("/workspace/user_")
         || trimmed.contains("workspace\\user_")
         || trimmed.contains("workspace\\\\user_")
         || trimmed.ends_with(".example.internal")
         || trimmed.ends_with("@sandbox.example.org")
+        || trimmed.starts_with("git-ref-placeholder-")
+        || trimmed.starts_with("CustomConcept_")
+        || trimmed.starts_with("sym_entity_")
+        || is_benchmark_ipv4(trimmed)
 }
 
 fn is_non_secret_env_token(raw: &str, is_quoted: bool) -> bool {
@@ -402,7 +417,7 @@ impl ProjectScanner {
         let trimmed = payload.trim();
         if trimmed.starts_with(['{', '[', '"']) {
             if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                Self::scan_json_value(&val, config, &mut results, &mut seen);
+                Self::scan_json_value_depth(&val, config, &mut results, &mut seen, 0);
                 return results;
             }
         }
@@ -410,20 +425,33 @@ impl ProjectScanner {
         results
     }
 
-    fn scan_json_value(
+    fn scan_json_value_depth(
         val: &Value,
         config: &HideConfig,
         results: &mut Vec<(FindingKind, String, String, String)>,
         seen: &mut HashSet<String>,
+        depth: usize,
     ) {
+        if depth >= MAX_JSON_DEPTH {
+            if let Value::String(s) = val {
+                Self::scan_plain_text_into(s, config, results, seen);
+            }
+            return;
+        }
         match val {
             Value::Object(map) => {
                 for (k, v) in map {
                     Self::scan_plain_text_into(k, config, results, seen);
                     if config.protect_secrets_and_keys && is_sensitive_secret_key(k) {
                         let raw = match v {
-                            Value::String(s) if !s.trim().is_empty() && !is_placeholder_token(s) => Some(s.clone()),
-                            Value::Number(_) | Value::Bool(_) => Some(v.to_string()),
+                            Value::String(s)
+                                if !s.trim().is_empty()
+                                    && !is_placeholder_token(s)
+                                    && (!k.eq_ignore_ascii_case("token") || s.trim().len() >= 6) =>
+                            {
+                                Some(s.clone())
+                            }
+                            Value::Number(_) => Some(v.to_string()),
                             _ => None,
                         };
                         if let Some(raw) = raw {
@@ -438,17 +466,17 @@ impl ProjectScanner {
                             continue;
                         }
                     }
-                    Self::scan_json_value(v, config, results, seen);
+                    Self::scan_json_value_depth(v, config, results, seen, depth + 1);
                 }
             }
             Value::Array(arr) => arr
                 .iter()
-                .for_each(|item| Self::scan_json_value(item, config, results, seen)),
+                .for_each(|item| Self::scan_json_value_depth(item, config, results, seen, depth + 1)),
             Value::String(s) => {
                 let st = s.trim();
-                if st.starts_with(['{', '[']) {
+                if depth + 1 < MAX_JSON_DEPTH && st.starts_with(['{', '[']) {
                     if let Ok(inner) = serde_json::from_str::<Value>(st) {
-                        Self::scan_json_value(&inner, config, results, seen);
+                        Self::scan_json_value_depth(&inner, config, results, seen, depth + 1);
                         return;
                     }
                 }
@@ -480,22 +508,24 @@ impl ProjectScanner {
     }
 }
 
+const MAX_INLINE_UNICODE_DECODE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Text with `\uXXXX` escapes decoded, plus a map from decoded byte offsets back to the source.
 pub struct DecodedText {
     pub text: String,
     /// `origin[i]` is the source byte offset of decoded byte `i`; one extra trailing entry.
-    origin: Vec<usize>,
+    origin: Vec<u32>,
 }
 
 impl DecodedText {
     pub fn source_offset(&self, decoded: usize) -> usize {
-        self.origin[decoded]
+        self.origin[decoded] as usize
     }
 }
 
 /// Decode inline `\uXXXX` escapes for detection only. Returns `None` when there are none.
 pub fn decode_inline_unicode(input: &str) -> Option<DecodedText> {
-    if !input.contains("\\u") {
+    if input.len() > MAX_INLINE_UNICODE_DECODE_BYTES || !input.contains("\\u") {
         return None;
     }
     static UNICODE_ESC_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\\u([0-9a-fA-F]{4})").unwrap());
@@ -504,13 +534,15 @@ pub fn decode_inline_unicode(input: &str) -> Option<DecodedText> {
     let mut last = 0;
     let mut changed = false;
     for caps in UNICODE_ESC_RE.captures_iter(input) {
-        let m = caps.get(0).unwrap();
+        let Some(m) = caps.get(0) else {
+            continue;
+        };
         let Some(ch) = u32::from_str_radix(&caps[1], 16).ok().and_then(char::from_u32) else {
             continue;
         };
         text.push_str(&input[last..m.start()]);
-        origin.extend(last..m.start());
-        origin.extend(std::iter::repeat_n(m.start(), ch.len_utf8()));
+        origin.extend((last..m.start()).map(|i| i as u32));
+        origin.extend(std::iter::repeat_n(m.start() as u32, ch.len_utf8()));
         text.push(ch);
         last = m.end();
         changed = true;
@@ -519,8 +551,8 @@ pub fn decode_inline_unicode(input: &str) -> Option<DecodedText> {
         return None;
     }
     text.push_str(&input[last..]);
-    origin.extend(last..input.len());
-    origin.push(input.len());
+    origin.extend((last..input.len()).map(|i| i as u32));
+    origin.push(input.len() as u32);
     Some(DecodedText { text, origin })
 }
 

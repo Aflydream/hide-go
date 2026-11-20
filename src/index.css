@@ -21,26 +21,25 @@
 }
 
 /*
- * Design tokens — see design-system/hide-go/MASTER.md ("查验台": paper, ink and two signal inks).
- * The console is light-only. Neutrals are warm paper and ink rather than blue-grey; colour is
- * reserved for meaning: ink green = cloaked and cleared to leave, vermilion = real value that
- * stays on this machine, ochre = intercepted.
+ * Design tokens — Dual-mode "查验台" (Warm Paper Light + Precision Obsidian Ink Dark).
+ * Follows modern-web-guidance (`dark-mode` + `dark-mode-toggle`) and ui-ux-pro-max contrast standards (>= 4.5:1 text, >= 3:1 controls).
  * Values are RGB channels so Tailwind alpha modifiers work (bg-brand/10).
- * Every text token is >= 4.5:1 on every surface; control boundaries >= 3:1.
  */
 @layer base {
   :root {
-    color-scheme: light;
+    color-scheme: light dark;
+
+    /* Light tokens (Warm Paper & Ink) */
     --bg: 244 242 236;
     --surface: 253 252 249;
     --surface-2: 248 246 241;
     --surface-3: 238 235 227;
     --line: 229 225 215;
-    --line-strong: 208 203 190;
-    --line-control: 140 135 121;
-    --fg: 26 28 24;
-    --fg-muted: 78 80 72;
-    --fg-subtle: 104 106 95;
+    --line-strong: 204 198 184;
+    --line-control: 136 131 117;
+    --fg: 24 26 22;
+    --fg-muted: 76 79 71;
+    --fg-subtle: 102 104 94;
     --brand: 6 95 70;
     --brand-solid: 4 120 87;
     --brand-on: 255 255 255;
@@ -49,17 +48,90 @@
     --warn: 138 82 8;
     --info: 38 84 150;
     --focus: 4 120 87;
+
+    --scrollbar-thumb-light: #b6b0a2;
+    --scrollbar-thumb-dark: #475569;
+    --scrollbar-track-light: transparent;
+    --scrollbar-track-dark: transparent;
+    --scrollbar-thumb: var(--scrollbar-thumb-light);
+    --scrollbar-track: var(--scrollbar-track-light);
+  }
+
+  /* Reflect explicit user override stored in <meta name="color-scheme"> */
+  :root:has(> head > meta[name='color-scheme'][content='light']) {
+    color-scheme: light;
+  }
+
+  :root:has(> head > meta[name='color-scheme'][content='dark']) {
+    color-scheme: dark;
+    --bg: 13 17 23;
+    --surface: 20 26 35;
+    --surface-2: 26 34 46;
+    --surface-3: 34 43 58;
+    --line: 42 52 68;
+    --line-strong: 58 72 94;
+    --line-control: 100 116 139;
+    --fg: 241 245 249;
+    --fg-muted: 173 185 204;
+    --fg-subtle: 143 158 179;
+    --brand: 52 211 153;
+    --brand-solid: 16 185 129;
+    --brand-on: 9 14 21;
+    --danger: 251 113 133;
+    --danger-solid: 225 29 72;
+    --warn: 251 191 36;
+    --info: 96 165 250;
+    --focus: 52 211 153;
+    --scrollbar-thumb: var(--scrollbar-thumb-dark);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not(:has(> head > meta[name='color-scheme'][content='light'])) {
+      --bg: 13 17 23;
+      --surface: 20 26 35;
+      --surface-2: 26 34 46;
+      --surface-3: 34 43 58;
+      --line: 42 52 68;
+      --line-strong: 58 72 94;
+      --line-control: 100 116 139;
+      --fg: 241 245 249;
+      --fg-muted: 173 185 204;
+      --fg-subtle: 143 158 179;
+      --brand: 52 211 153;
+      --brand-solid: 16 185 129;
+      --brand-on: 9 14 21;
+      --danger: 251 113 133;
+      --danger-solid: 225 29 72;
+      --warn: 251 191 36;
+      --info: 96 165 250;
+      --focus: 52 211 153;
+      --scrollbar-thumb: var(--scrollbar-thumb-dark);
+    }
+  }
+
+  @supports (color: light-dark(white, black)) {
+    :root {
+      --scrollbar-thumb: light-dark(var(--scrollbar-thumb-light), var(--scrollbar-thumb-dark));
+      --scrollbar-track: light-dark(var(--scrollbar-track-light), var(--scrollbar-track-dark));
+    }
   }
 
   html,
-  body,
+  body {
+    height: 100%;
+    overflow: hidden;
+  }
+
   #root {
     height: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
   }
 
   body {
     @apply bg-bg text-fg font-sans text-sm antialiased;
     font-feature-settings: 'cv05', 'ss01';
+    accent-color: rgb(var(--brand-solid));
   }
 
   code,
@@ -82,22 +154,132 @@
     background: rgb(var(--brand) / 0.28);
   }
 
+  /* Standard scrollbar styling (never animate scrollbar-color) */
   * {
     scrollbar-width: thin;
-    scrollbar-color: rgb(var(--line-strong)) transparent;
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
   }
-  ::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
+
+  @supports not (scrollbar-color: auto) {
+    ::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: var(--scrollbar-thumb);
+      border: 3px solid transparent;
+      background-clip: content-box;
+      border-radius: 999px;
+    }
+    ::-webkit-scrollbar-track {
+      background: var(--scrollbar-track);
+    }
   }
-  ::-webkit-scrollbar-thumb {
-    background: rgb(var(--line-strong));
-    border: 3px solid transparent;
-    background-clip: content-box;
-    border-radius: 999px;
+
+  /* Native top-layer <dialog> modal scroll containment & entry transitions */
+  dialog:modal {
+    overscroll-behavior: contain;
   }
-  ::-webkit-scrollbar-track {
-    background: transparent;
+
+  dialog::backdrop {
+    overflow: hidden;
+    overscroll-behavior: contain;
+    background-color: rgb(9 13 20 / 0);
+    transition-property: background-color, display, overlay;
+    transition-duration: 180ms;
+    transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+    transition-behavior: allow-discrete;
+  }
+
+  dialog[open]::backdrop {
+    background-color: rgb(9 13 20 / 0.52);
+    backdrop-filter: blur(2px);
+  }
+
+  @starting-style {
+    dialog[open]::backdrop {
+      background-color: rgb(9 13 20 / 0);
+    }
+  }
+
+  dialog.hg-dialog {
+    opacity: 0;
+    color: inherit;
+    transition-property: opacity, transform, display, overlay;
+    transition-duration: 180ms;
+    transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+    transition-behavior: allow-discrete;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    dialog.hg-dialog {
+      transform: scale(0.97) translateY(4px);
+    }
+    dialog.hg-dialog[open] {
+      transform: scale(1) translateY(0);
+    }
+    @starting-style {
+      dialog.hg-dialog[open] {
+        transform: scale(0.97) translateY(4px);
+      }
+    }
+  }
+
+  dialog.hg-dialog[open] {
+    opacity: 1;
+  }
+
+  @starting-style {
+    dialog.hg-dialog[open] {
+      opacity: 0;
+    }
+  }
+
+  @keyframes hg-indeterminate {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(260%);
+    }
+  }
+
+  .hg-progress-indeterminate {
+    width: 40%;
+    transform: translateX(75%);
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .hg-progress-indeterminate {
+      transform: translateX(-100%);
+      animation: hg-indeterminate 1.35s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    dialog.hg-dialog,
+    dialog::backdrop {
+      transition-duration: 80ms;
+    }
+    ::view-transition-group(*),
+    ::view-transition-old(*),
+    ::view-transition-new(*) {
+      animation: none !important;
+    }
+  }
+
+  @media (forced-colors: active) {
+    dialog.hg-dialog,
+    .hg-window-frame,
+    .hg-toast {
+      border: 1px solid CanvasText;
+    }
+    .hg-active-bar {
+      background-color: Highlight;
+    }
+    :focus-visible {
+      outline: 2px solid Highlight;
+    }
   }
 }
 
@@ -119,15 +301,8 @@
     @apply rounded-sm bg-danger/15 text-danger;
     box-shadow: inset 0 -1px 0 rgb(var(--danger) / 0.55);
   }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  *,
-  ::before,
-  ::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-    scroll-behavior: auto !important;
+  .mark-warn {
+    @apply rounded-sm bg-warn/15 text-warn;
+    box-shadow: inset 0 -1px 0 rgb(var(--warn) / 0.55);
   }
 }

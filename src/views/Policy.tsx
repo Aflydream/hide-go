@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from 'react';
+import { useId, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { ArrowsClockwise, Eye, EyeSlash, ShieldCheck, WarningCircle } from '@phosphor-icons/react';
 import { useStore } from '../store';
 import { Badge, Button, Callout, ConfirmDialog, IconButton, Skeleton, Switch, cx } from '../components/ui';
@@ -35,7 +35,7 @@ function ToggleRow({
 }) {
   const descId = useId();
   return (
-    <div className={cx('flex items-start justify-between gap-6 px-4 py-3.5', disabled && 'opacity-60')}>
+    <div className={cx('flex items-start justify-between gap-6 px-4 py-3.5 transition-colors hover:bg-surface-2/50', disabled && 'opacity-60')}>
       <div className="min-w-0">
         <div className="flex items-center gap-2">
           <p className="text-sm font-medium text-fg">{title}</p>
@@ -127,6 +127,7 @@ export function Policy() {
   const { config, saveConfig } = useStore();
   const [revealSalt, setRevealSalt] = useState(false);
   const [confirmSalt, setConfirmSalt] = useState(false);
+  const themeRefs = useRef<Array<HTMLButtonElement | null>>([]);
   if (!config) {
     return (
       <div className="mx-auto max-w-5xl space-y-4 p-6" aria-busy="true">
@@ -200,19 +201,19 @@ export function Policy() {
         <div className="divide-y divide-line rounded-md border border-line bg-surface">
           <ToggleRow
             title="凭据与密钥"
-            description="Anthropic / OpenAI / xAI / AWS / GitHub 密钥、PEM 私钥、数据库连接串，以及 password、token、api_key 等字段的值。"
+            description="API 密钥、PEM 私钥、数据库连接串及 token/password 字段"
             checked={config.protectSecretsAndKeys}
             onChange={(v) => set({ protectSecretsAndKeys: v })}
           />
           <ToggleRow
             title="本机路径与身份"
-            description="只替换用户目录前缀（/home/alice → /workspace/user_01），目录层级与文件名保持不变；同时替换邮箱地址。"
+            description="用户目录前缀与邮箱地址（保留相对目录结构）"
             checked={config.protectProjectPaths}
             onChange={(v) => set({ protectProjectPaths: v })}
           />
           <ToggleRow
             title="内网地址与域名"
-            description="RFC 1918 私网 IPv4 替换为 198.18.0.0/15 基准测试地址；.internal / .corp / .local / .lan 域名替换为 example.internal。"
+            description="RFC 1918 私网 IP（→ 198.18.0.0/15）及 .internal/.local 等内网域名"
             checked={config.protectInternalNetwork}
             onChange={(v) => set({ protectInternalNetwork: v })}
           />
@@ -222,12 +223,12 @@ export function Policy() {
       <Section
         index="03"
         title="静默遥测"
-        description="按请求路径识别遥测端点（event_logging、telemetry、metrics 等）。对话与推理端点永远不会被当作遥测拦截。"
+        description="按路径匹配遥测端点（不影响对话与推理）"
       >
         <div className="divide-y divide-line rounded-md border border-line bg-surface">
           <ToggleRow
             title="在本地应答遥测请求"
-            description="遥测请求不会离开本机，网关直接返回成功响应，避免工具报错。仅审计模式下不生效。"
+            description="直接返回成功响应，不外发（仅审计模式除外）"
             checked={config.blockSilentTelemetry}
             onChange={(v) => set({ blockSilentTelemetry: v })}
             disabled={!protecting}
@@ -238,19 +239,14 @@ export function Policy() {
       <Section
         index="04"
         title="工具调用中的凭据"
-        description={
-          <>
-            模型发起的工具调用（Shell 命令、网络请求、文件写入）会在本机执行。若在这些参数中还原真实密钥，被提示注入的模型只需复述占位符，就能让本机执行
-            <code className="mx-1 font-mono">curl …?k=真实密钥</code>。
-          </>
-        }
+        description="防止提示注入诱导本机执行带真实密钥的工具参数"
       >
         <div className="space-y-2.5">
           {(
             [
-              ['never', '始终保留占位符', '工具调用参数中的凭据占位符一律不还原。最安全；需要真实密钥的命令请改用环境变量。', undefined],
-              ['file-edits-only', '仅文件写入时还原', '只在写入或编辑文件的内容字段（content、new_string 等）中还原，命令行与 URL 中保持占位符。', <Badge tone="brand">推荐</Badge>],
-              ['always', '全部还原', '所有位置都还原真实值，与未使用网关时的风险相同。', <Badge tone="warn">风险较高</Badge>],
+              ['never', '始终保留占位符', 'Shell / URL / 文件参数均不还原凭据', undefined],
+              ['file-edits-only', '仅文件写入时还原', '仅写入或编辑文件的内容字段还原；命令与 URL 保留占位符', <Badge tone="brand">推荐</Badge>],
+              ['always', '全部还原', '所有工具调用参数均还原真实凭据', <Badge tone="warn">风险较高</Badge>],
             ] as Array<[ToolCallSecretPolicy, string, string, ReactNode]>
           ).map(([value, title, description, badge]) => (
             <RadioCard<ToolCallSecretPolicy>
@@ -264,7 +260,13 @@ export function Policy() {
               badge={badge}
             />
           ))}
-          <p className="text-xs text-fg-subtle">普通文本回复中的占位符始终会还原；路径、内网地址等非凭据数据不受此设置影响。</p>
+          <details className="text-xs text-fg-subtle">
+            <summary className="cursor-pointer select-none hover:text-fg-muted">还原范围说明</summary>
+            <p className="mt-1.5 leading-5">
+              普通文本回复始终还原；本机路径与内网地址不受此项限制。例如启用「仅文件写入时还原」后，
+              <code className="mx-1 font-mono">curl …?k=占位符</code> 会保持占位符而不外泄真实密钥。
+            </p>
+          </details>
         </div>
       </Section>
 
@@ -273,7 +275,7 @@ export function Policy() {
         title="All-Hide 伪装层"
         description={
           <>
-            仅在 All-Hide 模式下生效。各层可独立组合，映射关系由项目 Salt 决定。
+            仅在 All-Hide 模式下生效
             {!allHideActive && (
               <Button size="sm" variant="secondary" className="mt-3" icon={<ShieldCheck size={14} />} onClick={() => set({ mode: 'all-hide' }, '已切换为「All-Hide」')}>
                 切换到 All-Hide
@@ -285,7 +287,7 @@ export function Policy() {
         <div className={cx('divide-y divide-line rounded-md border border-line bg-surface', !allHideActive && 'opacity-80')}>
           <ToggleRow
             title="字符串字面量掩码"
-            description={'把代码中引号包裹的字面量替换为 <<HIDE_STR_001>> 形式的占位符；自然语言提示词不受影响。'}
+            description="代码引号字面量替换为 <<HIDE_STR_…>>"
             checked={config.allHide.strictLiteralMasking}
             onChange={(v) => setAllHide({ strictLiteralMasking: v })}
           />
@@ -293,23 +295,35 @@ export function Policy() {
             <div className="flex items-start justify-between gap-6">
               <div>
                 <p className="text-sm font-medium text-fg">同构领域伪装</p>
-                <p className="mt-0.5 text-xs leading-5 text-fg-subtle">把 snake_case / camelCase / PascalCase 标识符与 // 注释映射到下方词库，保留语法结构与命名风格。</p>
+                <p className="mt-0.5 text-xs leading-5 text-fg-subtle">按命名风格映射标识符与 // 注释</p>
               </div>
               <Switch checked={config.allHide.enableIsomorphicCamouflage} onChange={(v) => setAllHide({ enableIsomorphicCamouflage: v })} label="同构领域伪装" />
             </div>
             <div role="radiogroup" aria-label="伪装词库" className="mt-3 grid grid-cols-3 gap-2">
-              {(Object.keys(COVER_THEME_LABEL) as CoverTheme[]).map((theme) => {
+              {(Object.keys(COVER_THEME_LABEL) as CoverTheme[]).map((theme, idx, themes) => {
                 const active = config.allHide.coverTheme === theme;
+                const onThemeKeyDown = (e: KeyboardEvent<HTMLButtonElement>) => {
+                  const dir =
+                    e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 1 : e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 0;
+                  if (!dir) return;
+                  e.preventDefault();
+                  const nextIdx = (idx + dir + themes.length) % themes.length;
+                  themeRefs.current[nextIdx]?.focus();
+                  setAllHide({ coverTheme: themes[nextIdx] });
+                };
                 return (
                   <button
                     key={theme}
+                    ref={(el) => (themeRefs.current[idx] = el)}
                     type="button"
                     role="radio"
                     aria-checked={active}
+                    tabIndex={!config.allHide.enableIsomorphicCamouflage ? undefined : active ? 0 : -1}
                     disabled={!config.allHide.enableIsomorphicCamouflage}
                     onClick={() => setAllHide({ coverTheme: theme })}
+                    onKeyDown={onThemeKeyDown}
                     className={cx(
-                      'rounded border px-3 py-2 text-left text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-45',
+                      'cursor-pointer rounded border px-3 py-2 text-left text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus/40 disabled:cursor-not-allowed disabled:opacity-45',
                       active ? 'border-brand bg-brand/[0.06] text-fg' : 'border-line text-fg-muted hover:border-line-strong',
                     )}
                   >
@@ -324,14 +338,14 @@ export function Policy() {
           </div>
           <ToggleRow
             title="密钥流加密"
-            description="把每段内容加密为 ⟦HIDE-CIPHER::…⟧ 盲文块。注意：模型同样无法阅读这些内容，只适合需要原样回传、无需模型理解的数据。"
+            description="加密为 ⟦HIDE-CIPHER::…⟧（模型不可读，仅用于原样回传）"
             checked={config.allHide.enableCipherGarble}
             onChange={(v) => setAllHide({ enableCipherGarble: v })}
             badge={config.allHide.enableCipherGarble ? <Badge tone="warn">模型不可读</Badge> : undefined}
           />
           <ToggleRow
             title="索引上传诱饵"
-            description="后台代码索引上传保持原有 JSON 结构与长度，但所有内容替换为诱饵代码；遥测在本地应答。"
+            description="保留 JSON 结构与长度，代码内容替换为诱饵"
             checked={config.allHide.enableTelemetryChaff}
             onChange={(v) => setAllHide({ enableTelemetryChaff: v })}
           />
@@ -339,7 +353,7 @@ export function Policy() {
         {allHideActive && config.allHide.enableCipherGarble && (
           <div className="mt-3">
             <Callout tone="warn" title="密钥流加密已开启">
-              模型收到的是加密块而非代码内容，回答质量会明显下降。如需模型理解代码，请关闭此层，仅保留同构伪装。
+              模型无法读取密文内容；常规编码建议关闭此层。
             </Callout>
           </div>
         )}
@@ -348,7 +362,7 @@ export function Policy() {
       <Section
         index="06"
         title="项目 Salt"
-        description="同构伪装的映射种子，每次安装随机生成并保存在本机配置文件中。"
+        description="同构伪装映射种子（存本机配置）"
       >
         <div className="flex items-center gap-2 rounded-md border border-line bg-surface px-4 py-3">
           <code className="min-w-0 flex-1 truncate font-mono text-sm text-fg">{revealSalt ? config.projectSalt : `${config.projectSalt.slice(0, 5)}${'•'.repeat(18)}`}</code>
@@ -365,7 +379,7 @@ export function Policy() {
         {config.projectSalt.startsWith('hide-go-quantum-salt') && (
           <p className="mt-2 flex items-center gap-1.5 text-xs text-warn">
             <WarningCircle aria-hidden="true" size={13} weight="bold" />
-            正在使用旧版公开默认 Salt，厂商可预先计算伪装映射，建议重新生成。
+            当前为旧版默认 Salt，建议重新生成。
           </p>
         )}
       </Section>
@@ -378,7 +392,7 @@ export function Policy() {
           await saveConfig({ ...config, projectSalt: randomSalt() }, '已生成新的项目 Salt');
         }}
         title="重新生成项目 Salt？"
-        description="之后首次出现的标识符会使用新映射；映射表中已有的标识符保持原伪装名，以免进行中的对话前后不一致。若要全部重新映射，请随后清空映射表。"
+        description="新出现的标识符将使用新映射；已有映射保持不变，彻底重置请清空映射表。"
         confirmLabel="重新生成"
       />
     </div>

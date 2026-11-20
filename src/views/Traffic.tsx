@@ -57,6 +57,7 @@ export function Traffic() {
   const [action, setAction] = useState<ActionFilter>('all');
   const [hideSimulated, setHideSimulated] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [tab, setTab] = useState<DetailTab>('request');
   const selectedId = params.get('id');
 
   const rows = useMemo(() => {
@@ -73,6 +74,7 @@ export function Traffic() {
 
   const select = useCallback((id: string) => navigate('traffic', { id }), [navigate]);
   const effectiveId = selectedId ?? rows[0]?.id ?? null;
+  const hasSelectedRow = effectiveId !== null && rows.some((r) => r.id === effectiveId);
 
   const listRef = useRef<HTMLTableSectionElement>(null);
   const onListKey = (e: React.KeyboardEvent) => {
@@ -141,6 +143,21 @@ export function Traffic() {
           <Switch checked={hideSimulated} onChange={setHideSimulated} label="隐藏模拟记录" />
           隐藏模拟记录
         </label>
+        {filtersActive && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => {
+              setQuery('');
+              setHarness('all');
+              setCategory('all');
+              setAction('all');
+              setHideSimulated(false);
+            }}
+          >
+            重置筛选
+          </Button>
+        )}
         <div className="ml-auto flex items-center gap-2">
           <span className="tabular text-xs text-fg-subtle" role="status">
             {rows.length} / {logs.length} 条
@@ -164,20 +181,20 @@ export function Traffic() {
             </div>
           ) : rows.length === 0 ? (
             filtersActive ? (
-              <EmptyState icon={<Funnel size={20} />} title="没有符合条件的记录">
-                调整筛选条件，或清除搜索关键字。
+              <EmptyState icon={<Funnel size={20} />} title="无匹配记录">
+                尝试调整筛选或搜索词
               </EmptyState>
             ) : (
               <EmptyState
                 icon={<ArrowsLeftRight size={20} />}
-                title="还没有流量"
+                title="暂无流量"
                 action={
                   <Button size="sm" variant="primary" onClick={() => navigate('integrations')}>
                     查看接入方式
                   </Button>
                 }
               >
-                工具接入网关后，请求会实时出现在这里。
+                接入工具或运行模拟请求后，记录将显示在此
               </EmptyState>
             )
           ) : (
@@ -193,21 +210,25 @@ export function Traffic() {
                 </tr>
               </thead>
               <tbody ref={listRef} onKeyDown={onListKey} className="divide-y divide-line">
-                {rows.map((r) => {
+                {rows.map((r, idx) => {
                   const active = r.id === effectiveId;
                   const act = describeAction(r.actionTaken);
+                  const rowTabIndex = active || (!hasSelectedRow && idx === 0) ? 0 : -1;
                   return (
                     <tr
                       key={r.id}
                       data-id={r.id}
-                      tabIndex={active ? 0 : -1}
+                      tabIndex={rowTabIndex}
                       aria-selected={active}
                       onClick={() => select(r.id)}
                       onKeyDown={(e) => e.key === 'Enter' && select(r.id)}
-                      className={cx('relative cursor-pointer transition-colors', active ? 'bg-brand/[0.07]' : 'hover:bg-surface-2')}
+                      className={cx(
+                        'relative cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus',
+                        active ? 'bg-brand/[0.07]' : 'hover:bg-surface-2',
+                      )}
                     >
                       <td className="tabular relative py-2 pl-4 align-top font-mono text-fg-muted">
-                        {active && <span aria-hidden="true" className="absolute inset-y-0 left-0 w-0.5 bg-brand" />}
+                        {active && <span aria-hidden="true" className="hg-active-bar absolute inset-y-0 left-0 w-0.5 bg-brand" />}
                         {r.timestamp.slice(0, 8)}
                       </td>
                       <td className="min-w-0 py-2 pl-2">
@@ -239,10 +260,10 @@ export function Traffic() {
 
         <div className="min-h-0 min-w-0 bg-surface">
           {effectiveId ? (
-            <RecordDetail key={effectiveId} id={effectiveId} vaultTokens={vault} />
+            <RecordDetail key={effectiveId} id={effectiveId} vaultTokens={vault} tab={tab} onTabChange={setTab} />
           ) : (
             <EmptyState icon={<ArrowsLeftRight size={20} />} title="选择一条记录">
-              查看本地请求、厂商实际收到的内容和还原后的响应。
+              对比本地原文、厂商视角与还原结果
             </EmptyState>
           )}
         </div>
@@ -252,18 +273,27 @@ export function Traffic() {
         open={confirmClear}
         onClose={() => setConfirmClear(false)}
         onConfirm={clear}
-        title="清空全部流量记录？"
-        description="将删除当前窗口内的所有记录（含请求与响应正文）。统计计数与映射表不受影响。"
+        title="清空流量记录？"
+        description="仅清除列表显示，统计计数与映射表保留。"
         confirmLabel="清空记录"
       />
     </div>
   );
 }
 
-function RecordDetail({ id, vaultTokens }: { id: string; vaultTokens: { token: string; originalRaw: string; secret: boolean }[] }) {
+function RecordDetail({
+  id,
+  vaultTokens,
+  tab,
+  onTabChange,
+}: {
+  id: string;
+  vaultTokens: { token: string; originalRaw: string; secret: boolean }[];
+  tab: DetailTab;
+  onTabChange: (tab: DetailTab) => void;
+}) {
   const [record, setRecord] = useState<TrafficAuditRecord | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<DetailTab>('request');
 
   useEffect(() => {
     let cancelled = false;
@@ -361,7 +391,7 @@ function RecordDetail({ id, vaultTokens }: { id: string; vaultTokens: { token: s
         idPrefix="detail"
         label="记录详情"
         value={tab}
-        onChange={setTab}
+        onChange={onTabChange}
         tabs={[
           { value: 'request', label: '请求对照' },
           { value: 'response', label: '响应对照' },
@@ -373,31 +403,31 @@ function RecordDetail({ id, vaultTokens }: { id: string; vaultTokens: { token: s
       <div id="detail-panel" role="tabpanel" aria-labelledby={`detail-tab-${tab}`} className="flex min-h-0 flex-1 flex-col">
         {(record.truncated || record.withheldCount > 0) && (tab === 'request' || tab === 'response') && (
           <div className="space-y-2 border-b border-line px-4 py-2.5">
-            {record.truncated && <p className="text-xs text-fg-subtle">正文超过 64 KB 的部分未保存，仅展示开头。</p>}
+            {record.truncated && <p className="text-xs text-fg-subtle">正文已截断（超过 64 KB）</p>}
             {record.withheldCount > 0 && tab === 'response' && (
               <p className="flex items-center gap-1.5 text-xs text-warn">
                 <WarningCircle aria-hidden="true" size={13} weight="bold" />
-                {record.withheldCount} 个凭据占位符在工具调用参数中被刻意保留，未写回真实值。
+                已保留 {record.withheldCount} 个工具参数凭据占位符
               </p>
             )}
           </div>
         )}
         {tab === 'request' && (
           <div className="grid min-h-0 flex-1 grid-rows-2 divide-y divide-line 2xl:grid-cols-2 2xl:grid-rows-1 2xl:divide-x 2xl:divide-y-0">
-            <CodeView title="本地发出" caption="含真实数据，不出本机" text={record.localRequestPayload} bytes={record.requestBytes} matcher={matchers.local} mark="secret" />
+            <CodeView title="本地发出" caption="本地原文" text={record.localRequestPayload} bytes={record.requestBytes} matcher={matchers.local} mark="secret" />
             <CodeView
               title="厂商收到"
-              caption={blockedLocally ? '未发出' : '经过改写后的请求'}
+              caption={blockedLocally ? '未发出' : '已改写'}
               text={record.vendorVisiblePayload}
               matcher={matchers.vendor}
-              emptyText="请求在本地被拦截，没有任何内容发往厂商。"
+              emptyText="已在本地拦截"
             />
           </div>
         )}
         {tab === 'response' && (
           <div className="grid min-h-0 flex-1 grid-rows-2 divide-y divide-line 2xl:grid-cols-2 2xl:grid-rows-1 2xl:divide-x 2xl:divide-y-0">
-            <CodeView title="厂商返回" caption="引用占位符" text={record.vendorRawResponse} matcher={matchers.vendor} emptyText="没有上游响应。" />
-            <CodeView title="交给工具" caption="占位符已还原" text={record.localRestoredResponse} bytes={record.responseBytes} matcher={matchers.local} mark="secret" />
+            <CodeView title="厂商返回" caption="含占位符" text={record.vendorRawResponse} matcher={matchers.vendor} emptyText="无上游响应" />
+            <CodeView title="交给工具" caption="已还原" text={record.localRestoredResponse} bytes={record.responseBytes} matcher={matchers.local} mark="secret" />
           </div>
         )}
         {tab === 'findings' && <FindingsTable record={record} />}
@@ -410,8 +440,8 @@ function RecordDetail({ id, vaultTokens }: { id: string; vaultTokens: { token: s
 function FindingsTable({ record }: { record: TrafficAuditRecord }) {
   if (!record.findings.length) {
     return (
-      <EmptyState icon={<MagnifyingGlass size={20} />} title="未发现敏感数据">
-        该请求中没有命中内置检测器或自定义规则的内容。
+      <EmptyState icon={<MagnifyingGlass size={20} />} title="未检出敏感数据">
+        未命中内置规则或自定义规则
       </EmptyState>
     );
   }

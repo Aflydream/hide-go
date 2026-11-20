@@ -1,36 +1,51 @@
 //! SSE framing is decoded only after a complete LF/CRLF-delimited event arrives.
-//! Text deltas use independent StreamRestorers; nested JSON arguments are buffered
-//! until their channel ends and restored once with the JSON-aware vault instead.
+//! Text deltas use independent StreamRestorers; nested JSON / tool-argument deltas are
+//! buffered until their channel ends and restored once with the protocol-aware restorer.
 //!
 //! Every other string in a JSON event (snapshots such as `content_block_start`, Responses
 //! `.done`/`.completed` summaries, Gemini `functionCall` parts) is restored in one shot with
 //! the protocol-aware restorer, so tool names and final summaries never leak placeholders.
 //! Tool-call arguments follow `ToolCallSecretPolicy`.
 //!
-//! Boundaries: bare-CR framing and unterminated events at EOF are rejected; routing
-//! IDs must be stable (a missing `index` defaults to the array position). Synthetic deltas
-//! do not replay SSE id/retry/comments or Responses sequence_number.
-//! Buffer sizes are not capped here; the caller must impose upstream resource limits.
+//! Boundaries: bare-CR framing, oversized pending frames/buffers, and unterminated events at
+//! EOF are rejected; routing IDs must be stable (a missing `index` defaults to the array
+//! position). Synthetic deltas do not replay SSE id/retry/comments or Responses sequence_number.
 
 use crate::config::ToolCallSecretPolicy;
-use crate::restore::{restore_tool_args, restore_value};
+use crate::restore::{is_file_edit_tool, restore_tool_args_for_tool, restore_value};
 use crate::{stream_restorer::StreamRestorer, vault::PrivacyVault};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};
 
+const MAX_SSE_PENDING_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SSE_JSON_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SSE_CHANNELS: usize = 256;
+const MAX_SSE_ENDED: usize = 1024;
+
 pub struct SseRestorer {
     vault: PrivacyVault,
+    scope: Option<String>,
     policy: ToolCallSecretPolicy,
     withheld: usize,
     pending: Vec<u8>,
     scanned: usize,
     line_start: usize,
     channels: BTreeMap<Key, Channel>,
+    tool_names: BTreeMap<ToolSlot, String>,
     ended: Vec<End>,
     restored: usize,
+    length_truncated: bool,
     finished: bool,
     failed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ToolSlot {
+    Chat(u64, u64),
+    Anthropic(u64),
+    ResponsesId(String),
+    ResponsesIdx(u64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,7 +66,7 @@ enum Key {
 // once, then serialize it as the outer delta's string value.
 enum Buffer {
     Text(StreamRestorer),
-    Json(String),
+    Json { buf: String, strict_json: bool },
 }
 
 struct Channel {
@@ -65,6 +80,8 @@ struct Target {
     key: Key,
     pointer: String,
     nested_json: bool,
+    strict_json: bool,
+    allow_secret_text: bool,
 }
 
 #[derive(Clone)]
@@ -125,16 +142,23 @@ impl SseRestorer {
     }
 
     pub fn with_policy(vault: PrivacyVault, policy: ToolCallSecretPolicy) -> Self {
+        Self::with_policy_scoped(vault, None, policy)
+    }
+
+    pub fn with_policy_scoped(vault: PrivacyVault, scope: Option<String>, policy: ToolCallSecretPolicy) -> Self {
         Self {
             vault,
+            scope,
             policy,
             withheld: 0,
             pending: Vec::new(),
             scanned: 0,
             line_start: 0,
             channels: BTreeMap::new(),
+            tool_names: BTreeMap::new(),
             ended: Vec::new(),
             restored: 0,
+            length_truncated: false,
             finished: false,
             failed: false,
         }
@@ -162,6 +186,9 @@ impl SseRestorer {
     }
 
     fn push_inner(&mut self, bytes: &[u8]) -> io::Result<String> {
+        if self.pending.len().saturating_add(bytes.len()) > MAX_SSE_PENDING_BYTES {
+            return Err(invalid("SSE pending event exceeds size limit"));
+        }
         self.pending.extend_from_slice(bytes);
         let mut consumed = 0;
         let mut output = String::new();
@@ -200,12 +227,30 @@ impl SseRestorer {
             return Ok((String::new(), self.restored));
         }
         let result = (|| {
+            let mut prefix = String::new();
             if !self.pending.is_empty() {
-                std::str::from_utf8(&self.pending).map_err(invalid)?;
-                return Err(io::Error::new(ErrorKind::UnexpectedEof, "unterminated SSE event"));
+                let pending_str = std::str::from_utf8(&self.pending).map_err(invalid)?.to_owned();
+                let is_benign_eof = pending_str.lines().all(|l| {
+                    let t = l.trim();
+                    t.is_empty() || t.starts_with(':') || t == "data: [DONE]" || t == "data:[DONE]"
+                });
+                if is_benign_eof {
+                    self.pending.clear();
+                    self.scanned = 0;
+                    self.line_start = 0;
+                    let mut normalized = pending_str;
+                    if !normalized.ends_with('\n') {
+                        normalized.push('\n');
+                    }
+                    normalized.push('\n');
+                    prefix = self.event(&normalized)?;
+                } else {
+                    return Err(io::Error::new(ErrorKind::UnexpectedEof, "unterminated SSE event"));
+                }
             }
             let tail = self.flush(&[End::All])?;
-            Ok((tail, self.restored))
+            prefix.push_str(&tail);
+            Ok((prefix, self.restored))
         })();
         self.failed = result.is_err();
         self.finished = result.is_ok();
@@ -237,6 +282,9 @@ impl SseRestorer {
             .or(event.name)
             .unwrap_or("")
             .to_owned();
+        if is_length_truncation_event(&value, &kind) {
+            self.length_truncated = true;
+        }
         let mut output = String::new();
         let mut changed = false;
 
@@ -266,6 +314,7 @@ impl SseRestorer {
             changed = true;
         }
 
+        self.observe_tool_names(&value, &kind)?;
         let targets = targets(&value, &kind)?;
         // Restore every non-delta string once (snapshots, tool names, summaries). Delta
         // strings are blanked first so they only go through their streaming channel.
@@ -275,9 +324,11 @@ impl SseRestorer {
                 Some(Value::String(s)) => inputs.push(s),
                 _ => return Err(invalid("delta must be a JSON string")),
             }
-            *value.pointer_mut(&t.pointer).unwrap() = Value::String(String::new());
+            if let Some(slot) = value.pointer_mut(&t.pointer) {
+                *slot = Value::String(String::new());
+            }
         }
-        let matcher = self.vault.matcher();
+        let matcher = self.vault.matcher_for_scope(self.scope.as_deref());
         let (snapshot_restored, snapshot_withheld) = restore_value(&matcher, &mut value, self.policy);
         self.restored += snapshot_restored;
         self.withheld += snapshot_withheld;
@@ -288,13 +339,24 @@ impl SseRestorer {
             if self.ended.iter().any(|end| end.matches(&target.key)) {
                 return Err(invalid("text delta received after its channel ended"));
             }
+            if !self.channels.contains_key(&target.key) && self.channels.len() >= MAX_SSE_CHANNELS {
+                return Err(invalid("too many active SSE channels"));
+            }
             let envelope = chat_envelope(&value);
             let vault = &self.vault;
+            let scope = &self.scope;
             let channel = self.channels.entry(target.key.clone()).or_insert_with(|| Channel {
                 buffer: if target.nested_json {
-                    Buffer::Json(String::new())
+                    Buffer::Json {
+                        buf: String::new(),
+                        strict_json: target.strict_json,
+                    }
                 } else {
-                    Buffer::Text(StreamRestorer::new(vault.clone()))
+                    Buffer::Text(StreamRestorer::with_secret_policy_scoped(
+                        vault.clone(),
+                        scope.clone(),
+                        target.allow_secret_text,
+                    ))
                 },
                 envelope,
                 event: event.name.map(str::to_owned),
@@ -303,8 +365,11 @@ impl SseRestorer {
             let is_text = matches!(channel.buffer, Buffer::Text(_));
             let mut restored = match &mut channel.buffer {
                 Buffer::Text(stream) => stream.push_chunk(&input),
-                Buffer::Json(buffer) => {
-                    buffer.push_str(&input);
+                Buffer::Json { buf, .. } => {
+                    if buf.len().saturating_add(input.len()) > MAX_SSE_JSON_BUFFER_BYTES {
+                        return Err(invalid("SSE nested JSON buffer exceeds size limit"));
+                    }
+                    buf.push_str(&input);
                     String::new()
                 }
             };
@@ -323,16 +388,81 @@ impl SseRestorer {
                 }
             }
             changed |= restored != input;
-            *value.pointer_mut(&target.pointer).unwrap() = Value::String(restored);
+            if let Some(slot) = value.pointer_mut(&target.pointer) {
+                *slot = Value::String(restored);
+            }
         }
         output.push_str(&self.flush(&ends)?);
-        self.ended.extend(ends);
+        if self.ended.len().saturating_add(ends.len()) <= MAX_SSE_ENDED {
+            self.ended.extend(ends);
+        } else if !self.ended.iter().any(|e| matches!(e, End::All)) {
+            self.ended.extend(ends.into_iter().filter(|e| matches!(e, End::All)));
+        }
         output.push_str(&if changed {
             event.replace_data(&value)
         } else {
             raw.to_owned()
         });
         Ok(output)
+    }
+
+    fn observe_tool_names(&mut self, value: &Value, kind: &str) -> io::Result<()> {
+        if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+            for (position, choice) in choices.iter().enumerate() {
+                let choice_index = optional_index(choice, "index")?.unwrap_or(position as u64);
+                if let Some(tools) = choice.pointer("/delta/tool_calls").and_then(Value::as_array) {
+                    for (pos_tool, tool) in tools.iter().enumerate() {
+                        if let Some(name_chunk) = tool.pointer("/function/name").and_then(Value::as_str) {
+                            let tool_index = optional_index(tool, "index")?.unwrap_or(pos_tool as u64);
+                            self.tool_names
+                                .entry(ToolSlot::Chat(choice_index, tool_index))
+                                .or_default()
+                                .push_str(name_chunk);
+                        }
+                    }
+                }
+            }
+        }
+        if kind == "content_block_start" {
+            let block = index(value, "index")?;
+            if let Some(name) = value.pointer("/content_block/name").and_then(Value::as_str) {
+                self.tool_names
+                    .entry(ToolSlot::Anthropic(block))
+                    .or_default()
+                    .push_str(name);
+            }
+        }
+        if kind == "response.output_item.added" {
+            if let Some(name) = value
+                .pointer("/item/name")
+                .or_else(|| value.pointer("/item/tool_name"))
+                .and_then(Value::as_str)
+            {
+                if let Some(id) = value.pointer("/item/id").and_then(Value::as_str) {
+                    self.tool_names
+                        .insert(ToolSlot::ResponsesId(id.to_owned()), name.to_owned());
+                }
+                if let Some(out_idx) = optional_index(value, "output_index")? {
+                    self.tool_names.insert(ToolSlot::ResponsesIdx(out_idx), name.to_owned());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn tool_name_for(&self, key: &Key) -> Option<&str> {
+        match key {
+            Key::Chat(c, Some(t), _) => self.tool_names.get(&ToolSlot::Chat(*c, *t)).map(String::as_str),
+            Key::Anthropic(idx, _) => self.tool_names.get(&ToolSlot::Anthropic(*idx)).map(String::as_str),
+            Key::Responses {
+                item_id, output_index, ..
+            } => item_id
+                .as_ref()
+                .and_then(|id| self.tool_names.get(&ToolSlot::ResponsesId(id.clone())))
+                .or_else(|| output_index.and_then(|idx| self.tool_names.get(&ToolSlot::ResponsesIdx(idx))))
+                .map(String::as_str),
+            _ => None,
+        }
     }
 
     fn flush(&mut self, ends: &[End]) -> io::Result<String> {
@@ -344,20 +474,58 @@ impl SseRestorer {
             .collect();
         let mut output = String::new();
         for key in keys {
-            let mut channel = self.channels.remove(&key).unwrap();
+            let Some(mut channel) = self.channels.remove(&key) else {
+                continue;
+            };
+            let tool_name = self.tool_name_for(&key).map(str::to_owned);
+            let matcher = self.vault.matcher_for_scope(self.scope.as_deref());
             let (tail, count) = match &mut channel.buffer {
                 Buffer::Text(stream) => {
                     let result = stream.finish();
                     self.withheld += stream.withheld();
                     result
                 }
-                Buffer::Json(buffer) if buffer.is_empty() => (String::new(), 0),
-                Buffer::Json(buffer) => {
-                    // Never report malformed/truncated JSON as successfully restored text.
-                    let mut parsed: Value = serde_json::from_str(buffer).map_err(invalid)?;
-                    let (count, withheld) = restore_tool_args(&self.vault.matcher(), &mut parsed, self.policy);
-                    self.withheld += withheld;
-                    (parsed.to_string(), count)
+                Buffer::Json { buf, .. } if buf.is_empty() => (String::new(), 0),
+                Buffer::Json { buf, strict_json } => {
+                    if *strict_json || buf.trim_start().starts_with(['{', '[']) {
+                        match serde_json::from_str::<Value>(buf) {
+                            Ok(mut parsed) => {
+                                let (count, withheld) = restore_tool_args_for_tool(
+                                    &matcher,
+                                    &mut parsed,
+                                    self.policy,
+                                    tool_name.as_deref(),
+                                );
+                                self.withheld += withheld;
+                                (parsed.to_string(), count)
+                            }
+                            Err(_) if self.length_truncated => {
+                                // Model hit max_tokens/length mid-tool-call: degrade gracefully so the
+                                // harness still receives the finish_reason event instead of a stream abort.
+                                let allow_secret = match self.policy {
+                                    ToolCallSecretPolicy::Always => true,
+                                    ToolCallSecretPolicy::Never => false,
+                                    ToolCallSecretPolicy::FileEditsOnly => {
+                                        tool_name.as_deref().is_some_and(is_file_edit_tool)
+                                    }
+                                };
+                                let (restored, count, withheld) = matcher.restore(buf, None, allow_secret);
+                                self.withheld += withheld;
+                                (restored, count)
+                            }
+                            Err(err) => return Err(invalid(err)),
+                        }
+                    } else {
+                        // Free-form custom tool input (e.g. non-JSON patch/command text): apply tool policy.
+                        let allow_secret = match self.policy {
+                            ToolCallSecretPolicy::Always => true,
+                            ToolCallSecretPolicy::Never => false,
+                            ToolCallSecretPolicy::FileEditsOnly => tool_name.as_deref().is_some_and(is_file_edit_tool),
+                        };
+                        let (restored, count, withheld) = matcher.restore(buf, None, allow_secret);
+                        self.withheld += withheld;
+                        (restored, count)
+                    }
                 }
             };
             self.restored += count;
@@ -420,7 +588,7 @@ impl Key {
 
 fn targets(value: &Value, kind: &str) -> io::Result<Vec<Target>> {
     let mut targets = Vec::new();
-    let mut add = |key, pointer: String, nested_json| -> io::Result<()> {
+    let mut add = |key, pointer: String, nested_json, strict_json, allow_secret_text| -> io::Result<()> {
         if let Some(node) = value.pointer(&pointer).filter(|node| !node.is_null()) {
             if !node.is_string() {
                 return Err(invalid("delta must be a JSON string"));
@@ -429,6 +597,8 @@ fn targets(value: &Value, kind: &str) -> io::Result<Vec<Target>> {
                 key,
                 pointer,
                 nested_json,
+                strict_json,
+                allow_secret_text,
             });
         }
         Ok(())
@@ -441,6 +611,8 @@ fn targets(value: &Value, kind: &str) -> io::Result<Vec<Target>> {
                     Key::Chat(choice_index, None, field),
                     format!("/choices/{position}/delta/{field}"),
                     false,
+                    false,
+                    true,
                 )?;
             }
             if let Some(tools) = choice.pointer("/delta/tool_calls").and_then(Value::as_array) {
@@ -451,6 +623,8 @@ fn targets(value: &Value, kind: &str) -> io::Result<Vec<Target>> {
                             Key::Chat(choice_index, Some(tool_index), field),
                             format!("/choices/{position}/delta/tool_calls/{position_tool}/function/{field}"),
                             field == "arguments",
+                            field == "arguments",
+                            false,
                         )?;
                     }
                 }
@@ -464,6 +638,8 @@ fn targets(value: &Value, kind: &str) -> io::Result<Vec<Target>> {
                 Key::Anthropic(block, field),
                 format!("/delta/{field}"),
                 field == "partial_json",
+                field == "partial_json",
+                true,
             )?;
         }
     }
@@ -482,6 +658,8 @@ fn targets(value: &Value, kind: &str) -> io::Result<Vec<Target>> {
                             Key::Gemini(candidate_index, part_position as u64, field),
                             format!("/candidates/{position}/content/parts/{part_position}/text"),
                             false,
+                            false,
+                            true,
                         )?;
                     }
                 }
@@ -489,11 +667,15 @@ fn targets(value: &Value, kind: &str) -> io::Result<Vec<Target>> {
         }
     }
     let response_field = match kind {
-        "response.output_text.delta" => Some("output_text"),
-        "response.function_call_arguments.delta" => Some("function_call_arguments"),
+        "response.output_text.delta" => Some(("output_text", false, false)),
+        "response.reasoning_summary_text.delta" => Some(("reasoning_summary_text", false, false)),
+        "response.refusal.delta" => Some(("refusal", false, false)),
+        "response.function_call_arguments.delta" => Some(("function_call_arguments", true, true)),
+        "response.mcp_call_arguments.delta" => Some(("mcp_call_arguments", true, true)),
+        "response.custom_tool_call_input.delta" => Some(("custom_tool_call_input", true, false)),
         _ => None,
     };
-    if let Some(field) = response_field {
+    if let Some((field, nested_json, strict_json)) = response_field {
         let (item_id, output_index) = response_id(value)?;
         let content_index = optional_index(value, "content_index")?.unwrap_or(0);
         add(
@@ -504,7 +686,9 @@ fn targets(value: &Value, kind: &str) -> io::Result<Vec<Target>> {
                 field,
             },
             "/delta".to_owned(),
-            field == "function_call_arguments",
+            nested_json,
+            strict_json,
+            !nested_json,
         )?;
     }
     Ok(targets)
@@ -537,13 +721,21 @@ fn endings(value: &Value, kind: &str) -> io::Result<Vec<End>> {
         | "response.cancelled" => ends.push(End::All),
         "content_block_stop" => ends.push(End::Anthropic(index(value, "index")?)),
         "response.output_text.done"
+        | "response.reasoning_summary_text.done"
+        | "response.refusal.done"
         | "response.function_call_arguments.done"
+        | "response.mcp_call_arguments.done"
+        | "response.custom_tool_call_input.done"
         | "response.content_part.done"
         | "response.output_item.done" => {
             let (item_id, output_index) = response_id(value)?;
             let field = match kind {
                 "response.output_text.done" | "response.content_part.done" => Some("output_text"),
+                "response.reasoning_summary_text.done" => Some("reasoning_summary_text"),
+                "response.refusal.done" => Some("refusal"),
                 "response.function_call_arguments.done" => Some("function_call_arguments"),
+                "response.mcp_call_arguments.done" => Some("mcp_call_arguments"),
+                "response.custom_tool_call_input.done" => Some("custom_tool_call_input"),
                 _ => None,
             };
             let content_index = if field == Some("output_text") {
@@ -593,6 +785,30 @@ fn response_id(value: &Value) -> io::Result<(Option<String>, Option<u64>)> {
 
 fn nonnull(value: &Value, field: &str) -> bool {
     value.get(field).is_some_and(|v| !v.is_null())
+}
+
+fn is_length_truncation_event(value: &Value, kind: &str) -> bool {
+    if kind == "response.incomplete" {
+        return true;
+    }
+    if value.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens")
+        || value.get("stop_reason").and_then(Value::as_str) == Some("max_tokens")
+    {
+        return true;
+    }
+    if value.get("choices").and_then(Value::as_array).is_some_and(|cs| {
+        cs.iter()
+            .any(|c| c.get("finish_reason").and_then(Value::as_str) == Some("length"))
+    }) {
+        return true;
+    }
+    if value.get("candidates").and_then(Value::as_array).is_some_and(|cs| {
+        cs.iter()
+            .any(|c| c.get("finishReason").and_then(Value::as_str) == Some("MAX_TOKENS"))
+    }) {
+        return true;
+    }
+    false
 }
 
 fn chat_envelope(value: &Value) -> Value {
@@ -1120,5 +1336,47 @@ mod tests {
             }
             assert!(restorer.finish().is_err());
         }
+    }
+
+    #[test]
+    fn responses_custom_tool_call_input_withholds_secrets_for_non_edit_tools() {
+        let vault = PrivacyVault::new();
+        vault.insert_explicit("sk-real-secret-999", "sk-sem-placeholder-key-0001", "ApiKey");
+        let mut restorer = SseRestorer::with_policy(vault, ToolCallSecretPolicy::FileEditsOnly);
+        let added = frame(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "ct_1", "type": "custom_tool_call", "name": "Bash"}
+        }));
+        let d1 = frame(json!({
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "ct_1",
+            "output_index": 0,
+            "delta": "{\"content\":\"curl "
+        }));
+        let d2 = frame(json!({
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "ct_1",
+            "output_index": 0,
+            "delta": "sk-sem-placeholder-key-0001\"}"
+        }));
+        let done = frame(json!({
+            "type": "response.custom_tool_call_input.done",
+            "item_id": "ct_1",
+            "output_index": 0
+        }));
+        let mut out = String::new();
+        for ev in [added, d1, d2, done] {
+            out.push_str(&restorer.push_bytes(ev.as_bytes()).unwrap());
+        }
+        assert!(!out.contains("sk-real-secret-999"), "{out}");
+        assert_eq!(restorer.withheld(), 1);
+    }
+
+    #[test]
+    fn oversized_sse_pending_event_is_rejected() {
+        let mut restorer = SseRestorer::new(PrivacyVault::new());
+        let big = vec![b'a'; MAX_SSE_PENDING_BYTES + 1];
+        assert_eq!(restorer.push_bytes(&big).unwrap_err().kind(), ErrorKind::InvalidData);
     }
 }

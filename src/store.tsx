@@ -12,11 +12,12 @@ interface Store {
   statusError: Error | null;
   logs: TrafficSummary[];
   logsLoading: boolean;
-  refreshLogs: () => Promise<void>;
+  refreshLogs: () => Promise<unknown>;
   harnesses: HarnessProfile[];
+  refreshHarnesses: () => Promise<unknown>;
   vault: VaultEntry[];
   vaultLoading: boolean;
-  refreshVault: () => Promise<void>;
+  refreshVault: () => Promise<unknown>;
   route: Route;
   params: URLSearchParams;
   navigate: (route: Route, params?: Record<string, string>) => void;
@@ -99,6 +100,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       logsLoading: logs.loading,
       refreshLogs: logs.refresh,
       harnesses: harnesses.data ?? [],
+      refreshHarnesses: harnesses.refresh,
       vault: vault.data ?? [],
       vaultLoading: vault.loading,
       refreshVault: vault.refresh,
@@ -109,7 +111,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       simulatorOpen,
       closeSimulator: () => setSimulatorOpen(false),
     }),
-    [config, saveConfig, saving, status.data, status.error, logs.data, logs.loading, logs.refresh, harnesses.data, vault.data, vault.loading, vault.refresh, route, params, navigate, simulatorOpen],
+    [config, saveConfig, saving, status.data, status.error, logs.data, logs.loading, logs.refresh, harnesses.data, harnesses.refresh, vault.data, vault.loading, vault.refresh, route, params, navigate, simulatorOpen],
   );
 
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;

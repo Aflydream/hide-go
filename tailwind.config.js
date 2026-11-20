@@ -2,7 +2,7 @@
 const token = (name) => `rgb(var(--${name}) / <alpha-value>)`;
 
 export default {
-  content: ['./index.html', './src/**/*.{ts,tsx}'],
+  content: ['./index.html', './setup.html', './src/**/*.{ts,tsx}'],
   theme: {
     fontFamily: {
       sans: ['"IBM Plex Sans Variable"', '"IBM Plex Sans"', '-apple-system', 'BlinkMacSystemFont', '"PingFang SC"', '"Microsoft YaHei UI"', '"Microsoft YaHei"', 'system-ui', 'sans-serif'],

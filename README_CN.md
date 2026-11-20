@@ -112,17 +112,17 @@ pub fn compost_magnolia_766(
 
 ## 已适配的 7 款工具
 
-程序内置了以下工具的请求指纹识别与专属路由（桌面端内可一键复制环境变量脚本）：
+程序内置了本机 AI 工具自动扫描、可执行路径/配置识别与**可逆一键接入**（单端口同时承载反向代理与选择性 `HTTPS CONNECT` 劫持；修改前自动生成完整备份，卸载或断开时可无损回滚）：
 
-| 工具名称 | 本地代理路由 | 重点拦截项 |
-| :--- | :--- | :--- |
-| **Claude Code** | `http://127.0.0.1:18787/claude-code` | `CLAUDE.md` 注入、目录读取回传、`/api/event_logging` 遥测 |
-| **OpenAI Codex** | `http://127.0.0.1:18787/codex` | 沙箱环境上下文、终端执行日志中的密钥 |
-| **Antigravity** | `http://127.0.0.1:18787/antigravity` | 工作区挂载资源路径、跨文件代码片段 |
-| **ZCode** | `http://127.0.0.1:18787/zcode` | 打开文件快照、自动补全上下文 |
-| **Qoder** | `http://127.0.0.1:18787/qoder` | 后台全量代码库向量索引上传（Codebase Indexing） |
-| **Cursor** | `http://127.0.0.1:18787/cursor` | Composer 多文件上下文、`repo-service` 分块上传 |
-| **Grok Build** | `http://127.0.0.1:18787/grok-build` | 构建源码打包传输、构建报错日志中的内网地址 |
+| 工具名称 | 本地代理接入 | 自动接入方式 | 重点拦截项 |
+| :--- | :--- | :--- | :--- |
+| **Claude Code** | `http://127.0.0.1:18787/claude-code` | `~/.claude/settings.json`（保留已有上级网关链路） | `CLAUDE.md` 注入、目录读取回传、`/api/event_logging` 遥测 |
+| **OpenAI Codex** | `/codex` + 选择性 HTTPS MITM | `~/.codex/config.toml` + 托管环境脚本（`OPENAI_BASE_URL` / `HTTPS_PROXY`） | 沙箱环境上下文、终端执行日志中的密钥 |
+| **Antigravity** | 选择性 HTTPS MITM（支持 HTTP/2） | IDE `User/settings.json` + 托管环境脚本（`HTTPS_PROXY` / `NODE_EXTRA_CA_CERTS`） | 工作区挂载资源路径、跨文件代码片段（二进制 Proto RPC 原样透传） |
+| **ZCode** | 选择性 HTTPS MITM | 托管环境脚本（`ZCODE_HTTP_PROXY` / `ZCODE_AGENT_CA_CERT` / `HTTPS_PROXY`） | 打开文件快照、自动补全上下文 |
+| **Qoder** | 选择性 HTTPS MITM | `Qoder` / `QoderCN` `User/settings.json` + 托管环境脚本 | 后台全量代码库向量索引上传（Codebase Indexing） |
+| **Cursor** | 选择性 HTTPS MITM | `Cursor/User/settings.json` + 托管环境脚本（`http.proxy` / 禁用 HTTP/2 回退） | Composer 多文件上下文、`repo-service` 分块上传 |
+| **Grok Build** | `/grok-build` + 选择性 HTTPS MITM | 托管环境脚本（`GROK_XAI_API_BASE_URL` / `GROK_CLI_CHAT_PROXY_BASE_URL` / `HTTPS_PROXY`） | 构建源码打包传输、构建报错日志中的内网地址 |
 
 <details>
 <summary><b>📋 点击展开：命令行一键接入示例（Bash / PowerShell）</b></summary>
@@ -131,26 +131,32 @@ pub fn compost_magnolia_766(
 ```bash
 # Claude Code
 export ANTHROPIC_BASE_URL="http://127.0.0.1:18787/claude-code"
+export NO_PROXY="localhost,127.0.0.1,::1"
 
 # OpenAI Codex
 export OPENAI_BASE_URL="http://127.0.0.1:18787/codex/v1"
+export HTTPS_PROXY="http://127.0.0.1:18787"
+export NO_PROXY="localhost,127.0.0.1,::1"
 
 # Grok Build
-export XAI_BASE_URL="http://127.0.0.1:18787/grok-build/v1"
+export GROK_XAI_API_BASE_URL="http://127.0.0.1:18787/grok-build/v1"
+export HTTPS_PROXY="http://127.0.0.1:18787"
+export NO_PROXY="localhost,127.0.0.1,::1"
 ```
 
 **Windows (PowerShell)**
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:18787/claude-code"
 $env:OPENAI_BASE_URL    = "http://127.0.0.1:18787/codex/v1"
-$env:XAI_BASE_URL       = "http://127.0.0.1:18787/grok-build/v1"
+$env:HTTPS_PROXY        = "http://127.0.0.1:18787"
+$env:NO_PROXY           = "localhost,127.0.0.1,::1"
 ```
 
 </details>
 
-> **接入限制**：Hide-Go 是反向代理网关，不是 HTTPS 正向代理，**不能通过 `HTTPS_PROXY` 接入**（网关不支持 CONNECT，那样只会让你终端里的 HTTPS 请求全部失败）；工具必须支持自定义 API Base URL。另外两个已知边界：
-> * **Cursor** 的自定义 Base URL 请求由 Cursor 服务器转发，访问不到你本机的 `127.0.0.1`，需要自行用 HTTPS 隧道把网关暴露出去，并自负暴露风险。
-> * **Qoder** 的内置索引通道若不读取 Base URL 变量，那部分请求不会经过网关。
+> **选择性 TLS 拦截与无损兼容性说明**：
+> * **仅解密 AI 域名，其它流量零触碰**：通过 `HTTPS_PROXY` / `CONNECT` 经过网关的流量，仅对内置或自定义 AI API 域名（如 `api.openai.com`、`api2.cursor.sh`、`*.qoder.sh` 等）动态签发叶子证书检查，OAuth 登录域名及 GitHub/npm 等通用站点全部走原始 TCP 透传，支持 HTTP/1.1、HTTP/2 与 WebSocket (`wss://`) 升级透传。
+> * **显式 CA 信任与防断网探活**：桌面端托管的 `~/.hide-go/env.ps1` 与 Shell Profile 片段内置了本地端口探活逻辑，未启动 Hide-Go 时不会导出代理环境变量，避免终端断网；如需信任本地根证书，请在控制台「工具接入」页面显式点击「安装并信任根证书」（绝不静默篡改 Windows 注册表）。
 
 ## 工具调用里的密钥默认只在写文件时还原
 
@@ -158,21 +164,35 @@ $env:XAI_BASE_URL       = "http://127.0.0.1:18787/grok-build/v1"
 
 ---
 
-## 下载运行
+## 下载与安装
 
-直接从 [Releases 页面](https://github.com/Aflydream/hide-go/releases) 下载对应系统的单文件程序。前端界面已经通过 `include_bytes!` 编译进同一个二进制文件，不需要装 Node.js：
+从 [Releases 页面](https://github.com/Aflydream/hide-go/releases) 下载对应系统的 **Setup 安装向导**（推荐，含完整安装、快捷方式、PATH 注册、AI 工具自动检测与系统卸载器），或下载免安装便携版 `hide-go-desktop`。前端控制台与安装界面均已静态内嵌，无需预先安装 Node.js：
 
-* **Windows (x64)**：下载 `hide-go-desktop-windows-x64.exe` 双击运行
+### 完整安装向导（推荐）
+
+* **Windows (x64)**：下载并运行 `Hide-Go-Setup-windows-x64.exe`（图形化向导；支持在系统「应用和功能」中完整卸载并回滚接入配置）
 * **macOS (Apple Silicon)**：
   ```bash
-  chmod +x hide-go-desktop-macos-arm64 && ./hide-go-desktop-macos-arm64
+  chmod +x Hide-Go-Setup-macos-arm64 && ./Hide-Go-Setup-macos-arm64
   ```
 * **Linux (x86_64)**：
   ```bash
-  chmod +x hide-go-desktop-linux-x86_64 && ./hide-go-desktop-linux-x86_64
+  chmod +x Hide-Go-Setup-linux-x86_64 && ./Hide-Go-Setup-linux-x86_64
   ```
 
-运行后会自动监听 `127.0.0.1:18787` 并拉起桌面控制台窗口。如果只想在服务器后台跑纯网关守护进程，加环境变量 `HIDE_GO_HEADLESS=1` 即可。
+安装程序也支持静默命令行部署与卸载：
+
+```bash
+# 静默安装到指定目录并自动接入已检测到的 AI 工具
+Hide-Go-Setup --silent --install --dir /path/to/Hide-Go --auto-connect
+
+# 静默卸载并回滚所有由 Hide-Go 写入的接入配置
+Hide-Go-Setup --silent --uninstall --dir /path/to/Hide-Go
+```
+
+### 免安装便携版
+
+如果不需要写入安装目录或注册卸载项，可直接运行 `hide-go-desktop-*`；启动后监听 `127.0.0.1:18787` 并打开桌面控制台。若需在无桌面环境下作为后台守护进程运行，设置 `HIDE_GO_HEADLESS=1` 或直接运行安装目录下的 `hide-go-daemon`。
 
 | 环境变量 | 作用 |
 | :--- | :--- |
@@ -197,19 +217,24 @@ $env:XAI_BASE_URL       = "http://127.0.0.1:18787/grok-build/v1"
 环境要求：Rust `1.80+`，Node.js `20+`（仅在修改前端界面重新生成静态资源时需要）。
 
 ```bash
-# 1. 运行核心单元测试（7 大工具识别、双向脱敏、同构伪装、SSE 跨包流式还原）
+# 1. 运行核心、桌面端与安装器单元测试
 cargo test --workspace
 
-# 2. 打包前端并编译进单文件桌面程序
+# 2. 打包前端并编译守护进程 + 桌面程序
 npm install && npm run build
-cargo build --release -p hide-go-desktop
+cargo build --release -p hide-core -p hide-go-desktop
+
+# 3. 编译内嵌完整负载的独立安装程序（Windows PowerShell 示例）
+$env:HIDE_GO_BUNDLE_DESKTOP = "$PWD\target\release\hide-go-desktop.exe"
+$env:HIDE_GO_BUNDLE_DAEMON  = "$PWD\target\release\hide-go-daemon.exe"
+cargo build --release -p hide-setup
 ```
 
 ### 代码结构
 
 ```text
 hide-go/
-├── crates/hide-core/          # Rust 核心引擎与独立守护进程
+├── crates/hide-core/          # Rust 核心引擎与独立守护进程 (hide-go-daemon)
 │   ├── src/
 │   │   ├── scanner.rs         # 密钥、私钥、DB 连接串、内网 IP、路径与自定义规则扫描
 │   │   ├── vault.rs           # 线程安全双向映射表 (占位符 <-> 原文)，带容量上限
@@ -219,9 +244,11 @@ hide-go/
 │   │   ├── restore.rs         # JSON 响应还原与工具调用凭据策略
 │   │   ├── sse_restorer.rs    # 按协议分通道的 SSE 流式还原器
 │   │   ├── stream_restorer.rs # 跨 Chunk 边界的滑动窗口文本还原器
-│   │   ├── harness.rs         # 7 款工具的识别、路由与接入脚本
+│   │   ├── harness.rs         # 7 款工具的识别、路由与脚本生成
+│   │   ├── harness_detect.rs  # 本机 AI 工具扫描、配置文件/环境变量自动接入与可逆回滚
 │   │   └── proxy.rs           # Axum 反向代理、管理 API 与离线模拟器
 │   └── tests/                 # 代码审查问题的回归测试
-├── src/                       # 桌面端 UI（概览、流量检视、保护策略、自定义规则、映射表、工具接入）
-└── desktop/                   # 单文件静态资源内嵌与控制台窗口启动器
+├── crates/hide-setup/         # 图形化安装与卸载向导（内嵌前端与编译负载）
+├── src/                       # 桌面控制台与安装向导 UI（React + Vite + Tailwind）
+└── desktop/                   # 静态资源内嵌与桌面窗口启动器 (hide-go-desktop)
 ```

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -178,6 +179,18 @@ pub enum ToolCallSecretPolicy {
     Always,
 }
 
+pub const MIN_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 30;
+pub const MAX_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 3600;
+pub const DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 900;
+
+fn default_allowed_connect_ports() -> Vec<u16> {
+    vec![443, 8443]
+}
+
+fn default_upstream_idle_timeout_secs() -> u64 {
+    DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS
+}
+
 /// Global runtime configuration for Hide-Go
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -192,6 +205,20 @@ pub struct HideConfig {
     pub project_salt: String,
     pub tool_call_secret_policy: ToolCallSecretPolicy,
     pub custom_rules: Vec<CustomRule>,
+    #[serde(default)]
+    pub mitm_extra_hosts: Vec<String>,
+    #[serde(default)]
+    pub mitm_bypass_hosts: Vec<String>,
+    #[serde(default = "default_allowed_connect_ports")]
+    pub allowed_connect_ports: Vec<u16>,
+    #[serde(default)]
+    pub allowed_loopback_proxy_targets: Vec<String>,
+    #[serde(default = "default_upstream_idle_timeout_secs")]
+    pub upstream_idle_timeout_secs: u64,
+    #[serde(default)]
+    pub auto_trust_ca: bool,
+    #[serde(default)]
+    pub harness_upstreams: HashMap<String, String>,
 }
 
 impl Default for HideConfig {
@@ -208,6 +235,13 @@ impl Default for HideConfig {
             // camouflage mapping for common identifiers.
             project_salt: format!("hg-{}", Uuid::new_v4().simple()),
             tool_call_secret_policy: ToolCallSecretPolicy::default(),
+            mitm_extra_hosts: Vec::new(),
+            mitm_bypass_hosts: Vec::new(),
+            allowed_connect_ports: default_allowed_connect_ports(),
+            allowed_loopback_proxy_targets: Vec::new(),
+            upstream_idle_timeout_secs: default_upstream_idle_timeout_secs(),
+            auto_trust_ca: false,
+            harness_upstreams: HashMap::new(),
             custom_rules: vec![
                 CustomRule {
                     id: "rule-1".to_string(),
@@ -250,7 +284,7 @@ impl HideConfig {
     /// An unreadable file is kept aside as `config.json.corrupt` instead of being overwritten silently.
     pub fn load_or_create(path: &Path) -> HideConfig {
         match std::fs::read_to_string(path) {
-            Ok(text) => match serde_json::from_str::<HideConfig>(&text) {
+            Ok(text) => match serde_json::from_str::<HideConfig>(text.trim_start_matches('\u{feff}')) {
                 Ok(cfg) => return cfg,
                 Err(err) => {
                     tracing::warn!("config {} is invalid ({err}); starting from defaults", path.display());
@@ -270,14 +304,27 @@ impl HideConfig {
         cfg
     }
 
-    /// Atomically persist the configuration.
+    /// Atomically persist the configuration with private file permissions and serialized locking.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        static CONFIG_SAVE_LOCK: once_cell::sync::Lazy<parking_lot::Mutex<()>> =
+            once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(()));
+        let _guard = CONFIG_SAVE_LOCK.lock();
+        let data = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        crate::ca::atomic_write_private_file(path, &data).map_err(std::io::Error::other)?;
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            if dir.file_name().is_some_and(|n| n.eq_ignore_ascii_case("hide-go")) {
+                let _ = crate::ca::harden_private_dir_permissions(dir);
+            }
         }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self).expect("config serializes"))?;
-        std::fs::rename(&tmp, path)
+        Ok(())
+    }
+
+    /// Upstream read-idle timeout safely clamped to `[30s, 3600s]`.
+    pub fn effective_upstream_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.upstream_idle_timeout_secs
+                .clamp(MIN_UPSTREAM_IDLE_TIMEOUT_SECS, MAX_UPSTREAM_IDLE_TIMEOUT_SECS),
+        )
     }
 }
 
@@ -370,5 +417,47 @@ impl From<&TrafficAuditRecord> for TrafficAuditSummary {
             restored_count: r.restored_count,
             withheld_count: r.withheld_count,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_and_legacy_deserialization_apply_compat_fields() {
+        let cfg = HideConfig::default();
+        assert_eq!(cfg.allowed_connect_ports, vec![443, 8443]);
+        assert!(cfg.allowed_loopback_proxy_targets.is_empty());
+        assert_eq!(cfg.upstream_idle_timeout_secs, 900);
+        assert_eq!(
+            cfg.effective_upstream_idle_timeout(),
+            std::time::Duration::from_secs(900)
+        );
+
+        let legacy: HideConfig = serde_json::from_str(r#"{"proxyPort": 18787}"#).unwrap();
+        assert_eq!(legacy.allowed_connect_ports, vec![443, 8443]);
+        assert!(legacy.allowed_loopback_proxy_targets.is_empty());
+        assert_eq!(legacy.upstream_idle_timeout_secs, 900);
+    }
+
+    #[test]
+    fn upstream_idle_timeout_is_clamped_to_safe_bounds() {
+        let mut cfg = HideConfig::default();
+        cfg.upstream_idle_timeout_secs = 0;
+        assert_eq!(
+            cfg.effective_upstream_idle_timeout(),
+            std::time::Duration::from_secs(30)
+        );
+        cfg.upstream_idle_timeout_secs = 15;
+        assert_eq!(
+            cfg.effective_upstream_idle_timeout(),
+            std::time::Duration::from_secs(30)
+        );
+        cfg.upstream_idle_timeout_secs = 99_999;
+        assert_eq!(
+            cfg.effective_upstream_idle_timeout(),
+            std::time::Duration::from_secs(3600)
+        );
     }
 }

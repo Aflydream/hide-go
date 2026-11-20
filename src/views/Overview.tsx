@@ -18,7 +18,7 @@ import { SeverityBadge } from './Traffic';
 
 function Metric({ label, value, hint, tone }: { label: string; value: number | undefined; hint: string; tone?: 'brand' | 'warn' }) {
   return (
-    <div className="min-w-0 px-5 py-4">
+    <div className="min-w-0 bg-surface px-5 py-4">
       <p className="label-caps">{label}</p>
       {value === undefined ? (
         <Skeleton className="mt-2 h-7 w-16" />
@@ -56,12 +56,14 @@ export function Overview() {
   const { status, config, logs, harnesses, navigate, openSimulator } = useStore();
   const live = logs.filter((l) => !l.simulated);
   const recent = logs.slice(0, 8);
-  const base = config ? proxyBase(config.proxyPort) : '';
+  const base = config ? proxyBase(config.proxyPort) : null;
   const protecting = config && config.mode !== 'audit-only';
+  const telemetryBlocked =
+    !!protecting && (config.blockSilentTelemetry || (config.mode === 'all-hide' && config.allHide.enableTelemetryChaff));
 
   return (
     <div className="mx-auto max-w-[1360px] space-y-5 p-6">
-      <section aria-label="运行指标" className="grid grid-cols-3 divide-x divide-line rounded-md border border-line bg-surface xl:grid-cols-6 max-xl:divide-y">
+      <section aria-label="运行指标" className="grid grid-cols-3 gap-px overflow-hidden rounded-md border border-line bg-line xl:grid-cols-6">
         <Metric label="已代理请求" value={status?.totalRequests} hint="自本次启动以来" />
         <Metric label="敏感项" value={status?.totalFindings} hint={protecting ? '已在出境前替换' : '仅审计，未替换'} tone={protecting ? 'brand' : 'warn'} />
         <Metric label="已还原" value={status?.totalRestored} hint="返回时换回真实值" tone="brand" />
@@ -120,7 +122,14 @@ export function Overview() {
                         {r.simulated && <span className="ml-1.5 text-2xs text-info">模拟</span>}
                       </td>
                       <td className="truncate px-2 py-2 font-mono text-fg-muted">
-                        <button type="button" className="max-w-full truncate text-left hover:text-fg" onClick={() => navigate('traffic', { id: r.id })}>
+                        <button
+                          type="button"
+                          className="max-w-full truncate text-left hover:text-fg"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            navigate('traffic', { id: r.id });
+                          }}
+                        >
                           {r.endpoint}
                         </button>
                       </td>
@@ -153,7 +162,7 @@ export function Overview() {
               <ProtectionRow on={protecting && config.protectSecretsAndKeys ? true : false} label="凭据与密钥" detail="API Key、私钥、数据库连接串、配置文件中的密码" />
               <ProtectionRow on={protecting && config.protectProjectPaths ? true : false} label="本机路径与身份" detail="用户目录、邮箱；目录结构保持不变" />
               <ProtectionRow on={protecting && config.protectInternalNetwork ? true : false} label="内网地址与域名" detail="RFC 1918 地址、.internal / .corp 等域名" />
-              <ProtectionRow on={protecting && config.blockSilentTelemetry ? true : false} label="静默遥测" detail="遥测端点在本地应答，推理请求永不拦截" />
+              <ProtectionRow on={telemetryBlocked} label="静默遥测" detail="遥测端点在本地应答，推理请求永不拦截" />
               <ProtectionRow on={!!protecting} label="工具调用中的凭据" detail={POLICY_LABEL[config.toolCallSecretPolicy]} />
               <ProtectionRow
                 on={config.mode === 'all-hide'}
@@ -172,25 +181,31 @@ export function Overview() {
       </div>
 
       <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_380px]">
-        <Panel title="工具活跃度" description="按最近 200 条记录统计">
-          <ul className="grid grid-cols-2 divide-line lg:grid-cols-4">
+        <Panel title="工具活跃度" description="最近 200 条">
+          <ul className="grid grid-cols-2 gap-px bg-line lg:grid-cols-4">
             {HARNESS_ORDER.map((kind) => {
               const rows = live.filter((l) => l.harness === kind);
               const profile = harnesses.find((h) => h.kind === kind);
               return (
-                <li key={kind} className="border-b border-r border-line px-4 py-3">
-                  <div className="flex items-center gap-2">
-                    <span aria-hidden="true" className={cx('h-1.5 w-1.5 rounded-full', rows.length ? 'bg-brand' : 'bg-line-strong')} />
-                    <span className="truncate text-sm text-fg">{HARNESS_LABEL[kind]}</span>
-                  </div>
-                  <p className="tabular mt-1 font-mono text-lg font-semibold text-fg">{rows.length}</p>
-                  <p className="truncate text-2xs text-fg-subtle">
-                    {rows[0] ? `最近 ${rows[0].timestamp.slice(0, 8)} · ${CATEGORY_LABEL[rows[0].category]}` : profile ? '尚未检测到流量' : '—'}
-                  </p>
+                <li key={kind} className="bg-surface">
+                  <button
+                    type="button"
+                    onClick={() => navigate('integrations', { tool: kind })}
+                    className="block w-full cursor-pointer px-4 py-3 text-left transition-colors hover:bg-surface-2"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span aria-hidden="true" className={cx('h-1.5 w-1.5 rounded-full', rows.length ? 'bg-brand' : 'bg-line-strong')} />
+                      <span className="truncate text-sm text-fg">{HARNESS_LABEL[kind]}</span>
+                    </div>
+                    <p className="tabular mt-1 font-mono text-lg font-semibold text-fg">{rows.length}</p>
+                    <p className="truncate text-2xs text-fg-subtle">
+                      {rows[0] ? `${rows[0].timestamp.slice(0, 8)} · ${CATEGORY_LABEL[rows[0].category]}` : profile ? '暂无流量' : '—'}
+                    </p>
+                  </button>
                 </li>
               );
             })}
-            <li className="flex items-center border-b border-line px-4 py-3">
+            <li className="flex items-center bg-surface px-4 py-3">
               <Button size="sm" variant="ghost" icon={<Plugs size={14} />} onClick={() => navigate('integrations')}>
                 查看接入方式
               </Button>
@@ -198,15 +213,17 @@ export function Overview() {
           </ul>
         </Panel>
 
-        <Panel title="网关地址" description="把工具的 Base URL 指向以下路径">
+        <Panel title="网关入口" description="Tool Base URL">
           <div className="space-y-2 p-4">
-            {['claude-code', 'codex', 'grok-build'].map((slug) => (
-              <div key={slug} className="flex items-center gap-2 rounded border border-line bg-surface-2 py-1 pl-3 pr-1">
-                <code className="min-w-0 flex-1 truncate font-mono text-xs text-fg">{`${base}/${slug}`}</code>
-                <CopyButton compact text={`${base}/${slug}`} label={`复制 ${slug} 地址`} />
-              </div>
-            ))}
-            <p className="pt-1 text-xs text-fg-subtle">只监听 127.0.0.1，局域网中的其他设备无法访问。</p>
+            {base
+              ? ['claude-code', 'codex', 'grok-build'].map((slug) => (
+                  <div key={slug} className="flex items-center gap-2 rounded border border-line bg-surface-2 py-1 pl-3 pr-1">
+                    <code className="min-w-0 flex-1 truncate font-mono text-xs text-fg">{`${base}/${slug}`}</code>
+                    <CopyButton compact text={`${base}/${slug}`} label={`复制 ${slug} 地址`} />
+                  </div>
+                ))
+              : Array.from({ length: 3 }, (_, i) => <Skeleton key={i} className="h-8" />)}
+            <p className="pt-1 text-xs text-fg-subtle">仅监听 127.0.0.1</p>
           </div>
         </Panel>
       </div>

@@ -3,7 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="light" />
+    <meta name="color-scheme" content="light dark" />
+    <script nonce="__HIDE_GO_NONCE__">
+      try {
+        var pref = localStorage.getItem('hide-go-color-scheme');
+        if (pref === 'light' || pref === 'dark') {
+          document.querySelector('meta[name="color-scheme"]').setAttribute('content', pref);
+        }
+      } catch (_) {}
+    </script>
     <link rel="icon" type="image/png" href="./src/assets/logo-mark.png" />
     <title>Hide-Go 控制台</title>
   </head>

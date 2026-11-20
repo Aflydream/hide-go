@@ -1,16 +1,16 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { PaperPlaneTilt } from '@phosphor-icons/react';
 import { useStore } from '../store';
 import { api } from '../lib/api';
 import { CATEGORY_LABEL, HARNESS_LABEL, HARNESS_ORDER, MODE_LABEL } from '../lib/format';
 import type { HarnessKind, TrafficCategory } from '../types';
-import { Button, Dialog, Field, Kbd, cx, inputClass, useToast } from '../components/ui';
+import { Button, Callout, Dialog, Field, Kbd, cx, inputClass, useToast } from '../components/ui';
 
 const CATEGORY_HINT: Record<TrafficCategory, string> = {
-  'interactive-prompt': '用户提问及其上下文，最常见的推理请求。',
-  'tool-execution-sync': '工具执行结果回传给模型。',
-  'codebase-indexing': '后台上传代码片段用于建立索引。',
-  telemetry: '工具静默上报的使用数据。',
+  'interactive-prompt': '用户对话与上下文',
+  'tool-execution-sync': '工具输出回传',
+  'codebase-indexing': '后台代码索引上传',
+  telemetry: '客户端遥测上报',
 };
 
 /** Run the offline simulator and jump to the record it produced. */
@@ -18,16 +18,21 @@ export function useSimulate() {
   const { navigate, refreshLogs } = useStore();
   const toast = useToast();
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const clearError = useCallback(() => setError(null), []);
   const run = useCallback(
     async (harness: HarnessKind, category: TrafficCategory, payload?: string) => {
       setBusy(true);
+      setError(null);
       try {
         const record = await api.simulate(harness, category, payload);
         await refreshLogs();
         navigate('traffic', { id: record.id });
         return true;
       } catch (e) {
-        toast.push({ tone: 'danger', title: '模拟请求失败', body: (e as Error).message });
+        const message = (e as Error).message;
+        setError(message);
+        toast.push({ tone: 'danger', title: '模拟请求失败', body: message });
         return false;
       } finally {
         setBusy(false);
@@ -35,7 +40,7 @@ export function useSimulate() {
     },
     [navigate, refreshLogs, toast],
   );
-  return { run, busy };
+  return { run, busy, error, clearError };
 }
 
 function isBrokenJson(text: string): boolean {
@@ -50,12 +55,16 @@ function isBrokenJson(text: string): boolean {
 
 export function SimulateDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { config } = useStore();
-  const { run, busy } = useSimulate();
+  const { run, busy, error, clearError } = useSimulate();
   const [harness, setHarness] = useState<HarnessKind>('claude-code');
   const [category, setCategory] = useState<TrafficCategory>('interactive-prompt');
   const [payload, setPayload] = useState('');
   const trimmed = payload.trim();
   const brokenJson = isBrokenJson(trimmed);
+
+  useEffect(() => {
+    if (open) clearError();
+  }, [open, clearError]);
 
   const submit = async () => {
     if (busy) return;
@@ -67,7 +76,7 @@ export function SimulateDialog({ open, onClose }: { open: boolean; onClose: () =
       open={open}
       onClose={onClose}
       title="模拟请求"
-      description="在本机走一遍完整的改写与还原流程，不连接任何厂商。结果会作为「模拟」记录出现在流量列表中。"
+      description="离线演练改写与还原流程，不发送网络请求。"
       width="max-w-xl"
       footer={
         <>
@@ -126,7 +135,7 @@ export function SimulateDialog({ open, onClose }: { open: boolean; onClose: () =
               <span className="text-warn">内容以 JSON 开头但无法解析，请检查括号与引号。</span>
             ) : (
               <>
-                留空则使用该工具的内置示例。粘贴真实请求体可以检验规则是否命中。<Kbd>Ctrl</Kbd> + <Kbd>Enter</Kbd> 发送。
+                留空使用内置示例 · <Kbd>Ctrl</Kbd> + <Kbd>Enter</Kbd> 发送
               </>
             )
           }
@@ -148,6 +157,11 @@ export function SimulateDialog({ open, onClose }: { open: boolean; onClose: () =
             className={cx(inputClass, 'w-full resize-y py-2 font-mono text-xs leading-5')}
           />
         </Field>
+        {error && (
+          <Callout tone="danger" title="模拟请求失败">
+            {error}
+          </Callout>
+        )}
       </form>
     </Dialog>
   );

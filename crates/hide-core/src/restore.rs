@@ -7,10 +7,10 @@
 
 use crate::config::ToolCallSecretPolicy;
 use crate::protocol::is_structural_key;
-use crate::vault::{reserialize_like, Matcher};
+use crate::vault::{reserialize_like, Matcher, MAX_JSON_DEPTH};
 use serde_json::Value;
 
-/// Fields in which tool arguments carry file content the user asked to write.
+/// Fields in which file-editing tools carry file content the user asked to write.
 const FILE_EDIT_KEYS: &[&str] = &[
     "content",
     "old_string",
@@ -26,11 +26,41 @@ const FILE_EDIT_KEYS: &[&str] = &[
     "replacement",
 ];
 
+/// Only explicit file-editing tools may receive restored secrets under `FileEditsOnly`.
+/// All other tools (`Bash`, `shell`, network/MCP tools, unknown names) stay redacted.
+const FILE_EDIT_TOOLS: &[&str] = &[
+    "write",
+    "edit",
+    "multiedit",
+    "notebookedit",
+    "write_file",
+    "write_to_file",
+    "create_file",
+    "edit_file",
+    "str_replace",
+    "str_replace_editor",
+    "str_replace_based_edit_tool",
+    "apply_patch",
+    "patch_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+    "insert_edit_into_file",
+    "save-file",
+    "update_file",
+    "search_replace",
+];
+
+pub fn is_file_edit_tool(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    FILE_EDIT_TOOLS.contains(&lower.as_str())
+}
+
 #[derive(Clone, Copy)]
 struct Ctx<'a> {
     policy: ToolCallSecretPolicy,
     tool: bool,
-    key: Option<&'a str>,
+    tool_name: Option<&'a str>,
+    in_edit_key: bool,
 }
 
 impl Ctx<'_> {
@@ -41,7 +71,7 @@ impl Ctx<'_> {
         match self.policy {
             ToolCallSecretPolicy::Always => true,
             ToolCallSecretPolicy::Never => false,
-            ToolCallSecretPolicy::FileEditsOnly => self.key.is_some_and(|k| FILE_EDIT_KEYS.contains(&k)),
+            ToolCallSecretPolicy::FileEditsOnly => self.in_edit_key && self.tool_name.is_some_and(is_file_edit_tool),
         }
     }
 }
@@ -72,15 +102,27 @@ pub fn restore_value(matcher: &Matcher, value: &mut Value, policy: ToolCallSecre
         Ctx {
             policy,
             tool: false,
-            key: None,
+            tool_name: None,
+            in_edit_key: false,
         },
         &mut withheld,
+        0,
     );
     (n, withheld)
 }
 
 /// Restore a complete tool-arguments document (streamed `arguments` / `partial_json`).
 pub fn restore_tool_args(matcher: &Matcher, value: &mut Value, policy: ToolCallSecretPolicy) -> (usize, usize) {
+    restore_tool_args_for_tool(matcher, value, policy, None)
+}
+
+/// Restore a complete tool-arguments document with the calling tool's name for `FileEditsOnly` enforcement.
+pub fn restore_tool_args_for_tool(
+    matcher: &Matcher,
+    value: &mut Value,
+    policy: ToolCallSecretPolicy,
+    tool_name: Option<&str>,
+) -> (usize, usize) {
     let mut withheld = 0;
     let n = walk(
         matcher,
@@ -88,48 +130,82 @@ pub fn restore_tool_args(matcher: &Matcher, value: &mut Value, policy: ToolCallS
         Ctx {
             policy,
             tool: true,
-            key: None,
+            tool_name,
+            in_edit_key: false,
         },
         &mut withheld,
+        0,
     );
     (n, withheld)
 }
 
-fn walk(m: &Matcher, value: &mut Value, ctx: Ctx, withheld: &mut usize) -> usize {
+fn walk(m: &Matcher, value: &mut Value, ctx: Ctx, withheld: &mut usize, depth: usize) -> usize {
+    if depth >= MAX_JSON_DEPTH {
+        if let Value::String(text) = value {
+            let (out, n, w) = m.restore(text, None, ctx.allow_secret());
+            *withheld += w;
+            *text = out;
+            return n;
+        }
+        return 0;
+    }
     match value {
         Value::Object(map) => {
             let block_type = map.get("type").and_then(Value::as_str).unwrap_or("").to_string();
             if matches!(
                 block_type.as_str(),
-                "redacted_thinking" | "image" | "document" | "input_image" | "input_file"
+                "redacted_thinking" | "image" | "document" | "input_image" | "input_file" | "reasoning"
             ) || map.contains_key("encrypted_content")
                 || map.contains_key("inlineData")
+                || map.contains_key("inline_data")
             {
                 return 0;
             }
+            let own_tool_name = map.get("name").and_then(Value::as_str).map(str::to_owned);
+            let effective_tool_name = own_tool_name.as_deref().or(ctx.tool_name);
             let mut count = 0;
             for (key, mut item) in std::mem::take(map) {
                 if (is_structural_key(&key) || key == "signature" || key == "data") && item.is_string() {
                     map.insert(key, item);
                     continue;
                 }
+                let is_tool_name_field = key == "name"
+                    && item.is_string()
+                    && (ctx.tool
+                        || matches!(
+                            block_type.as_str(),
+                            "tool_use" | "server_tool_use" | "custom_tool_call" | "function_call" | "mcp_call"
+                        ));
                 let tool = ctx.tool
-                    || (key == "input" && matches!(block_type.as_str(), "tool_use" | "server_tool_use"))
+                    || is_tool_name_field
+                    || (key == "input"
+                        && matches!(
+                            block_type.as_str(),
+                            "tool_use" | "server_tool_use" | "custom_tool_call" | "mcp_call"
+                        ))
                     || key == "arguments"
                     || key == "args";
                 let (new_key, kn, kw) = m.restore(&key, None, !tool || ctx.policy == ToolCallSecretPolicy::Always);
                 *withheld += kw;
+                let in_edit_key = if tool && !is_tool_name_field {
+                    ctx.in_edit_key
+                        || (effective_tool_name.is_some_and(is_file_edit_tool)
+                            && FILE_EDIT_KEYS.contains(&new_key.as_str()))
+                } else {
+                    false
+                };
                 let child = Ctx {
                     policy: ctx.policy,
                     tool,
-                    key: Some(new_key.as_str()),
+                    tool_name: effective_tool_name,
+                    in_edit_key,
                 };
-                count += kn + walk(m, &mut item, child, withheld);
+                count += kn + walk(m, &mut item, child, withheld, depth + 1);
                 map.insert(new_key, item);
             }
             count
         }
-        Value::Array(items) => items.iter_mut().map(|v| walk(m, v, ctx, withheld)).sum(),
+        Value::Array(items) => items.iter_mut().map(|v| walk(m, v, ctx, withheld, depth + 1)).sum(),
         Value::String(text) => {
             if !ctx.tool || ctx.policy == ToolCallSecretPolicy::Always {
                 if let Some(original) = m.json_value(text) {
@@ -138,9 +214,9 @@ fn walk(m: &Matcher, value: &mut Value, ctx: Ctx, withheld: &mut usize) -> usize
                 }
             }
             let trimmed = text.trim_start();
-            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            if (trimmed.starts_with('{') || trimmed.starts_with('[')) && depth + 1 < MAX_JSON_DEPTH {
                 if let Ok(mut inner) = serde_json::from_str::<Value>(text) {
-                    let n = walk(m, &mut inner, Ctx { key: None, ..ctx }, withheld);
+                    let n = walk(m, &mut inner, ctx, withheld, depth + 1);
                     if n > 0 {
                         *text = reserialize_like(text, &inner);
                     }
@@ -207,5 +283,82 @@ mod tests {
             let (out, _, _) = restore_response(&v.matcher(), &body.to_string(), policy);
             assert_eq!(out.contains("sk-ant-real-key"), expect_real);
         }
+    }
+
+    #[test]
+    fn custom_tool_call_input_respects_secret_policy() {
+        let v = vault();
+        let body = json!({"output": [{"type": "custom_tool_call", "call_id": "c1", "name": "shell",
+            "input": {"command": "echo sk-sem-placeholder-key-0001"}}]});
+        let (out_never, _, withheld) = restore_response(&v.matcher(), &body.to_string(), ToolCallSecretPolicy::Never);
+        assert!(!out_never.contains("sk-ant-real-key"));
+        assert_eq!(withheld, 1);
+
+        let (out_always, _, withheld_always) =
+            restore_response(&v.matcher(), &body.to_string(), ToolCallSecretPolicy::Always);
+        assert!(out_always.contains("sk-ant-real-key"));
+        assert_eq!(withheld_always, 0);
+    }
+
+    #[test]
+    fn non_edit_tool_cannot_bypass_file_edits_only_via_content_key_or_nested_json() {
+        let v = vault();
+        let nested = json!({"content": "KEY=sk-sem-placeholder-key-0001"}).to_string();
+        let body = json!({"content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash",
+             "input": {"content": "sk-sem-placeholder-key-0001", "command": nested}},
+            {"type": "tool_use", "id": "t2", "name": "Write",
+             "input": {"file_path": "/workspace/user_01/cfg.json", "content": "{\"token\":\"sk-sem-placeholder-key-0001\"}"}}
+        ]});
+        let (out, _, withheld) = restore_response(&v.matcher(), &body.to_string(), ToolCallSecretPolicy::FileEditsOnly);
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["content"][0]["input"]["content"], "sk-sem-placeholder-key-0001");
+        assert!(!parsed["content"][0]["input"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("sk-ant-real-key"));
+        assert_eq!(
+            parsed["content"][1]["input"]["content"],
+            "{\"token\":\"sk-ant-real-key-123456789\"}"
+        );
+        assert_eq!(withheld, 2);
+    }
+
+    #[test]
+    fn cursor_search_replace_tool_restores_secrets_in_edit_keys() {
+        let v = vault();
+        let args = json!({
+            "file_path": "/workspace/user_01/.env",
+            "old_string": "KEY=sk-sem-placeholder-key-0001",
+            "new_string": "KEY=sk-sem-placeholder-key-0001-updated"
+        })
+        .to_string();
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_sr_1",
+                        "function": {
+                            "name": "search_replace",
+                            "arguments": args
+                        }
+                    }]
+                }
+            }]
+        });
+        let (out, restored, withheld) =
+            restore_response(&v.matcher(), &body.to_string(), ToolCallSecretPolicy::FileEditsOnly);
+        assert!(restored >= 3);
+        assert_eq!(withheld, 0);
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let restored_args: Value = serde_json::from_str(
+            parsed["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored_args["file_path"], "/home/alice/.env");
+        assert_eq!(restored_args["old_string"], "KEY=sk-ant-real-key-123456789");
+        assert_eq!(restored_args["new_string"], "KEY=sk-ant-real-key-123456789-updated");
     }
 }

@@ -1,16 +1,20 @@
 use axum::{
+    extract::State,
     http::{header, HeaderMap, StatusCode, Uri},
     response::{Html, IntoResponse, Response},
-    routing::get,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
 use hide_core::{
-    build_router, harness::HarnessProfile, proxy::is_local_browser_request, vault::VaultEntry, GatewayState,
-    HarnessKind, HideConfig, TrafficAuditRecord, TrafficCategory,
+    build_gateway_service, build_router, harness::HarnessProfile, proxy::is_local_browser_request, vault::VaultEntry,
+    GatewayMakeService, GatewayState, HarnessKind, HideConfig, TrafficAuditRecord, TrafficCategory,
 };
 use std::net::SocketAddr;
-use std::process::Command;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
@@ -23,6 +27,13 @@ impl Default for DesktopBridge {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Clone)]
+struct UiRouterState {
+    gateway: GatewayState,
+    shutdown: Option<Arc<Notify>>,
+    ui_seen: Option<Arc<AtomicBool>>,
 }
 
 impl DesktopBridge {
@@ -72,122 +83,254 @@ impl DesktopBridge {
         self.state.simulate_traffic(harness, category, custom_payload)
     }
 
-    /// Build the self-contained desktop router serving both embedded UI and all proxy/API routes
-    pub fn build_desktop_router(&self) -> Router {
-        let core_router = build_router(self.state.clone());
-        let ui_router = Router::new()
+    fn ui_router_with_control(&self, shutdown: Option<Arc<Notify>>, ui_seen: Option<Arc<AtomicBool>>) -> Router {
+        let ui_state = UiRouterState {
+            gateway: self.state.clone(),
+            shutdown,
+            ui_seen,
+        };
+        Router::new()
             .route("/", get(serve_index))
             .route("/index.html", get(serve_index))
             .route("/assets/*file", get(serve_embedded_asset))
-            .with_state(self.state.clone());
-        ui_router.merge(core_router)
+            .route("/api/quit", post(api_desktop_quit))
+            .with_state(ui_state)
     }
 
-    /// Open the console in a chromeless browser window (Edge/Chrome `--app`), falling back to
-    /// the default browser. Each candidate is checked for real success, not just a spawn.
+    fn ui_router(&self) -> Router {
+        self.ui_router_with_control(None, None)
+    }
+
+    /// Build the self-contained desktop router serving both embedded UI and all proxy/API routes
+    pub fn build_desktop_router(&self) -> Router {
+        let core_router = build_router(self.state.clone());
+        self.ui_router().merge(core_router)
+    }
+
+    /// Build the single-port gateway service (HTTP CONNECT + selective AI MITM + embedded UI/API)
+    pub fn build_desktop_gateway_service(&self) -> GatewayMakeService {
+        build_gateway_service(self.state.clone(), Some(self.ui_router()))
+    }
+
+    fn build_desktop_gateway_service_with_control(
+        &self,
+        shutdown: Arc<Notify>,
+        ui_seen: Arc<AtomicBool>,
+    ) -> GatewayMakeService {
+        build_gateway_service(
+            self.state.clone(),
+            Some(self.ui_router_with_control(Some(shutdown), Some(ui_seen))),
+        )
+    }
+
+    /// Open the console URL in the system browser (used as headless / fallback launcher).
     pub fn launch_native_desktop_window(url: &str) {
-        if std::env::var("HIDE_GO_HEADLESS").is_ok() {
+        if !hide_chrome::can_open_gui() {
             return;
         }
-        let app = format!("--app={url}");
-        let size = "--window-size=1440,920".to_string();
-        let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
-
-        #[cfg(target_os = "windows")]
-        {
-            let env = |k: &str| std::env::var(k).unwrap_or_default();
-            for base in [env("ProgramFiles(x86)"), env("ProgramFiles"), env("LOCALAPPDATA")] {
-                if base.is_empty() {
-                    continue;
-                }
-                for rel in [
-                    r"Microsoft\Edge\Application\msedge.exe",
-                    r"Google\Chrome\Application\chrome.exe",
-                ] {
-                    let path = std::path::Path::new(&base).join(rel);
-                    if path.is_file() {
-                        candidates.push((path.display().to_string(), vec![app.clone(), size.clone()]));
-                    }
-                }
-            }
-            candidates.push((
-                "rundll32".into(),
-                vec!["url.dll,FileProtocolHandler".into(), url.to_string()],
-            ));
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            for bundle in [
-                "/Applications/Google Chrome.app",
-                "/Applications/Microsoft Edge.app",
-                "/Applications/Chromium.app",
-            ] {
-                if std::path::Path::new(bundle).exists() {
-                    candidates.push((
-                        "open".into(),
-                        vec!["-na".into(), bundle.into(), "--args".into(), app.clone(), size.clone()],
-                    ));
-                }
-            }
-            candidates.push(("open".into(), vec![url.to_string()]));
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            if std::env::var("DISPLAY").is_err() && std::env::var("WAYLAND_DISPLAY").is_err() {
-                return;
-            }
-            for bin in [
-                "google-chrome",
-                "google-chrome-stable",
-                "chromium",
-                "chromium-browser",
-                "microsoft-edge",
-            ] {
-                candidates.push((bin.into(), vec![app.clone(), size.clone()]));
-            }
-            candidates.push(("xdg-open".into(), vec![url.to_string()]));
-        }
-
-        for (bin, args) in candidates {
-            match Command::new(&bin).args(&args).spawn() {
-                // `open` / `xdg-open` exit immediately; a non-zero status means "no such app".
-                Ok(mut child) if bin == "open" || bin == "xdg-open" || bin == "rundll32" => {
-                    if child.wait().is_ok_and(|s| s.success()) {
-                        return;
-                    }
-                }
-                Ok(_) => return,
-                Err(_) => continue,
-            }
-        }
-        tracing::warn!("could not open a browser window; open {url} manually");
+        hide_chrome::open_browser_fallback(url);
     }
 
     pub async fn run_desktop_app(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let stopped = terminate_existing_if_enabled();
         let port = std::env::var("HIDE_GO_PORT")
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or_else(|| self.state.get_config().proxy_port);
 
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
+        let listener = bind_loopback_with_retry(port, stopped > 0)
+            .await
+            .map_err(std::io::Error::other)?;
         let addr = listener.local_addr()?;
         // Update only the live runtime port so an ephemeral HIDE_GO_PORT or port 0
         // does not overwrite the user's persisted config.json.
         self.state.config.write().proxy_port = addr.port();
-        let app = self.build_desktop_router();
+        let shutdown = Arc::new(Notify::new());
+        let ui_seen = Arc::new(AtomicBool::new(false));
+        let app = self.build_desktop_gateway_service_with_control(shutdown.clone(), ui_seen);
 
         let ui_url = format!("http://{}", addr);
         tracing::info!("Hide-Go Standalone Desktop App running at {}", ui_url);
+        if !hide_chrome::can_open_gui() && std::env::var_os("HIDE_GO_ADMIN_TOKEN").is_none() {
+            tracing::info!("Hide-Go headless desktop console started (set HIDE_GO_ADMIN_TOKEN to pin API auth)");
+        }
         Self::launch_native_desktop_window(&ui_url);
 
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                tokio::select! {
+                    _ = shutdown.notified() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Run the desktop app with a native frameless desktop WebView window on the main thread
+    /// and the async privacy gateway server running on a background Tokio runtime.
+    pub fn run_desktop_app_blocking(self) -> Result<(), Box<dyn std::error::Error>> {
+        if !hide_chrome::can_open_gui() {
+            let rt = tokio::runtime::Runtime::new()?;
+            return rt.block_on(self.run_desktop_app());
+        }
+
+        let keep_existing = std::env::var_os("HIDE_GO_KEEP_EXISTING").is_some();
+        let stopped = terminate_existing_if_enabled();
+        let port = std::env::var("HIDE_GO_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or_else(|| self.state.get_config().proxy_port);
+        let shutdown = Arc::new(Notify::new());
+        let ui_seen = Arc::new(AtomicBool::new(false));
+        let app = self.build_desktop_gateway_service_with_control(shutdown.clone(), ui_seen.clone());
+        let state = self.state.clone();
+        let shutdown_server = shutdown.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<String, String>>(1);
+
+        let server_thread = std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string()));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let listener = match bind_loopback_with_retry(port, stopped > 0).await {
+                    Ok(l) => l,
+                    Err(msg) => {
+                        let _ = tx.send(Err(msg));
+                        return;
+                    }
+                };
+                let addr = match listener.local_addr() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("local_addr failed: {e}")));
+                        return;
+                    }
+                };
+                state.config.write().proxy_port = addr.port();
+                let ui_url = format!("http://{addr}/");
+                tracing::info!("Hide-Go Standalone Desktop App running at {}", ui_url);
+                let _ = tx.send(Ok(ui_url));
+                if let Err(e) = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        tokio::select! {
+                            _ = shutdown_server.notified() => {}
+                            _ = tokio::signal::ctrl_c() => {}
+                        }
+                    })
+                    .await
+                {
+                    tracing::error!("desktop gateway server error: {e}");
+                }
+            });
+        });
+
+        let ui_url = rx
+            .recv()
+            .map_err(|e| format!("desktop server startup channel closed: {e}"))?
+            .map_err(|e| format!("failed to start desktop server: {e}"))?;
+
+        let (webview_dir, temp_webview_dir) = desktop_webview_data_dir();
+        let window_res = hide_chrome::run_frameless_window(hide_chrome::NativeWindowOptions {
+            title: "Hide-Go".into(),
+            url: ui_url.clone(),
+            width: 1380.0,
+            height: 880.0,
+            min_width: 960.0,
+            min_height: 640.0,
+            resizable: true,
+            cleanup_on_close: !keep_existing,
+            user_data_dir: Some(webview_dir),
+        });
+        if window_res.is_err() {
+            // Browser fallback stays non-blocking; guard against an invisible orphan process if no
+            // browser ever connects or when no console is attached.
+            tracing::warn!(
+                "Desktop UI opened in system browser at {ui_url}; use POST /api/quit or Ctrl+C to stop gateway"
+            );
+            let watchdog_shutdown = shutdown.clone();
+            let watchdog_seen = ui_seen.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(45));
+                if !watchdog_seen.load(Ordering::Relaxed) {
+                    tracing::warn!("no browser UI connected within 45s after WebView fallback; shutting down cleanly");
+                    watchdog_shutdown.notify_one();
+                }
+            });
+            let _ = server_thread.join();
+        } else {
+            shutdown.notify_one();
+            let _ = server_thread.join();
+        }
+        if let Some(tmp_dir) = temp_webview_dir {
+            let _ = std::fs::remove_dir_all(tmp_dir);
+        }
+        if !keep_existing {
+            hide_chrome::terminate_other_hide_go_processes();
+        }
         Ok(())
     }
 }
 
-fn render_index_html(token: &str) -> String {
+fn desktop_webview_data_dir() -> (PathBuf, Option<PathBuf>) {
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    #[cfg(windows)]
+    let persisted = env("LOCALAPPDATA")
+        .or_else(|| env("USERPROFILE"))
+        .map(|p| p.join("Hide-Go").join("WebView2"));
+    #[cfg(target_os = "macos")]
+    let persisted = env("HOME").map(|h| h.join("Library/Application Support/hide-go/webview"));
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let persisted = env("XDG_DATA_HOME")
+        .or_else(|| env("HOME").map(|h| h.join(".local/share")))
+        .map(|p| p.join("hide-go").join("webview"));
+
+    if let Some(dir) = persisted {
+        return (dir, None);
+    }
+    match hide_chrome::create_private_temp_dir("hide-go-webview") {
+        Ok(dir) => (dir.clone(), Some(dir)),
+        Err(_) => (std::env::temp_dir().join("Hide-Go-WebView2"), None),
+    }
+}
+
+fn terminate_existing_if_enabled() -> usize {
+    if std::env::var_os("HIDE_GO_KEEP_EXISTING").is_some() {
+        return 0;
+    }
+    let stopped = hide_chrome::terminate_other_hide_go_processes();
+    if stopped > 0 {
+        tracing::info!("terminated {stopped} existing Hide-Go background process(es)");
+    }
+    stopped
+}
+
+async fn bind_loopback_with_retry(port: u16, had_existing: bool) -> Result<TcpListener, String> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let attempts = if had_existing { 12 } else { 1 };
+    for attempt in 0..attempts {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                if attempt + 1 < attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                return Err(format!(
+                    "本地端口 {port} 已被占用。\n\n请先关闭占用该端口的程序后重试，或设置环境变量 HIDE_GO_PORT 指定其他端口。\n({e})"
+                ));
+            }
+            Err(e) => return Err(format!("bind failed: {e}")),
+        }
+    }
+    unreachable!()
+}
+
+fn render_index_html(token: &str, nonce: &str) -> String {
     let token_json = serde_json::to_string(token)
         .expect("admin token must serialize as a JSON string")
         .replace('<', "\\u003c")
@@ -195,31 +338,77 @@ fn render_index_html(token: &str) -> String {
         .replace('&', "\\u0026")
         .replace('\u{2028}', "\\u2028")
         .replace('\u{2029}', "\\u2029");
-    let token_script = format!("<script>window.__HIDE_GO_TOKEN__={token_json};</script></head>");
-    EMBEDDED_INDEX_HTML.replacen("</head>", &token_script, 1)
+    let token_script = format!("<script nonce=\"{nonce}\">window.__HIDE_GO_TOKEN__={token_json};</script></head>");
+    EMBEDDED_INDEX_HTML
+        .replace("nonce=\"__HIDE_GO_NONCE__\"", &format!("nonce=\"{nonce}\""))
+        .replacen("</head>", &token_script, 1)
 }
 
-async fn serve_index(axum::extract::State(state): axum::extract::State<GatewayState>, headers: HeaderMap) -> Response {
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let mut diff = ab.len() ^ bb.len();
+    for i in 0..ab.len().min(bb.len()) {
+        diff |= (ab[i] ^ bb[i]) as usize;
+    }
+    diff == 0
+}
+
+async fn api_desktop_quit(State(state): State<UiRouterState>, headers: HeaderMap) -> Response {
     if !is_local_browser_request(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let expected = state.gateway.admin_token();
+    let supplied = headers
+        .get("x-hide-go-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .or_else(|| {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|a| a.split_once(' '))
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                .map(|(_, t)| t.trim())
+        });
+    if !supplied.is_some_and(|t| constant_time_eq(t, expected)) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(shutdown) = state.shutdown {
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            shutdown.notify_one();
+        });
+    }
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+async fn serve_index(State(state): State<UiRouterState>, headers: HeaderMap) -> Response {
+    if !is_local_browser_request(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Some(seen) = &state.ui_seen {
+        seen.store(true, Ordering::Relaxed);
+    }
+
+    let nonce = hide_chrome::generate_csp_nonce();
+    let csp = format!(
+        "default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+    );
 
     // No cookie: browsers send 127.0.0.1 cookies to every local port. The token only lives in
     // this no-store page and is sent as a header by the console.
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-store"),
-            (header::REFERRER_POLICY, "no-referrer"),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-            (header::X_FRAME_OPTIONS, "DENY"),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
-            ),
+            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+            (header::REFERRER_POLICY, "no-referrer".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (header::X_FRAME_OPTIONS, "DENY".to_string()),
+            (header::CONTENT_SECURITY_POLICY, csp),
         ],
-        Html(render_index_html(state.admin_token())),
+        Html(render_index_html(state.gateway.admin_token(), &nonce)),
     )
         .into_response()
 }
@@ -292,11 +481,15 @@ mod tests {
     #[test]
     fn index_token_is_json_and_cannot_close_the_script() {
         let token = "</script><script>alert(\"x\")</script>&'\\\n\r\t\0\u{001b}\u{2028}\u{2029}";
-        let html = render_index_html(token);
-        let (_, script) = html.split_once("<script>window.__HIDE_GO_TOKEN__=").unwrap();
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let html = render_index_html(token, nonce);
+        let (_, script) = html
+            .split_once(&format!("<script nonce=\"{nonce}\">window.__HIDE_GO_TOKEN__="))
+            .unwrap();
         let (json, _) = script.split_once(";</script>").unwrap();
         assert!(!json.contains(['<', '>', '&', '\u{2028}', '\u{2029}']));
         assert_eq!(serde_json::from_str::<String>(json).unwrap(), token);
+        assert!(!html.contains("__HIDE_GO_NONCE__"));
         assert_eq!(
             html.matches("</script>").count(),
             EMBEDDED_INDEX_HTML.matches("</script>").count() + 1
@@ -305,7 +498,11 @@ mod tests {
 
     #[tokio::test]
     async fn local_index_is_not_cached_and_sets_no_cookie() {
-        let state = GatewayState::default();
+        let state = UiRouterState {
+            gateway: GatewayState::default(),
+            shutdown: None,
+            ui_seen: None,
+        };
         for host in ["127.0.0.1:18787", "localhost:1420", "[::1]:43210"] {
             for origin in [None, Some(format!("http://{host}"))] {
                 let mut headers = HeaderMap::new();
@@ -319,16 +516,33 @@ mod tests {
                 assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
                 assert_eq!(response.headers()[header::CONTENT_TYPE], "text/html; charset=utf-8");
                 assert!(!response.headers().contains_key(header::SET_COOKIE));
-                assert!(response.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+                let csp = response.headers()[header::CONTENT_SECURITY_POLICY]
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let script_src = csp
+                    .split(';')
+                    .find(|d| d.trim_start().starts_with("script-src"))
+                    .unwrap();
+                assert!(!script_src.contains("'unsafe-inline'"));
+                let nonce = script_src.split("'nonce-").nth(1).unwrap().split('\'').next().unwrap();
+                assert_eq!(nonce.len(), 32);
                 let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-                assert_eq!(body.as_ref(), render_index_html(state.admin_token()).as_bytes());
+                assert_eq!(
+                    body.as_ref(),
+                    render_index_html(state.gateway.admin_token(), nonce).as_bytes()
+                );
             }
         }
     }
 
     #[tokio::test]
     async fn index_rejects_rebinding_and_cross_origin_requests() {
-        let state = GatewayState::default();
+        let state = UiRouterState {
+            gateway: GatewayState::default(),
+            shutdown: None,
+            ui_seen: None,
+        };
         let cases = [
             (None, None),
             (Some("attacker.example:18787"), None),
@@ -363,5 +577,34 @@ mod tests {
                 assert!(!String::from_utf8_lossy(&body).contains("__HIDE_GO_TOKEN__"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn desktop_quit_requires_local_origin_and_admin_token() {
+        let state = UiRouterState {
+            gateway: GatewayState::default(),
+            shutdown: Some(Arc::new(Notify::new())),
+            ui_seen: None,
+        };
+        let mut no_tok = HeaderMap::new();
+        no_tok.insert(header::HOST, "127.0.0.1:18787".parse().unwrap());
+        assert_eq!(
+            api_desktop_quit(State(state.clone()), no_tok).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut evil = HeaderMap::new();
+        evil.insert(header::HOST, "127.0.0.1:18787".parse().unwrap());
+        evil.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        evil.insert("x-hide-go-token", state.gateway.admin_token().parse().unwrap());
+        assert_eq!(
+            api_desktop_quit(State(state.clone()), evil).await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let mut ok = HeaderMap::new();
+        ok.insert(header::HOST, "127.0.0.1:18787".parse().unwrap());
+        ok.insert("x-hide-go-token", state.gateway.admin_token().parse().unwrap());
+        assert_eq!(api_desktop_quit(State(state), ok).await.status(), StatusCode::OK);
     }
 }
