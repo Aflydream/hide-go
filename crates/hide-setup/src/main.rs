@@ -10,13 +10,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use hide_core::config::{HarnessKind, HideConfig};
+use hide_core::config::{HarnessKind, HideConfig, UiLanguage};
 use hide_core::harness_detect::{connect_harness, detect_all_harness_profiles};
 use hide_core::proxy::is_local_browser_request;
 use installer::{
-    configured_proxy_port, current_platform, default_install_dir, desktop_bin_name, detect_existing_install,
-    is_reparse_or_symlink, manifest_path, perform_install, perform_uninstall, same_path, schedule_self_cleanup,
-    validate_install_dir, EmbeddedPayloads, InstallManifest, InstallOptions, UninstallOptions,
+    configured_language, configured_proxy_port, current_platform, default_install_dir, desktop_bin_name,
+    detect_existing_install, is_reparse_or_symlink, manifest_path, perform_install, perform_uninstall, same_path,
+    schedule_self_cleanup, validate_install_dir, EmbeddedPayloads, InstallManifest, InstallOptions, UninstallOptions,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -32,6 +32,28 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 include!(concat!(env!("OUT_DIR"), "/embedded_setup_assets.rs"));
+
+const LOCALE_ZH_CN_JSON: &str = include_str!("../../../src/locales/zh-CN.json");
+const LOCALE_EN_JSON: &str = include_str!("../../../src/locales/en.json");
+
+fn locale_map(raw: &str) -> HashMap<String, String> {
+    serde_json::from_str(raw).expect("embedded locale JSON must be a flat string map")
+}
+
+fn setup_msg(locale: &str, key: &str) -> String {
+    static ZH: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    static EN: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    let en = || EN.get_or_init(|| locale_map(LOCALE_EN_JSON));
+    let map = if locale == "zh-CN" {
+        ZH.get_or_init(|| locale_map(LOCALE_ZH_CN_JSON))
+    } else {
+        en()
+    };
+    map.get(key)
+        .or_else(|| en().get(key))
+        .cloned()
+        .unwrap_or_else(|| key.to_string())
+}
 
 fn payloads() -> EmbeddedPayloads<'static> {
     EmbeddedPayloads {
@@ -58,6 +80,8 @@ struct SetupInfoResponse {
     mode: &'static str,
     version: &'static str,
     platform: &'static str,
+    system_locale: &'static str,
+    language: UiLanguage,
     has_embedded_binaries: bool,
     default_install_dir: String,
     already_installed: bool,
@@ -83,6 +107,8 @@ struct LaunchReq {
 #[serde(rename_all = "camelCase")]
 struct PickDirReq {
     initial_dir: Option<String>,
+    #[serde(default)]
+    locale: Option<String>,
 }
 
 struct CliArgs {
@@ -140,6 +166,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut it: I, exe_is_uninstall: bool
 }
 
 fn render_setup_html(token: &str, nonce: &str) -> String {
+    let sys_locale = hide_chrome::detect_system_locale();
     let token_json = serde_json::to_string(token)
         .expect("setup token must serialize as JSON string")
         .replace('<', "\\u003c")
@@ -150,6 +177,8 @@ fn render_setup_html(token: &str, nonce: &str) -> String {
     let token_script =
         format!("<script nonce=\"{nonce}\">window.__HIDE_GO_SETUP_TOKEN__={token_json};</script></head>");
     EMBEDDED_SETUP_HTML
+        .replacen("<html lang=\"zh-CN\">", &format!("<html lang=\"{sys_locale}\">"), 1)
+        .replace("__HIDE_GO_LOCALE__", sys_locale)
         .replace("nonce=\"__HIDE_GO_NONCE__\"", &format!("nonce=\"{nonce}\""))
         .replacen("</head>", &token_script, 1)
 }
@@ -223,11 +252,14 @@ async fn api_setup_info(State(state): State<SetupState>) -> Response {
         let existing = detect_existing_install();
         let cfg_path = HideConfig::default_path();
         let port = configured_proxy_port(cfg_path.as_deref());
+        let language = configured_language(cfg_path.as_deref());
         let harnesses = detect_all_harness_profiles(port, &HashMap::new());
         SetupInfoResponse {
             mode: state.mode,
             version: env!("CARGO_PKG_VERSION"),
             platform: current_platform(),
+            system_locale: hide_chrome::detect_system_locale(),
+            language,
             has_embedded_binaries: EMBEDDED_DESKTOP_BIN.is_some() && EMBEDDED_DAEMON_BIN.is_some(),
             default_install_dir: default_install_dir().to_string_lossy().into_owned(),
             already_installed: existing.is_some(),
@@ -245,14 +277,19 @@ async fn api_setup_info(State(state): State<SetupState>) -> Response {
 }
 
 async fn api_setup_pick_dir(body: Option<Json<PickDirReq>>) -> Response {
-    let initial = body
-        .and_then(|Json(req)| req.initial_dir)
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let initial = req
+        .initial_dir
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
-    match tokio::task::spawn_blocking(move || hide_chrome::pick_folder("选择 Hide-Go 安装目录", initial.as_deref()))
-        .await
-    {
+    let locale = req
+        .locale
+        .as_deref()
+        .map(hide_chrome::normalize_locale_tag)
+        .unwrap_or_else(hide_chrome::detect_system_locale);
+    let title = setup_msg(locale, "setup.pickDirTitle");
+    match tokio::task::spawn_blocking(move || hide_chrome::pick_folder(&title, initial.as_deref())).await {
         Ok(chosen) => Json(serde_json::json!({
             "path": chosen.map(|p| p.to_string_lossy().into_owned())
         }))
@@ -445,6 +482,7 @@ fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                     create_shortcuts: cli.create_shortcuts,
                     add_to_path: cli.add_to_path,
                     autostart_daemon: cli.autostart_daemon,
+                    language: None,
                 },
                 &payloads(),
             );
@@ -523,16 +561,19 @@ fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("setup startup channel closed: {e}"))?
         .map_err(|e| format!("failed to start setup server: {e}"))?;
 
-    let title = if cli.mode == "uninstall" {
-        "Hide-Go 卸载向导"
+    let resolved_locale =
+        configured_language(HideConfig::default_path().as_deref()).resolve(hide_chrome::detect_system_locale());
+    let title_key = if cli.mode == "uninstall" {
+        "setup.windowTitle.uninstall"
     } else {
-        "Hide-Go 安装向导"
+        "setup.windowTitle.install"
     };
+    let title = setup_msg(resolved_locale, title_key);
 
     if hide_chrome::can_open_gui() {
         let (webview_dir, temp_webview_dir) = setup_webview_data_dir();
         let win_res = hide_chrome::run_frameless_window(hide_chrome::NativeWindowOptions {
-            title: title.into(),
+            title,
             url: url.clone(),
             width: 840.0,
             height: 580.0,
@@ -726,5 +767,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad_launch.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn locale_resource_files_have_exact_key_parity_and_setup_titles() {
+        use std::collections::BTreeSet;
+
+        let zh = locale_map(LOCALE_ZH_CN_JSON);
+        let en = locale_map(LOCALE_EN_JSON);
+        let zh_keys: BTreeSet<&String> = zh.keys().collect();
+        let en_keys: BTreeSet<&String> = en.keys().collect();
+        assert_eq!(zh_keys, en_keys, "zh-CN.json and en.json keys diverged");
+
+        for key in [
+            "setup.windowTitle.install",
+            "setup.windowTitle.uninstall",
+            "setup.pickDirTitle",
+        ] {
+            let zh_val = setup_msg("zh-CN", key);
+            let en_val = setup_msg("en", key);
+            assert_ne!(zh_val, key, "missing zh-CN key {key}");
+            assert_ne!(en_val, key, "missing en key {key}");
+            assert!(!zh_val.trim().is_empty());
+            assert!(!en_val.trim().is_empty());
+        }
     }
 }

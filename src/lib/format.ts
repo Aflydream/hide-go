@@ -1,79 +1,122 @@
 import type { CoverTheme, FindingKind, HarnessKind, PrivacyMode, Severity, ToolCallSecretPolicy, TrafficCategory } from '../types';
-
-export const HARNESS_LABEL: Record<HarnessKind, string> = {
-  'claude-code': 'Claude Code',
-  codex: 'Codex',
-  antigravity: 'Antigravity',
-  zcode: 'ZCode',
-  qoder: 'Qoder',
-  cursor: 'Cursor',
-  'grok-build': 'Grok Build',
-  generic: '通用',
-};
+import { LOCALE_META, translate, type Locale, type MessageKey } from './i18n';
 
 export const HARNESS_ORDER: HarnessKind[] = ['claude-code', 'codex', 'antigravity', 'zcode', 'qoder', 'cursor', 'grok-build'];
-
-export const CATEGORY_LABEL: Record<TrafficCategory, string> = {
-  'interactive-prompt': '对话推理',
-  'tool-execution-sync': '工具回传',
-  'codebase-indexing': '代码索引',
-  telemetry: '遥测',
-};
-
-export const MODE_LABEL: Record<PrivacyMode, string> = {
-  'audit-only': '仅审计',
-  'auto-desensitize': '自动脱敏',
-  'all-hide': 'All-Hide',
-};
-
-export const COVER_THEME_LABEL: Record<CoverTheme, string> = {
-  'botanical-garden': '植物园温室',
-  'library-catalog': '图书馆编目',
-  'bakery-recipe': '烘焙坊配方',
-};
-
-export const POLICY_LABEL: Record<ToolCallSecretPolicy, string> = {
-  never: '始终保留占位符',
-  'file-edits-only': '仅文件写入时还原',
-  always: '全部还原',
-};
-
-export const FINDING_LABEL: Record<FindingKind, string> = {
-  'api-key': 'API 密钥',
-  'private-key': '私钥',
-  'database-url': '数据库连接串',
-  'internal-ip': '内网 IP',
-  'internal-domain': '内部域名',
-  'project-path': '本机路径',
-  'email-or-pii': '邮箱 / 身份',
-  'git-metadata': '后台上传',
-  'env-secret': '配置密钥',
-  'custom-keyword': '自定义规则',
-  'proprietary-code-symbol': '代码伪装',
-};
-
-export const VAULT_CATEGORY_LABEL: Record<string, string> = {
-  ApiKey: 'API 密钥',
-  PrivateKey: '私钥',
-  DatabaseUrl: '数据库连接串',
-  InternalIp: '内网 IP',
-  InternalDomain: '内部域名',
-  ProjectPath: '本机路径',
-  EmailOrPii: '邮箱 / 身份',
-  EnvSecret: '配置密钥',
-  CustomKeyword: '自定义规则',
-  IsomorphicSymbol: '伪装标识符',
-  CoverComment: '伪装注释',
-  StrictStringLiteral: '字符串字面量',
-  StrictLiteral: '字面量',
-  CipherGarble: '加密块',
-};
-
+export const COVER_THEMES: CoverTheme[] = ['botanical-garden', 'library-catalog', 'bakery-recipe'];
 export const SEVERITY_RANK: Record<Severity, number> = { critical: 4, high: 3, medium: 2, low: 1 };
-export const SEVERITY_LABEL: Record<Severity, string> = { critical: '严重', high: '高', medium: '中', low: '低' };
+
+const HARNESS_KEYS: Record<HarnessKind, MessageKey> = {
+  'claude-code': 'harness.claude-code',
+  codex: 'harness.codex',
+  antigravity: 'harness.antigravity',
+  zcode: 'harness.zcode',
+  qoder: 'harness.qoder',
+  cursor: 'harness.cursor',
+  'grok-build': 'harness.grok-build',
+  generic: 'harness.generic',
+};
+
+export function getHarnessLabel(kind: HarnessKind, locale: Locale): string {
+  return HARNESS_KEYS[kind] ? translate(locale, HARNESS_KEYS[kind]) : kind;
+}
+
+const CATEGORY_KEYS: Record<TrafficCategory, MessageKey> = {
+  'interactive-prompt': 'category.interactive-prompt',
+  'tool-execution-sync': 'category.tool-execution-sync',
+  'codebase-indexing': 'category.codebase-indexing',
+  telemetry: 'category.telemetry',
+};
+
+export function getCategoryLabel(category: TrafficCategory, locale: Locale): string {
+  return CATEGORY_KEYS[category] ? translate(locale, CATEGORY_KEYS[category]) : category;
+}
+
+const MODE_KEYS: Record<PrivacyMode, MessageKey> = {
+  'audit-only': 'mode.auditOnly',
+  'auto-desensitize': 'mode.autoDesensitize',
+  'all-hide': 'mode.allHide',
+};
+
+export function getModeLabel(mode: PrivacyMode, locale: Locale): string {
+  return MODE_KEYS[mode] ? translate(locale, MODE_KEYS[mode]) : mode;
+}
+
+const COVER_THEME_KEYS: Record<CoverTheme, MessageKey> = {
+  'botanical-garden': 'coverTheme.botanical-garden',
+  'library-catalog': 'coverTheme.library-catalog',
+  'bakery-recipe': 'coverTheme.bakery-recipe',
+};
+
+export function getCoverThemeLabel(theme: CoverTheme, locale: Locale): string {
+  return COVER_THEME_KEYS[theme] ? translate(locale, COVER_THEME_KEYS[theme]) : theme;
+}
+
+const POLICY_KEYS: Record<ToolCallSecretPolicy, MessageKey> = {
+  never: 'toolPolicy.never',
+  'file-edits-only': 'toolPolicy.file-edits-only',
+  always: 'toolPolicy.always',
+};
+
+export function getPolicyLabel(policy: ToolCallSecretPolicy, locale: Locale): string {
+  return POLICY_KEYS[policy] ? translate(locale, POLICY_KEYS[policy]) : policy;
+}
+
+const FINDING_KEYS: Record<FindingKind, MessageKey> = {
+  'api-key': 'finding.api-key',
+  'private-key': 'finding.private-key',
+  'database-url': 'finding.database-url',
+  'internal-ip': 'finding.internal-ip',
+  'internal-domain': 'finding.internal-domain',
+  'project-path': 'finding.project-path',
+  'email-or-pii': 'finding.email-or-pii',
+  'git-metadata': 'finding.git-metadata',
+  'env-secret': 'finding.env-secret',
+  'custom-keyword': 'finding.custom-keyword',
+  'proprietary-code-symbol': 'finding.proprietary-code-symbol',
+};
+
+export function getFindingLabel(kind: FindingKind, locale: Locale): string {
+  return FINDING_KEYS[kind] ? translate(locale, FINDING_KEYS[kind]) : kind;
+}
+
+const VAULT_CATEGORY_KEYS: Record<string, MessageKey> = {
+  ApiKey: 'vaultCategory.ApiKey',
+  PrivateKey: 'vaultCategory.PrivateKey',
+  DatabaseUrl: 'vaultCategory.DatabaseUrl',
+  InternalIp: 'vaultCategory.InternalIp',
+  InternalDomain: 'vaultCategory.InternalDomain',
+  ProjectPath: 'vaultCategory.ProjectPath',
+  EmailOrPii: 'vaultCategory.EmailOrPii',
+  EnvSecret: 'vaultCategory.EnvSecret',
+  CustomKeyword: 'vaultCategory.CustomKeyword',
+  IsomorphicSymbol: 'vaultCategory.IsomorphicSymbol',
+  CoverComment: 'vaultCategory.CoverComment',
+  StrictStringLiteral: 'vaultCategory.StrictStringLiteral',
+  StrictLiteral: 'vaultCategory.StrictLiteral',
+  CipherGarble: 'vaultCategory.CipherGarble',
+};
+
+export function getVaultCategoryLabel(category: string, locale: Locale): string {
+  const key = VAULT_CATEGORY_KEYS[category];
+  return key ? translate(locale, key) : category;
+}
+
+const SEVERITY_KEYS: Record<Severity, MessageKey> = {
+  critical: 'severity.critical',
+  high: 'severity.high',
+  medium: 'severity.medium',
+  low: 'severity.low',
+};
+
+export function getSeverityLabel(severity: Severity, locale: Locale): string {
+  return SEVERITY_KEYS[severity] ? translate(locale, SEVERITY_KEYS[severity]) : severity;
+}
 
 /** Human description of what the gateway did with a request. */
-export function describeAction(action: string): { label: string; tone: 'brand' | 'warn' | 'danger' | 'neutral' | 'info' } {
+export function describeAction(
+  action: string,
+  locale: Locale,
+): { label: string; tone: 'brand' | 'warn' | 'danger' | 'neutral' | 'info' } {
   if (
     action.includes('stream-error') ||
     action.includes('upstream_') ||
@@ -82,13 +125,23 @@ export function describeAction(action: string): { label: string; tone: 'brand' |
     action.includes('invalid_upstream') ||
     action.includes('transformation_breaks')
   ) {
-    return { label: '转发失败', tone: 'danger' };
+    return { label: translate(locale, 'action.failed'), tone: 'danger' };
   }
-  if (action === 'telemetry-blocked') return { label: '遥测已拦截', tone: 'warn' };
-  if (action === 'chaff-injected') return { label: '诱饵替换', tone: 'warn' };
-  if (action === 'passed') return { label: '原样透传', tone: 'neutral' };
-  if (action === 'desensitized') return { label: '已脱敏', tone: 'brand' };
-  if (action.includes('all-hide') || action.includes('strict-literal')) return { label: 'All-Hide', tone: 'brand' };
+  if (action === 'telemetry-blocked') {
+    return { label: translate(locale, 'action.telemetryBlocked'), tone: 'warn' };
+  }
+  if (action === 'chaff-injected') {
+    return { label: translate(locale, 'action.chaffInjected'), tone: 'warn' };
+  }
+  if (action === 'passed') {
+    return { label: translate(locale, 'action.passed'), tone: 'neutral' };
+  }
+  if (action === 'desensitized') {
+    return { label: translate(locale, 'action.desensitized'), tone: 'brand' };
+  }
+  if (action.includes('all-hide') || action.includes('strict-literal')) {
+    return { label: translate(locale, 'action.allHide'), tone: 'brand' };
+  }
   return { label: action, tone: 'neutral' };
 }
 
@@ -98,20 +151,25 @@ export function formatBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-const NUMBER_FORMATTER = new Intl.NumberFormat('zh-CN');
+const numberFormatters = new Map<Locale, Intl.NumberFormat>();
 
-export function formatCount(n: number): string {
-  return NUMBER_FORMATTER.format(n);
+export function formatCount(n: number, locale: Locale): string {
+  let formatter = numberFormatters.get(locale);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat(LOCALE_META[locale].intlTag);
+    numberFormatters.set(locale, formatter);
+  }
+  return formatter.format(n);
 }
 
-export function formatDuration(totalSecs: number): string {
+export function formatDuration(totalSecs: number, locale: Locale): string {
   const d = Math.floor(totalSecs / 86400);
   const h = Math.floor((totalSecs % 86400) / 3600);
   const m = Math.floor((totalSecs % 3600) / 60);
-  if (d > 0) return `${d} 天 ${h} 小时`;
-  if (h > 0) return `${h} 小时 ${m} 分`;
-  if (m > 0) return `${m} 分钟`;
-  return `${totalSecs} 秒`;
+  if (d > 0) return translate(locale, 'time.daysHours', { d, h });
+  if (h > 0) return translate(locale, 'time.hoursMinutes', { h, m });
+  if (m > 0) return translate(locale, 'time.minutes', { m });
+  return translate(locale, 'time.seconds', { s: totalSecs });
 }
 
 export function formatLatency(ms: number): string {

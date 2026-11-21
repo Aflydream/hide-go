@@ -4,6 +4,7 @@ import { useStore } from '../store';
 import { api } from '../lib/api';
 import { Badge, Button, Callout, CopyButton, Segmented, Skeleton, cx, useToast } from '../components/ui';
 import { formatCount, proxyBase } from '../lib/format';
+import { localizeHarnessIntegrationNote, localizeHarnessTargets, translate, useI18n, type Locale } from '../lib/i18n';
 import type { CaStatus, HarnessKind, HarnessProfile } from '../types';
 import { useSimulate } from './SimulateDialog';
 
@@ -19,24 +20,26 @@ const FALLBACK_TARGETS: Partial<Record<HarnessProfile['kind'], string[]>> = {
   'grok-build': ['环境变量 GROK_XAI_API_BASE_URL / HTTPS_PROXY / NODE_EXTRA_CA_CERTS'],
 };
 
-function describeAutoConnectMode(profile: HarnessProfile): string {
-  const targets =
+function describeAutoConnectMode(profile: HarnessProfile, locale: Locale): string {
+  const rawTargets =
     profile.autoConnectTargets && profile.autoConnectTargets.length > 0
       ? profile.autoConnectTargets
       : (FALLBACK_TARGETS[profile.kind] ?? []);
-  const targetText = targets.join('、');
+  const targets = localizeHarnessTargets(rawTargets, locale);
+  const sep = locale === 'zh-CN' ? '、' : ', ';
+  const targetText = targets.join(sep);
 
   if (profile.autoConnectMode === 'configFile') {
     return targetText
-      ? `写入配置文件（${targetText}），修改前保留原设置备份`
-      : '写入配置文件与共享环境变量，修改前保留原设置备份';
+      ? translate(locale, 'integrations.modeConfig', { targets: targetText })
+      : translate(locale, 'integrations.modeConfigGeneric');
   }
   if (profile.autoConnectMode === 'envVar') {
     return targetText
-      ? `写入当前用户的持久化环境变量（${targetText}），支持一键回滚`
-      : '写入当前用户的持久化环境变量，支持一键回滚';
+      ? translate(locale, 'integrations.modeEnv', { targets: targetText })
+      : translate(locale, 'integrations.modeEnvGeneric');
   }
-  return '仅支持手动配置（请参考下方网关路由与临时环境变量说明）';
+  return translate(locale, 'integrations.modeManual');
 }
 
 function CaTrustCard({
@@ -58,8 +61,9 @@ function CaTrustCard({
   onExport: () => void;
   onRetry: () => void;
 }) {
+  const { t } = useI18n();
   return (
-    <section aria-label="本地根证书与 TLS 信任" className="mx-auto max-w-3xl px-8 pt-6">
+    <section aria-label={t('integrations.caSectionAria')} className="mx-auto max-w-3xl px-8 pt-6">
       <div className="rounded-md border border-line bg-surface-2 px-4 py-3.5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex min-w-0 items-center gap-2">
@@ -69,26 +73,26 @@ function CaTrustCard({
               weight={caStatus?.installedInOsStore ? 'fill' : 'regular'}
               className={caStatus?.installedInOsStore ? 'shrink-0 text-brand' : 'shrink-0 text-warn'}
             />
-            <h2 className="truncate text-sm font-semibold text-fg">本地根证书（HTTP CONNECT 选择性脱敏）</h2>
+            <h2 className="truncate text-sm font-semibold text-fg">{t('integrations.caTitle')}</h2>
             {!caStatus ? (
               caError ? (
                 <Badge tone="danger" dot>
-                  状态获取失败
+                  {t('integrations.caFetchFailed')}
                 </Badge>
               ) : (
                 <Skeleton className="h-5 w-24" />
               )
             ) : !caStatus.ready ? (
               <Badge tone="danger" dot>
-                证书未就绪
+                {t('integrations.caNotReady')}
               </Badge>
             ) : caStatus.installedInOsStore ? (
               <Badge tone="brand" dot>
-                已信任
+                {t('integrations.caTrusted')}
               </Badge>
             ) : (
               <Badge tone="warn" dot>
-                需安装本地根证书
+                {t('integrations.caNeedsTrust')}
               </Badge>
             )}
           </div>
@@ -96,7 +100,7 @@ function CaTrustCard({
           <div className="flex flex-wrap items-center gap-2">
             {caError && (
               <Button size="sm" variant="ghost" onClick={onRetry}>
-                重试
+                {t('common.retry')}
               </Button>
             )}
             {caStatus && !caStatus.installedInOsStore && (
@@ -107,12 +111,12 @@ function CaTrustCard({
                 disabled={busy || !caStatus.ready || !caStatus.osTrustSupported}
                 onClick={onTrust}
               >
-                安装并信任根证书
+                {t('integrations.caTrustBtn')}
               </Button>
             )}
             {caStatus && caStatus.installedInOsStore && (
               <Button size="sm" variant="secondary" icon={<LinkBreak size={14} />} disabled={busy} onClick={onUntrust}>
-                卸载证书信任
+                {t('integrations.caUntrustBtn')}
               </Button>
             )}
             <Button
@@ -122,7 +126,7 @@ function CaTrustCard({
               disabled={exporting || !caStatus?.ready}
               onClick={onExport}
             >
-              导出证书
+              {t('integrations.caExportBtn')}
             </Button>
           </div>
         </div>
@@ -134,52 +138,59 @@ function CaTrustCard({
         ) : caStatus && (!caStatus.installedInOsStore || !caStatus.osTrustSupported) ? (
           <div className="mt-3 space-y-1.5 border-t border-line pt-2.5 text-xs">
             <div className="flex items-center justify-between gap-3">
-              <span className="shrink-0 text-fg-subtle">证书路径</span>
+              <span className="shrink-0 text-fg-subtle">{t('integrations.caPathLabel')}</span>
               <div className="flex min-w-0 items-center gap-1">
                 <code className="truncate font-mono text-fg-muted" title={caStatus.caCertPath}>
                   {caStatus.caCertPath}
                 </code>
-                <CopyButton compact text={caStatus.caCertPath} label="复制证书路径" />
+                <CopyButton compact text={caStatus.caCertPath} label={t('integrations.caCopyPath')} />
               </div>
             </div>
             {!caStatus.osTrustSupported && (
-              <p className="text-warn">{caStatus.osTrustDetail || '当前系统不支持一键安装信任，请点击「导出证书」后手动导入系统受信任根证书。'}</p>
+              <p className="text-warn">{caStatus.osTrustDetail || t('integrations.caManualFallback')}</p>
             )}
           </div>
         ) : null}
 
         <details className="mt-2.5 border-t border-line pt-2 text-2xs text-fg-subtle">
           <summary className="cursor-pointer select-none hover:text-fg-muted">
-            HTTPS 仅脱敏 AI API 主机，普通站点直连透传
+            {t('integrations.caSummary')}
           </summary>
           <div className="mt-2 space-y-1.5">
             <p className="leading-5">
-              拦截主机：<code className="font-mono text-fg-muted">api.openai.com</code>、
-              <code className="font-mono text-fg-muted">api.anthropic.com</code>、
-              <code className="font-mono text-fg-muted">generativelanguage.googleapis.com</code>、
-              <code className="font-mono text-fg-muted">api2.cursor.sh</code>、
-              <code className="font-mono text-fg-muted">*.qoder.*</code>、
-              <code className="font-mono text-fg-muted">api.x.ai</code>；GitHub、npm、OAuth 登录、网银等均直接透传，不解密。
+              {t('integrations.caHostsBefore')}
+              <code className="font-mono text-fg-muted">api.openai.com</code>
+              {', '}
+              <code className="font-mono text-fg-muted">api.anthropic.com</code>
+              {', '}
+              <code className="font-mono text-fg-muted">generativelanguage.googleapis.com</code>
+              {', '}
+              <code className="font-mono text-fg-muted">api2.cursor.sh</code>
+              {', '}
+              <code className="font-mono text-fg-muted">*.qoder.*</code>
+              {', '}
+              <code className="font-mono text-fg-muted">api.x.ai</code>
+              {t('integrations.caHostsAfter')}
             </p>
             {caStatus && (
               <div className="space-y-1 border-t border-line pt-2 text-xs">
                 <div className="flex items-center justify-between gap-3">
-                  <span className="shrink-0 text-fg-subtle">SHA-256 指纹</span>
+                  <span className="shrink-0 text-fg-subtle">{t('integrations.caFingerprintLabel')}</span>
                   <div className="flex min-w-0 items-center gap-1">
                     <code className="truncate font-mono text-fg-muted" title={caStatus.fingerprintSha256}>
                       {caStatus.fingerprintSha256}
                     </code>
-                    <CopyButton compact text={caStatus.fingerprintSha256} label="复制 SHA-256 指纹" />
+                    <CopyButton compact text={caStatus.fingerprintSha256} label={t('integrations.caCopyFingerprint')} />
                   </div>
                 </div>
                 {caStatus.installedInOsStore && caStatus.osTrustSupported && (
                   <div className="flex items-center justify-between gap-3">
-                    <span className="shrink-0 text-fg-subtle">证书路径</span>
+                    <span className="shrink-0 text-fg-subtle">{t('integrations.caPathLabel')}</span>
                     <div className="flex min-w-0 items-center gap-1">
                       <code className="truncate font-mono text-fg-muted" title={caStatus.caCertPath}>
                         {caStatus.caCertPath}
                       </code>
-                      <CopyButton compact text={caStatus.caCertPath} label="复制证书路径" />
+                      <CopyButton compact text={caStatus.caCertPath} label={t('integrations.caCopyPath')} />
                     </div>
                   </div>
                 )}
@@ -227,6 +238,7 @@ function ToolDetail({
   onRefresh: () => Promise<unknown>;
 }) {
   const { navigate } = useStore();
+  const { locale, t } = useI18n();
   const toast = useToast();
   const { run, busy: simBusy } = useSimulate();
   const [connecting, setConnecting] = useState(false);
@@ -234,6 +246,7 @@ function ToolDetail({
   const entry = `${proxyBase(port)}${profile.localProxyRoute}`;
   const snippet = shell === 'bash' ? profile.envSetupBash : profile.envSetupPowershell;
   const effectiveTraffic = Math.max(liveCount, profile.trafficCount);
+  const integrationNote = localizeHarnessIntegrationNote(profile.kind, profile.integrationNote, locale);
 
   const handleConnect = async () => {
     setConnecting(true);
@@ -241,12 +254,12 @@ function ToolDetail({
       const res = await api.connectHarness(profile.kind);
       toast.push({
         tone: res.ok ? 'brand' : 'warn',
-        title: res.ok ? `${profile.name} 已接入网关` : '无法自动接入',
+        title: res.ok ? t('integrations.connectedToast', { name: profile.name }) : t('integrations.cannotAutoToast'),
         body: res.message,
       });
       await onRefresh();
     } catch (e) {
-      toast.push({ tone: 'danger', title: '接入失败', body: (e as Error).message });
+      toast.push({ tone: 'danger', title: t('integrations.connectFailedToast'), body: (e as Error).message });
     } finally {
       setConnecting(false);
     }
@@ -258,16 +271,22 @@ function ToolDetail({
       const res = await api.disconnectHarness(profile.kind);
       toast.push({
         tone: res.ok ? 'brand' : 'danger',
-        title: res.ok ? `${profile.name} 已恢复原配置` : '断开失败',
+        title: res.ok ? t('integrations.disconnectedToast', { name: profile.name }) : t('integrations.disconnectFailedToast'),
         body: res.message,
       });
       await onRefresh();
     } catch (e) {
-      toast.push({ tone: 'danger', title: '断开失败', body: (e as Error).message });
+      toast.push({ tone: 'danger', title: t('integrations.disconnectFailedToast'), body: (e as Error).message });
     } finally {
       setConnecting(false);
     }
   };
+
+  const timeSuffix = profile.lastSeenAt
+    ? locale === 'zh-CN'
+      ? `（${profile.lastSeenAt}）`
+      : ` (${profile.lastSeenAt})`
+    : '';
 
   return (
     <article className="mx-auto max-w-3xl px-8 pb-10 pt-5">
@@ -275,31 +294,31 @@ function ToolDetail({
         <div className="flex flex-wrap items-center gap-2">
           <h2 className="text-lg font-semibold text-fg">{profile.name}</h2>
           {profile.installed ? (
-            <Badge tone="brand">已检测到本机安装</Badge>
+            <Badge tone="brand">{t('integrations.badgeInstalled')}</Badge>
           ) : (
-            <Badge>未检测到安装</Badge>
+            <Badge>{t('integrations.badgeNotInstalled')}</Badge>
           )}
           {profile.configured ? (
             <Badge tone="brand" dot>
-              已接入网关
+              {t('integrations.badgeConfigured')}
             </Badge>
           ) : (
-            <Badge dot>未配置接入</Badge>
+            <Badge dot>{t('integrations.badgeNotConfigured')}</Badge>
           )}
           {profile.detectedActive && (
             <Badge tone="info" dot>
-              实时流量 · {formatCount(effectiveTraffic)}
+              {t('integrations.badgeLiveTraffic', { count: formatCount(effectiveTraffic, locale) })}
             </Badge>
           )}
         </div>
         <p className="mt-1 text-xs text-fg-subtle">{profile.protocolFamily}</p>
-        {profile.integrationNote && (
+        {integrationNote && (
           <div className="mt-4">
             <Callout
               tone={profile.autoConnectMode === 'manual' ? 'warn' : 'info'}
-              title={profile.autoConnectMode === 'manual' ? '手动接入说明' : '接入说明'}
+              title={t(profile.autoConnectMode === 'manual' ? 'integrations.calloutManual' : 'integrations.calloutAuto')}
             >
-              {profile.integrationNote}
+              {integrationNote}
             </Callout>
           </div>
         )}
@@ -307,7 +326,7 @@ function ToolDetail({
           <div className="mt-4">
             <Callout
               tone="warn"
-              title="未信任本地根证书"
+              title={t('integrations.caWarnTitle')}
               action={
                 <Button
                   size="sm"
@@ -316,13 +335,13 @@ function ToolDetail({
                   disabled={caBusy || !caStatus.ready || !caStatus.osTrustSupported}
                   onClick={onTrustCa}
                 >
-                  安装并信任
+                  {t('integrations.caWarnInstallBtn')}
                 </Button>
               }
             >
               {caStatus.osTrustSupported
-                ? `已接入 ${profile.name}，IDE 的代理对话与搜索需先安装并信任本地根证书。`
-                : `当前系统不支持自动写入信任，请点击上方「导出证书」手动导入系统根证书存储。`}
+                ? t('integrations.caWarnBodySupported', { name: profile.name })
+                : t('integrations.caWarnBodyUnsupported')}
             </Callout>
           </div>
         )}
@@ -330,7 +349,7 @@ function ToolDetail({
 
       <Block
         index="01"
-        title="本机检测与一键接入"
+        title={t('integrations.blockConnectTitle')}
         aside={
           profile.autoConnectMode !== 'manual' && (
             <div className="flex items-center gap-2">
@@ -341,11 +360,11 @@ function ToolDetail({
                 disabled={connecting}
                 onClick={handleConnect}
               >
-                {profile.configured ? '重新写入配置' : '自动接入网关'}
+                {t(profile.configured ? 'integrations.reapplyConfig' : 'integrations.autoConnect')}
               </Button>
               {profile.configured && (
                 <Button size="sm" icon={<LinkBreak size={14} />} disabled={connecting} onClick={handleDisconnect}>
-                  断开并恢复
+                  {t('integrations.disconnect')}
                 </Button>
               )}
             </div>
@@ -354,29 +373,31 @@ function ToolDetail({
       >
         <div className="space-y-3 rounded-md border border-line bg-surface-2 px-4 py-3 text-xs">
           <div className="flex items-start justify-between gap-4">
-            <span className="shrink-0 text-fg-subtle">接入方式</span>
-            <span className="text-right text-fg">{describeAutoConnectMode(profile)}</span>
+            <span className="shrink-0 text-fg-subtle">{t('integrations.connectMethod')}</span>
+            <span className="text-right text-fg">{describeAutoConnectMode(profile, locale)}</span>
           </div>
           {profile.requiresCaTrust && (
             <div className="flex items-start justify-between gap-4 border-t border-line pt-2.5">
-              <span className="shrink-0 text-fg-subtle">TLS 根证书</span>
+              <span className="shrink-0 text-fg-subtle">{t('integrations.tlsCertLabel')}</span>
               <span className={cx('text-right font-mono', caStatus?.installedInOsStore ? 'text-brand' : 'text-warn')}>
                 {caStatus?.installedInOsStore
-                  ? '已信任'
+                  ? t('integrations.caTrusted')
                   : caStatus && !caStatus.osTrustSupported
-                    ? '需手动导入系统根证书'
-                    : '未信任（点击上方安装）'}
+                    ? t('integrations.tlsCertManual')
+                    : t('integrations.tlsCertUntrusted')}
               </span>
             </div>
           )}
           <div className="flex items-start justify-between gap-4 border-t border-line pt-2.5">
-            <span className="shrink-0 text-fg-subtle">当前接入状态</span>
+            <span className="shrink-0 text-fg-subtle">{t('integrations.currentStateLabel')}</span>
             <span className={cx('text-right font-mono', profile.configured ? 'text-brand' : 'text-fg-muted')}>
-              {profile.configured ? `已生效 · ${profile.configuredVia ?? entry}` : '尚未指向 Hide-Go'}
+              {profile.configured
+                ? t('integrations.stateActiveVia', { via: profile.configuredVia ?? entry })
+                : t('integrations.stateNotRouted')}
             </span>
           </div>
           <div className="flex items-start justify-between gap-4 border-t border-line pt-2.5">
-            <span className="shrink-0 text-fg-subtle">发现的本机路径</span>
+            <span className="shrink-0 text-fg-subtle">{t('integrations.detectedPathsLabel')}</span>
             <div className="min-w-0 text-right font-mono text-fg-muted">
               {profile.installPaths.length > 0 ? (
                 profile.installPaths.map((p) => (
@@ -385,46 +406,49 @@ function ToolDetail({
                   </div>
                 ))
               ) : (
-                <span>未在 PATH 或默认目录发现</span>
+                <span>{t('integrations.noDetectedPaths')}</span>
               )}
             </div>
           </div>
         </div>
       </Block>
 
-      <Block index="02" title="网关路由">
+      <Block index="02" title={t('integrations.blockRouteTitle')}>
         <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-stretch rounded-md border border-line">
           <div className="min-w-0 py-3 pl-4 pr-2">
-            <p className="label-caps">本地入口</p>
+            <p className="label-caps">{t('integrations.localEntryLabel')}</p>
             <div className="mt-1 flex items-center gap-1">
               <code className="min-w-0 truncate font-mono text-sm text-brand" title={entry}>
                 {entry}
               </code>
-              <CopyButton compact text={entry} label="复制本地入口地址" />
+              <CopyButton compact text={entry} label={t('integrations.copyEntry')} />
             </div>
           </div>
           <span aria-hidden="true" className="flex items-center px-2 text-fg-subtle">
             <ArrowRight size={16} />
           </span>
           <div className="min-w-0 border-l border-line px-4 py-3">
-            <p className="label-caps">转发到</p>
+            <p className="label-caps">{t('integrations.forwardToLabel')}</p>
             <code className="mt-1 block truncate py-1 font-mono text-sm text-fg-muted" title={profile.defaultUpstream}>
               {profile.defaultUpstream}
             </code>
           </div>
         </div>
         <p className="mt-2 text-xs leading-5 text-fg-subtle">
-          自定义上游：<code className="font-mono text-fg-muted">HIDE_GO_UPSTREAM_URL</code> 或请求头 <code className="font-mono text-fg-muted">X-Hide-Go-Upstream</code>
+          {t('integrations.customUpstreamHintBefore')}
+          <code className="font-mono text-fg-muted">HIDE_GO_UPSTREAM_URL</code>
+          {t('integrations.customUpstreamHintMid')}
+          <code className="font-mono text-fg-muted">X-Hide-Go-Upstream</code>
         </p>
       </Block>
 
       <Block
         index="03"
-        title="临时环境变量（单终端）"
+        title={t('integrations.blockEnvTitle')}
         aside={
           <Segmented
             size="sm"
-            label="终端类型"
+            label={t('integrations.shellTypeAria')}
             value={shell}
             onChange={onShell}
             options={[
@@ -437,9 +461,9 @@ function ToolDetail({
         <div className="overflow-hidden rounded-md border border-line">
           <div className="flex h-9 items-center gap-2 border-b border-line bg-surface-2 pl-3 pr-1">
             <Terminal aria-hidden="true" size={14} className="shrink-0 text-fg-subtle" />
-            <span className="truncate text-xs text-fg-subtle">仅对当前终端会话生效</span>
+            <span className="truncate text-xs text-fg-subtle">{t('integrations.currentShellOnly')}</span>
             <span className="ml-auto">
-              <CopyButton compact text={snippet} label="复制命令" />
+              <CopyButton compact text={snippet} label={t('integrations.copySnippet')} />
             </span>
           </div>
           <pre tabIndex={0} className="overflow-x-auto px-4 py-3 font-mono text-xs leading-6 text-fg">
@@ -448,32 +472,35 @@ function ToolDetail({
         </div>
       </Block>
 
-      <Block index="04" title="验证接入">
+      <Block index="04" title={t('integrations.blockVerifyTitle')}>
         {effectiveTraffic > 0 ? (
           <Callout
             tone="brand"
-            title={`本会话已捕获 ${formatCount(effectiveTraffic)} 条真实请求${profile.lastSeenAt ? `（${profile.lastSeenAt}）` : ''}`}
+            title={t('integrations.capturedTrafficTitle', {
+              count: formatCount(effectiveTraffic, locale),
+              time: timeSuffix,
+            })}
             action={
               <Button size="sm" onClick={() => navigate('traffic')}>
-                查看流量
+                {t('integrations.viewTraffic')}
               </Button>
             }
           >
-            请求已经过本地网关。
+            {t('integrations.capturedTrafficBody')}
           </Callout>
         ) : (
           <p className="text-sm leading-6 text-fg-muted">
-            接入后在 {profile.name} 中发送一次对话，「流量」页出现记录即生效。
+            {t('integrations.verifyHint', { name: profile.name })}
           </p>
         )}
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <Button size="sm" icon={<Play size={13} weight="fill" />} disabled={simBusy} onClick={() => run(profile.kind, 'interactive-prompt')}>
-            模拟对话请求
+            {t('integrations.simChat')}
           </Button>
           <Button size="sm" icon={<Play size={13} weight="fill" />} disabled={simBusy} onClick={() => run(profile.kind, 'codebase-indexing')}>
-            模拟代码索引
+            {t('integrations.simIndex')}
           </Button>
-          <span className="text-xs text-fg-subtle">离线演练，不联网</span>
+          <span className="text-xs text-fg-subtle">{t('integrations.simOfflineNote')}</span>
         </div>
       </Block>
     </article>
@@ -482,6 +509,7 @@ function ToolDetail({
 
 export function Integrations() {
   const { harnesses, refreshHarnesses, config, logs, params, navigate } = useStore();
+  const { t } = useI18n();
   const toast = useToast();
   const [shell, setShell] = useState<Shell>(() => (/win/i.test(navigator.platform) ? 'powershell' : 'bash'));
   const [scanning, setScanning] = useState(false);
@@ -549,9 +577,9 @@ export function Integrations() {
     setScanning(true);
     try {
       await refreshAll();
-      toast.push({ tone: 'brand', title: '本机扫描已刷新' });
+      toast.push({ tone: 'brand', title: t('integrations.scanDone') });
     } catch (e) {
-      toast.push({ tone: 'danger', title: '扫描失败', body: (e as Error).message });
+      toast.push({ tone: 'danger', title: t('integrations.scanFailed'), body: (e as Error).message });
     } finally {
       setScanning(false);
     }
@@ -565,11 +593,11 @@ export function Integrations() {
       const succeeded = results.filter((r) => r.ok).length;
       toast.push({
         tone: succeeded > 0 ? 'brand' : 'warn',
-        title: succeeded > 0 ? `已接入 ${succeeded} 个工具` : '无可自动接入的工具',
-        body: succeeded > 0 ? '新会话将自动走 Hide-Go 网关' : '请先安装工具或使用右侧终端命令',
+        title: succeeded > 0 ? t('integrations.connectAllOkTitle', { count: succeeded }) : t('integrations.connectAllNoneTitle'),
+        body: t(succeeded > 0 ? 'integrations.connectAllOkBody' : 'integrations.connectAllNoneBody'),
       });
     } catch (e) {
-      toast.push({ tone: 'danger', title: '批量接入失败', body: (e as Error).message });
+      toast.push({ tone: 'danger', title: t('integrations.connectAllFailed'), body: (e as Error).message });
     } finally {
       setConnectingAll(false);
     }
@@ -583,11 +611,11 @@ export function Integrations() {
       setCaError(null);
       toast.push({
         tone: next.installedInOsStore ? 'brand' : 'warn',
-        title: next.installedInOsStore ? '本地根证书已安装并受信任' : '证书信任尚未生效',
+        title: t(next.installedInOsStore ? 'integrations.caTrustedToast' : 'integrations.caNotEffectiveToast'),
         body: next.osTrustDetail,
       });
     } catch (e) {
-      toast.push({ tone: 'danger', title: '安装根证书失败', body: (e as Error).message });
+      toast.push({ tone: 'danger', title: t('integrations.caTrustFailed'), body: (e as Error).message });
     } finally {
       setCaBusy(false);
     }
@@ -601,11 +629,11 @@ export function Integrations() {
       setCaError(null);
       toast.push({
         tone: !next.installedInOsStore ? 'brand' : 'warn',
-        title: !next.installedInOsStore ? '已移除本地根证书信任' : '证书信任仍然存在',
+        title: t(!next.installedInOsStore ? 'integrations.caUntrustedToast' : 'integrations.caStillPresentToast'),
         body: next.osTrustDetail,
       });
     } catch (e) {
-      toast.push({ tone: 'danger', title: '卸载证书信任失败', body: (e as Error).message });
+      toast.push({ tone: 'danger', title: t('integrations.caUntrustFailed'), body: (e as Error).message });
     } finally {
       setCaBusy(false);
     }
@@ -623,9 +651,13 @@ export function Integrations() {
       a.click();
       a.remove();
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-      toast.push({ tone: 'brand', title: '已导出本地根证书', body: '文件名：hide-go-ca.crt（仅含公钥）' });
+      toast.push({
+        tone: 'brand',
+        title: t('integrations.caExportedTitle'),
+        body: t('integrations.caExportedBody'),
+      });
     } catch (e) {
-      toast.push({ tone: 'danger', title: '导出证书失败', body: (e as Error).message });
+      toast.push({ tone: 'danger', title: t('integrations.caExportFailed'), body: (e as Error).message });
     } finally {
       setExportingCert(false);
     }
@@ -633,21 +665,25 @@ export function Integrations() {
 
   return (
     <div className="grid h-full min-h-0 grid-cols-[280px_minmax(0,1fr)]">
-      <nav aria-label="支持的工具" className="flex min-h-0 flex-col border-r border-line bg-surface">
+      <nav aria-label={t('integrations.navAria')} className="flex min-h-0 flex-col border-r border-line bg-surface">
         <div className="border-b border-line p-3">
           <div className="flex items-center justify-between gap-2">
             <span className="label-caps">
-              本机已安装 {installedCount}/{harnesses.length} · 已接入 {configuredCount}
+              {t('integrations.summaryCount', {
+                installed: installedCount,
+                total: harnesses.length,
+                configured: configuredCount,
+              })}
             </span>
             <button
               type="button"
               onClick={handleScan}
               disabled={scanning}
-              title="重新扫描本机工具"
+              title={t('integrations.scanBtnTitle')}
               className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-1 text-2xs text-fg-muted hover:bg-surface-2 hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus/40 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <ArrowsClockwise size={13} className={scanning ? 'animate-spin' : undefined} />
-              扫描
+              {t('integrations.scanBtn')}
             </button>
           </div>
           <Button
@@ -658,13 +694,19 @@ export function Integrations() {
             disabled={connectingAll || installedCount === 0}
             onClick={handleConnectAll}
           >
-            一键接入已检测工具
+            {t('integrations.connectAllBtn')}
           </Button>
         </div>
         <ul className="min-h-0 flex-1 divide-y divide-line overflow-y-auto">
           {harnesses.map((h) => {
             const active = h.kind === selected.kind;
-            const statusText = h.detectedActive ? '有流量' : h.configured ? '已接入' : h.installed ? '已安装' : '未安装';
+            const statusText = h.detectedActive
+              ? t('integrations.statusActive')
+              : h.configured
+                ? t('integrations.statusConfigured')
+                : h.installed
+                  ? t('integrations.statusInstalled')
+                  : t('integrations.statusMissing');
             const dotTone = h.detectedActive
               ? 'bg-brand'
               : h.configured

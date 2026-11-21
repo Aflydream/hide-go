@@ -4,16 +4,21 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
+    <meta name="hide-go-locale" content="__HIDE_GO_LOCALE__" />
     <script nonce="__HIDE_GO_NONCE__">
       try {
         var pref = localStorage.getItem('hide-go-color-scheme');
         if (pref === 'light' || pref === 'dark') {
           document.querySelector('meta[name="color-scheme"]').setAttribute('content', pref);
         }
+        var loc = localStorage.getItem('hide-go-locale');
+        if (loc === 'zh-CN' || loc === 'en') {
+          document.documentElement.lang = loc;
+        }
       } catch (_) {}
     </script>
     <link rel="icon" type="image/png" href="./src/assets/logo-mark.png" />
-    <title>Hide-Go 控制台</title>
+    <title>Hide-Go</title>
   </head>
   <body>
     <div id="root"></div>

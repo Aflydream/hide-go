@@ -736,9 +736,90 @@ pub fn show_error_dialog(title: &str, message: &str) {
     }
 }
 
+/// Normalize a system locale identifier (BCP-47 / POSIX) to a supported UI locale (`"zh-CN"` or `"en"`).
+pub fn normalize_locale_tag(raw: &str) -> &'static str {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2
+        && trimmed.as_bytes()[..2].eq_ignore_ascii_case(b"zh")
+        && trimmed.as_bytes().get(2).is_none_or(|b| !b.is_ascii_alphanumeric())
+    {
+        "zh-CN"
+    } else {
+        "en"
+    }
+}
+
+fn env_locale_candidate() -> Option<String> {
+    for key in ["HIDE_GO_LANG", "LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"] {
+        let Ok(raw) = std::env::var(key) else {
+            continue;
+        };
+        let parts: Vec<&str> = if key == "LANGUAGE" {
+            raw.split(':').collect()
+        } else {
+            vec![raw.as_str()]
+        };
+        for part in parts {
+            let cleaned = part.trim();
+            if cleaned.is_empty() {
+                continue;
+            }
+            let base = cleaned.split(['.', '@']).next().unwrap_or(cleaned).trim();
+            if base.eq_ignore_ascii_case("C") || base.eq_ignore_ascii_case("POSIX") {
+                continue;
+            }
+            return Some(cleaned.to_string());
+        }
+    }
+    None
+}
+
+/// Detect the OS UI language (`"zh-CN"` for Chinese locales, `"en"` otherwise).
+pub fn detect_system_locale() -> &'static str {
+    if let Some(candidate) = env_locale_candidate() {
+        return normalize_locale_tag(&candidate);
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetUserDefaultUILanguage() -> u16;
+        }
+        // SAFETY: `GetUserDefaultUILanguage` takes no parameters and returns a LANGID scalar.
+        let lang_id = unsafe { GetUserDefaultUILanguage() };
+        if (lang_id & 0x03ff) == 0x04 {
+            "zh-CN"
+        } else {
+            "en"
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(output) = Command::new("/usr/bin/defaults")
+            .args(["read", "-g", "AppleLanguages"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let trimmed = line.trim().trim_matches(['(', ')', ',', '"', '\'']);
+                if !trimmed.is_empty() {
+                    return normalize_locale_tag(trimmed);
+                }
+            }
+        }
+        "en"
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        "en"
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{existing_initial_dir, is_hide_go_runtime_process_name, parse_ps_entry};
+    use super::{existing_initial_dir, is_hide_go_runtime_process_name, normalize_locale_tag, parse_ps_entry};
     use std::path::Path;
 
     #[test]
@@ -806,5 +887,17 @@ mod tests {
         let dir = create_private_temp_dir("hide-chrome-test").unwrap();
         assert!(dir.is_dir());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_locale_tag_maps_chinese_variants_and_falls_back_to_en() {
+        assert_eq!(normalize_locale_tag("zh-CN"), "zh-CN");
+        assert_eq!(normalize_locale_tag("zh_TW.UTF-8"), "zh-CN");
+        assert_eq!(normalize_locale_tag("zh-Hans"), "zh-CN");
+        assert_eq!(normalize_locale_tag("ZH"), "zh-CN");
+        assert_eq!(normalize_locale_tag("en-US"), "en");
+        assert_eq!(normalize_locale_tag("ja-JP"), "en");
+        assert_eq!(normalize_locale_tag("C"), "en");
+        assert_eq!(normalize_locale_tag(""), "en");
     }
 }

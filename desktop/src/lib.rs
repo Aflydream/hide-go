@@ -331,6 +331,7 @@ async fn bind_loopback_with_retry(port: u16, had_existing: bool) -> Result<TcpLi
 }
 
 fn render_index_html(token: &str, nonce: &str) -> String {
+    let sys_locale = hide_chrome::detect_system_locale();
     let token_json = serde_json::to_string(token)
         .expect("admin token must serialize as a JSON string")
         .replace('<', "\\u003c")
@@ -340,6 +341,8 @@ fn render_index_html(token: &str, nonce: &str) -> String {
         .replace('\u{2029}', "\\u2029");
     let token_script = format!("<script nonce=\"{nonce}\">window.__HIDE_GO_TOKEN__={token_json};</script></head>");
     EMBEDDED_INDEX_HTML
+        .replacen("<html lang=\"zh-CN\">", &format!("<html lang=\"{sys_locale}\">"), 1)
+        .replace("__HIDE_GO_LOCALE__", sys_locale)
         .replace("nonce=\"__HIDE_GO_NONCE__\"", &format!("nonce=\"{nonce}\""))
         .replacen("</head>", &token_script, 1)
 }

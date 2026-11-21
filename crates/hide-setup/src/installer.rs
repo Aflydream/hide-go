@@ -1,7 +1,7 @@
 #[cfg(windows)]
 use hide_chrome::{hidden_command_path, windows_system_executable};
 use hide_core::ca::{CaManager, RealCaTrustAdapter};
-use hide_core::config::HideConfig;
+use hide_core::config::{HideConfig, UiLanguage};
 use hide_core::harness::HarnessProfile;
 use hide_core::harness_detect::{detect_all_harness_profiles, disconnect_all_managed, HarnessActionResult};
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,8 @@ pub struct InstallOptions {
     pub create_shortcuts: bool,
     pub add_to_path: bool,
     pub autostart_daemon: bool,
+    #[serde(default)]
+    pub language: Option<UiLanguage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -936,13 +938,23 @@ fn write_binary(embedded: Option<&[u8]>, file_name: &str, dest: &Path) -> Result
     Ok(())
 }
 
-pub fn configured_proxy_port(config_path: Option<&Path>) -> u16 {
+fn load_existing_config(config_path: Option<&Path>) -> Option<HideConfig> {
     config_path
         .filter(|p| p.is_file())
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<HideConfig>(&s).ok())
+        .and_then(|s| serde_json::from_str::<HideConfig>(s.trim_start_matches('\u{feff}')).ok())
+}
+
+pub fn configured_proxy_port(config_path: Option<&Path>) -> u16 {
+    load_existing_config(config_path)
         .map(|c| c.proxy_port)
         .unwrap_or_else(|| HideConfig::default().proxy_port)
+}
+
+pub fn configured_language(config_path: Option<&Path>) -> UiLanguage {
+    load_existing_config(config_path)
+        .map(|c| c.language)
+        .unwrap_or_default()
 }
 
 pub fn perform_install(opts: &InstallOptions, payloads: &EmbeddedPayloads<'_>) -> InstallOutcome {
@@ -1062,8 +1074,14 @@ pub fn perform_install_with(
 
     // 3. Ensure initial config.json exists without clobbering user's existing settings
     if let Some(cfg_path) = config_path {
-        let cfg = HideConfig::load_or_create(cfg_path);
-        if !cfg_path.exists() {
+        let mut cfg = HideConfig::load_or_create(cfg_path);
+        let needs_save = !cfg_path.exists()
+            || opts.language.is_some_and(|lang| {
+                let changed = cfg.language != lang;
+                cfg.language = lang;
+                changed
+            });
+        if needs_save {
             if let Err(e) = cfg.save(cfg_path) {
                 steps.push(SetupStepStatus {
                     id: "cfg".into(),
@@ -1707,6 +1725,7 @@ mod tests {
                 create_shortcuts: true,
                 add_to_path: true,
                 autostart_daemon: true,
+                language: Some(UiLanguage::En),
             },
             &payloads,
             &ops,
@@ -1720,9 +1739,11 @@ mod tests {
         assert!(*ops.path_added.borrow());
         assert!(*ops.autostart.borrow());
 
-        // Existing config salt must survive install/upgrade untouched
+        // Existing config salt must survive install/upgrade untouched while selected language is persisted
         let loaded = HideConfig::load_or_create(&cfg_path);
         assert_eq!(loaded.project_salt, "user-custom-salt-123");
+        assert_eq!(loaded.language, UiLanguage::En);
+        assert_eq!(configured_language(Some(&cfg_path)), UiLanguage::En);
 
         let uninst = perform_uninstall_with(
             &UninstallOptions {
@@ -1761,6 +1782,7 @@ mod tests {
                 create_shortcuts: true,
                 add_to_path: true,
                 autostart_daemon: false,
+                language: None,
             },
             &payloads,
             &ops,
@@ -1775,6 +1797,7 @@ mod tests {
                 create_shortcuts: false,
                 add_to_path: false,
                 autostart_daemon: false,
+                language: None,
             },
             &payloads,
             &ops,
@@ -1907,6 +1930,7 @@ mod tests {
                 create_shortcuts: false,
                 add_to_path: false,
                 autostart_daemon: false,
+                language: None,
             },
             &payloads,
             &ops,

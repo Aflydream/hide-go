@@ -6,6 +6,7 @@ import {
   Plugs,
   Vault as VaultIcon,
   BracketsAngle,
+  Gear,
   Eye,
   EyeSlash,
   Lightning,
@@ -14,9 +15,10 @@ import {
 } from '@phosphor-icons/react';
 import { StoreProvider, isAuthError, useStore } from './store';
 import { Button, Segmented, ToastProvider, cx, type SegmentTone } from './components/ui';
-import { WindowFrame } from './components/WindowFrame';
+import { ColorSchemeProvider, WindowFrame } from './components/WindowFrame';
 import type { Route } from './lib/hooks';
-import { MODE_LABEL, formatCount, formatDuration } from './lib/format';
+import { formatCount, formatDuration, getModeLabel } from './lib/format';
+import { I18nProvider, translate, useI18n, type Locale } from './lib/i18n';
 import type { PrivacyMode } from './types';
 import { Overview } from './views/Overview';
 import { Traffic } from './views/Traffic';
@@ -24,25 +26,100 @@ import { Policy } from './views/Policy';
 import { Integrations } from './views/Integrations';
 import { VaultView } from './views/Vault';
 import { Rules } from './views/Rules';
+import { Settings } from './views/Settings';
 import { SimulateDialog } from './views/SimulateDialog';
 
-const NAV: Array<{ route: Route; label: string; icon: ReactNode; title: string; description: string }> = [
-  { route: 'overview', label: '概览', icon: <ChartLineUp size={18} />, title: '概览', description: '运行状态与最近流量' },
-  { route: 'traffic', label: '流量', icon: <ArrowsLeftRight size={18} />, title: '流量检视', description: '请求 / 响应对照与敏感项' },
-  { route: 'policy', label: '保护策略', icon: <ShieldCheck size={18} />, title: '保护策略', description: '脱敏范围与工具参数策略' },
-  { route: 'rules', label: '自定义规则', icon: <BracketsAngle size={18} />, title: '自定义规则', description: '项目专有正则规则' },
-  { route: 'vault', label: '映射表', icon: <VaultIcon size={18} />, title: '映射表', description: '内存中的占位符对照表' },
-  { route: 'integrations', label: '工具接入', icon: <Plugs size={18} />, title: '工具接入', description: '检测并接入本机 AI 工具' },
-];
+interface NavItem {
+  route: Route;
+  label: string;
+  icon: ReactNode;
+  title: string;
+  description: string;
+}
 
-const MODE_OPTIONS: Array<{ value: PrivacyMode; label: string; icon: ReactNode; title: string; tone: SegmentTone }> = [
-  { value: 'audit-only', label: MODE_LABEL['audit-only'], icon: <Eye size={14} />, title: '只记录，不修改请求', tone: 'warn' },
-  { value: 'auto-desensitize', label: MODE_LABEL['auto-desensitize'], icon: <ShieldCheck size={14} />, title: '替换密钥、路径与内网信息，返回时还原', tone: 'brand' },
-  { value: 'all-hide', label: MODE_LABEL['all-hide'], icon: <EyeSlash size={14} />, title: '在脱敏基础上伪装代码标识符与字面量', tone: 'ink' },
-];
+function getNavItems(locale: Locale): NavItem[] {
+  return [
+    {
+      route: 'overview',
+      label: translate(locale, 'nav.overview'),
+      icon: <ChartLineUp size={18} />,
+      title: translate(locale, 'nav.overviewTitle'),
+      description: translate(locale, 'nav.overviewDesc'),
+    },
+    {
+      route: 'traffic',
+      label: translate(locale, 'nav.traffic'),
+      icon: <ArrowsLeftRight size={18} />,
+      title: translate(locale, 'nav.trafficTitle'),
+      description: translate(locale, 'nav.trafficDesc'),
+    },
+    {
+      route: 'policy',
+      label: translate(locale, 'nav.policy'),
+      icon: <ShieldCheck size={18} />,
+      title: translate(locale, 'nav.policyTitle'),
+      description: translate(locale, 'nav.policyDesc'),
+    },
+    {
+      route: 'rules',
+      label: translate(locale, 'nav.rules'),
+      icon: <BracketsAngle size={18} />,
+      title: translate(locale, 'nav.rulesTitle'),
+      description: translate(locale, 'nav.rulesDesc'),
+    },
+    {
+      route: 'vault',
+      label: translate(locale, 'nav.vault'),
+      icon: <VaultIcon size={18} />,
+      title: translate(locale, 'nav.vaultTitle'),
+      description: translate(locale, 'nav.vaultDesc'),
+    },
+    {
+      route: 'integrations',
+      label: translate(locale, 'nav.integrations'),
+      icon: <Plugs size={18} />,
+      title: translate(locale, 'nav.integrationsTitle'),
+      description: translate(locale, 'nav.integrationsDesc'),
+    },
+    {
+      route: 'settings',
+      label: translate(locale, 'nav.settings'),
+      icon: <Gear size={18} />,
+      title: translate(locale, 'nav.settingsTitle'),
+      description: translate(locale, 'nav.settingsDesc'),
+    },
+  ];
+}
 
-function Sidebar() {
+function getModeOptions(locale: Locale): Array<{ value: PrivacyMode; label: string; icon: ReactNode; title: string; tone: SegmentTone }> {
+  return [
+    {
+      value: 'audit-only',
+      label: getModeLabel('audit-only', locale),
+      icon: <Eye size={14} />,
+      title: translate(locale, 'mode.auditOnlyDesc'),
+      tone: 'warn',
+    },
+    {
+      value: 'auto-desensitize',
+      label: getModeLabel('auto-desensitize', locale),
+      icon: <ShieldCheck size={14} />,
+      title: translate(locale, 'mode.autoDesensitizeDesc'),
+      tone: 'brand',
+    },
+    {
+      value: 'all-hide',
+      label: getModeLabel('all-hide', locale),
+      icon: <EyeSlash size={14} />,
+      title: translate(locale, 'mode.allHideDesc'),
+      tone: 'ink',
+    },
+  ];
+}
+
+function Sidebar({ navItems }: { navItems: NavItem[] }) {
   const { route, navigate, logs, vault, status, config, statusError } = useStore();
+  const { locale, t } = useI18n();
   const liveCount = useMemo(() => logs.reduce((n, l) => n + (l.simulated ? 0 : 1), 0), [logs]);
   const online = !!status && !statusError;
   const counts: Partial<Record<Route, number>> = {
@@ -51,9 +128,9 @@ function Sidebar() {
     rules: config?.customRules.length,
   };
   return (
-    <aside className="flex w-52 shrink-0 flex-col border-r border-line bg-surface-2/60 max-[1180px]:w-14" aria-label="主导航">
-      <nav className="flex-1 space-y-0.5 px-2 pt-3" aria-label="控制台视图">
-        {NAV.map((item) => {
+    <aside className="flex w-52 shrink-0 flex-col border-r border-line bg-surface-2/60 max-[1180px]:w-14" aria-label={t('shell.navAria')}>
+      <nav className="flex-1 space-y-0.5 px-2 pt-3" aria-label={t('shell.viewsAria')}>
+        {navItems.map((item) => {
           const active = item.route === route;
           const count = counts[item.route];
           return (
@@ -75,7 +152,7 @@ function Sidebar() {
               <span className="flex-1 truncate text-left max-[1180px]:sr-only">{item.label}</span>
               {count !== undefined && count > 0 && (
                 <span className="tabular rounded-sm bg-surface-3 px-1.5 py-px font-mono text-2xs text-fg-subtle max-[1180px]:hidden">
-                  {formatCount(count)}
+                  {formatCount(count, locale)}
                 </span>
               )}
             </button>
@@ -87,19 +164,25 @@ function Sidebar() {
         <div role="status" aria-live="polite">
           <div className="flex items-center gap-2 text-xs">
             <span aria-hidden="true" className={cx('h-2 w-2 rounded-full', online ? 'bg-brand' : 'bg-danger')} />
-            <span className="font-medium text-fg">{online ? '网关运行中' : '网关未连接'}</span>
+            <span className="font-medium text-fg">{online ? t('shell.online') : t('shell.offline')}</span>
             {config && <span className="tabular ml-auto font-mono text-2xs text-fg-subtle">:{config.proxyPort}</span>}
           </div>
-          {status && <p className="tabular mt-1 pl-4 text-2xs text-fg-subtle">已运行 {formatDuration(status.uptimeSecs)}</p>}
+          {status && (
+            <p className="tabular mt-1 pl-4 text-2xs text-fg-subtle">
+              {t('shell.uptime', { duration: formatDuration(status.uptimeSecs, locale) })}
+            </p>
+          )}
         </div>
       </div>
     </aside>
   );
 }
 
-function TopBar() {
+function TopBar({ navItems }: { navItems: NavItem[] }) {
   const { route, config, saveConfig, openSimulator } = useStore();
-  const item = NAV.find((n) => n.route === route) ?? NAV[0];
+  const { locale, t } = useI18n();
+  const item = navItems.find((n) => n.route === route) ?? navItems[0];
+  const modeOptions = useMemo(() => getModeOptions(locale), [locale]);
   return (
     <header className="flex h-12 shrink-0 items-center justify-between gap-4 border-b border-line bg-surface px-6">
       <div className="flex min-w-0 items-baseline gap-2.5">
@@ -108,22 +191,25 @@ function TopBar() {
         </h1>
         <p className="truncate text-xs text-fg-subtle max-[1100px]:hidden">{item.description}</p>
       </div>
-      <div role="toolbar" aria-label="网关快捷控制" className="flex shrink-0 items-center gap-3">
-        <div role="group" aria-label="请求测试">
+      <div role="toolbar" aria-label={t('shell.quickControlsAria')} className="flex shrink-0 items-center gap-3">
+        <div role="group" aria-label={t('shell.requestTestAria')}>
           <Button size="sm" variant="ghost" icon={<PaperPlaneTilt size={14} />} onClick={openSimulator}>
-            模拟请求
+            {t('shell.simulate')}
           </Button>
         </div>
         <span role="separator" aria-orientation="vertical" className="h-5 w-px bg-line" />
         <span className="label-caps max-[1280px]:hidden" id="mode-label">
-          处理模式
+          {t('shell.modeLabel')}
         </span>
         {config ? (
           <Segmented
-            label="全局处理模式"
+            label={t('shell.globalModeAria')}
             value={config.mode}
-            onChange={(mode) => mode !== config.mode && saveConfig({ ...config, mode }, `已切换为「${MODE_LABEL[mode]}」`)}
-            options={MODE_OPTIONS}
+            onChange={(mode) =>
+              mode !== config.mode &&
+              saveConfig({ ...config, mode }, t('shell.modeSwitched', { mode: getModeLabel(mode, locale) }))
+            }
+            options={modeOptions}
           />
         ) : (
           <span className="h-8 w-[260px] animate-pulse rounded bg-surface-3" aria-hidden="true" />
@@ -135,29 +221,29 @@ function TopBar() {
 
 function ConnectionBanner() {
   const { statusError } = useStore();
+  const { t } = useI18n();
   if (!statusError) return null;
   const auth = isAuthError(statusError);
   return (
     <div role="alert" className="flex items-center gap-3 border-b border-danger/40 bg-danger/10 px-6 py-2 text-sm text-danger">
       <WifiSlash aria-hidden="true" size={16} weight="bold" />
-      <span className="font-medium">{auth ? '管理令牌无效' : '无法连接本地网关'}</span>
-      <span className="text-xs text-fg-muted">
-        {auth ? '请关闭窗口并从 Hide-Go 桌面程序重新启动。' : '界面数据可能已过期，正在自动重试…'}
-      </span>
+      <span className="font-medium">{t(auth ? 'shell.invalidTokenTitle' : 'shell.unreachableTitle')}</span>
+      <span className="text-xs text-fg-muted">{t(auth ? 'shell.invalidTokenBody' : 'shell.unreachableBody')}</span>
     </div>
   );
 }
 
 function AuditWarning() {
   const { config, route, navigate } = useStore();
+  const { t } = useI18n();
   if (!config || config.mode !== 'audit-only' || route === 'policy') return null;
   return (
     <div className="flex items-center gap-3 border-b border-warn/40 bg-warn/10 px-6 py-2 text-xs">
       <Lightning aria-hidden="true" size={14} weight="fill" className="text-warn" />
-      <span className="font-medium text-warn">仅审计模式</span>
-      <span className="text-fg-muted">密钥、路径和内网地址会原样发送给模型厂商。</span>
+      <span className="font-medium text-warn">{t('shell.auditBannerTitle')}</span>
+      <span className="text-fg-muted">{t('shell.auditBannerBody')}</span>
       <button type="button" onClick={() => navigate('policy')} className="ml-auto cursor-pointer font-medium text-fg underline-offset-2 hover:underline">
-        查看保护策略
+        {t('shell.auditBannerAction')}
       </button>
     </div>
   );
@@ -177,15 +263,21 @@ function Main() {
       {route === 'rules' && <Rules />}
       {route === 'vault' && <VaultView />}
       {route === 'integrations' && <Integrations />}
+      {route === 'settings' && <Settings />}
     </main>
   );
 }
 
 function Shell() {
   const { simulatorOpen, closeSimulator, status, statusError, config } = useStore();
+  const { locale, t } = useI18n();
+  const navItems = useMemo(() => getNavItems(locale), [locale]);
+
   useEffect(() => {
-    document.title = status ? `Hide-Go · ${formatCount(status.totalRequests)} 请求` : 'Hide-Go 控制台';
-  }, [status]);
+    document.title = status
+      ? t('shell.requestsTitle', { count: formatCount(status.totalRequests, locale) })
+      : t('shell.consoleTitle');
+  }, [status, locale, t]);
 
   const online = !!status && !statusError;
   const statusChip = (
@@ -201,17 +293,17 @@ function Shell() {
   );
 
   return (
-    <WindowFrame title="Hide-Go" badge={status ? `v${status.version}` : undefined} statusSlot={statusChip} minWidthClass="min-w-[960px]">
+    <WindowFrame title={t('shell.appName')} badge={status ? `v${status.version}` : undefined} statusSlot={statusChip} minWidthClass="min-w-[960px]">
       <a
         href="#main"
         className="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-12 focus:z-[70] focus:rounded focus:border focus:border-line-strong focus:bg-surface focus:px-3 focus:py-2 focus:text-sm"
       >
-        跳到主要内容
+        {t('shell.skipToContent')}
       </a>
       <div className="flex min-h-0 flex-1">
-        <Sidebar />
+        <Sidebar navItems={navItems} />
         <div className="flex min-w-0 flex-1 flex-col">
-          <TopBar />
+          <TopBar navItems={navItems} />
           <ConnectionBanner />
           <AuditWarning />
           <Main />
@@ -224,10 +316,14 @@ function Shell() {
 
 export default function App() {
   return (
-    <ToastProvider>
-      <StoreProvider>
-        <Shell />
-      </StoreProvider>
-    </ToastProvider>
+    <I18nProvider>
+      <ColorSchemeProvider>
+        <ToastProvider>
+          <StoreProvider>
+            <Shell />
+          </StoreProvider>
+        </ToastProvider>
+      </ColorSchemeProvider>
+    </I18nProvider>
   );
 }

@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api, ApiError } from './lib/api';
 import { usePoll, useRoute, type Route } from './lib/hooks';
+import { useI18n } from './lib/i18n';
 import type { GatewayStatus, HarnessProfile, HideConfig, TrafficSummary, VaultEntry } from './types';
 import { useToast } from './components/ui';
 
@@ -39,12 +40,14 @@ export function useStore(): Store {
 
 export function StoreProvider({ children }: { children: ReactNode }) {
   const toast = useToast();
+  const { syncPrefFromConfig, t } = useI18n();
   const { route, params, navigate } = useRoute();
   const [config, setConfig] = useState<HideConfig | null>(null);
   const [saving, setSaving] = useState(false);
   const [simulatorOpen, setSimulatorOpen] = useState(false);
   const saveSeq = useRef(0);
   const confirmedConfigRef = useRef<HideConfig | null>(null);
+  const syncedLangRef = useRef(false);
 
   const openSimulator = useCallback(() => setSimulatorOpen(true), []);
   const closeSimulator = useCallback(() => setSimulatorOpen(false), []);
@@ -65,6 +68,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         .then((c) => {
           if (cancelled) return;
           confirmedConfigRef.current = c;
+          if (!syncedLangRef.current) {
+            syncedLangRef.current = true;
+            syncPrefFromConfig(c.language);
+          }
           setConfig(c);
         })
         .catch(() => {
@@ -77,10 +84,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       cancelled = true;
       if (timerId !== undefined) window.clearTimeout(timerId);
     };
-  }, []);
+  }, [syncPrefFromConfig]);
 
   const saveConfig = useCallback(
-    async (next: HideConfig, successMessage = '设置已保存') => {
+    async (next: HideConfig, successMessage?: string) => {
       const seq = ++saveSeq.current;
       setConfig(next);
       setSaving(true);
@@ -88,17 +95,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         const saved = await api.saveConfig(next);
         confirmedConfigRef.current = saved;
         if (seq === saveSeq.current) setConfig(saved);
-        toast.push({ tone: 'brand', title: successMessage });
+        toast.push({ tone: 'brand', title: successMessage ?? t('store.saved') });
         return true;
       } catch (e) {
         if (seq === saveSeq.current) setConfig(confirmedConfigRef.current);
-        toast.push({ tone: 'danger', title: '保存失败，已恢复为生效中的设置', body: (e as Error).message });
+        toast.push({
+          tone: 'danger',
+          title: t('store.saveFailed'),
+          body: (e as Error).message,
+        });
         return false;
       } finally {
         if (seq === saveSeq.current) setSaving(false);
       }
     },
-    [toast],
+    [toast, t],
   );
 
   const value = useMemo<Store>(

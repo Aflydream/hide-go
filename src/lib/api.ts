@@ -1,3 +1,4 @@
+import { getActiveLocale, translate } from './i18n';
 import type {
   CaStatus,
   GatewayStatus,
@@ -64,7 +65,7 @@ async function authorizedFetch(path: string, init: RequestInit = {}): Promise<Re
   try {
     res = await fetch(path, { ...init, headers, credentials: 'omit', cache: 'no-store' });
   } catch {
-    throw new ApiError(0, '无法连接本地网关');
+    throw new ApiError(0, translate(getActiveLocale(), 'api.unreachable'));
   }
   if (!res.ok) {
     let message = `HTTP ${res.status}`;
@@ -74,7 +75,7 @@ async function authorizedFetch(path: string, init: RequestInit = {}): Promise<Re
     } catch {
       /* non-JSON error body */
     }
-    if (res.status === 401) message = '管理令牌无效：请通过 Hide-Go 桌面程序打开控制台';
+    if (res.status === 401) message = translate(getActiveLocale(), 'api.invalidToken');
     throw new ApiError(res.status, message);
   }
   return res;

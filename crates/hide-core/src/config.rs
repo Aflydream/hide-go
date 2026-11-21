@@ -191,6 +191,28 @@ fn default_upstream_idle_timeout_secs() -> u64 {
     DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS
 }
 
+/// Interface language preference persisted in `config.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UiLanguage {
+    #[default]
+    #[serde(rename = "system")]
+    System,
+    #[serde(rename = "zh-CN")]
+    ZhCn,
+    #[serde(rename = "en")]
+    En,
+}
+
+impl UiLanguage {
+    pub fn resolve(&self, system_locale: &'static str) -> &'static str {
+        match self {
+            UiLanguage::System => system_locale,
+            UiLanguage::ZhCn => "zh-CN",
+            UiLanguage::En => "en",
+        }
+    }
+}
+
 /// Global runtime configuration for Hide-Go
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -205,6 +227,8 @@ pub struct HideConfig {
     pub project_salt: String,
     pub tool_call_secret_policy: ToolCallSecretPolicy,
     pub custom_rules: Vec<CustomRule>,
+    #[serde(default)]
+    pub language: UiLanguage,
     #[serde(default)]
     pub mitm_extra_hosts: Vec<String>,
     #[serde(default)]
@@ -235,13 +259,6 @@ impl Default for HideConfig {
             // camouflage mapping for common identifiers.
             project_salt: format!("hg-{}", Uuid::new_v4().simple()),
             tool_call_secret_policy: ToolCallSecretPolicy::default(),
-            mitm_extra_hosts: Vec::new(),
-            mitm_bypass_hosts: Vec::new(),
-            allowed_connect_ports: default_allowed_connect_ports(),
-            allowed_loopback_proxy_targets: Vec::new(),
-            upstream_idle_timeout_secs: default_upstream_idle_timeout_secs(),
-            auto_trust_ca: false,
-            harness_upstreams: HashMap::new(),
             custom_rules: vec![
                 CustomRule {
                     id: "rule-1".to_string(),
@@ -258,6 +275,14 @@ impl Default for HideConfig {
                     enabled: true,
                 },
             ],
+            language: UiLanguage::default(),
+            mitm_extra_hosts: Vec::new(),
+            mitm_bypass_hosts: Vec::new(),
+            allowed_connect_ports: default_allowed_connect_ports(),
+            allowed_loopback_proxy_targets: Vec::new(),
+            upstream_idle_timeout_secs: default_upstream_idle_timeout_secs(),
+            auto_trust_ca: false,
+            harness_upstreams: HashMap::new(),
         }
     }
 }
@@ -459,5 +484,26 @@ mod tests {
             cfg.effective_upstream_idle_timeout(),
             std::time::Duration::from_secs(3600)
         );
+    }
+
+    #[test]
+    fn ui_language_roundtrips_and_defaults_legacy_config_to_system() {
+        let legacy: HideConfig = serde_json::from_str(r#"{"proxyPort": 18787}"#).unwrap();
+        assert_eq!(legacy.language, UiLanguage::System);
+        assert_eq!(legacy.language.resolve("en"), "en");
+        assert_eq!(legacy.language.resolve("zh-CN"), "zh-CN");
+
+        for (lang, expected_json) in [
+            (UiLanguage::System, r#""system""#),
+            (UiLanguage::ZhCn, r#""zh-CN""#),
+            (UiLanguage::En, r#""en""#),
+        ] {
+            let encoded = serde_json::to_string(&lang).unwrap();
+            assert_eq!(encoded, expected_json);
+            let decoded: UiLanguage = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, lang);
+        }
+        assert_eq!(UiLanguage::ZhCn.resolve("en"), "zh-CN");
+        assert_eq!(UiLanguage::En.resolve("zh-CN"), "en");
     }
 }

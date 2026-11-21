@@ -2,20 +2,24 @@ import { useCallback, useEffect, useState } from 'react';
 import { PaperPlaneTilt } from '@phosphor-icons/react';
 import { useStore } from '../store';
 import { api } from '../lib/api';
-import { CATEGORY_LABEL, HARNESS_LABEL, HARNESS_ORDER, MODE_LABEL } from '../lib/format';
+import { HARNESS_ORDER, getCategoryLabel, getHarnessLabel, getModeLabel } from '../lib/format';
+import { useI18n, type MessageKey } from '../lib/i18n';
 import type { HarnessKind, TrafficCategory } from '../types';
 import { Button, Callout, Dialog, Field, Kbd, cx, inputClass, useToast } from '../components/ui';
 
-const CATEGORY_HINT: Record<TrafficCategory, string> = {
-  'interactive-prompt': '用户对话与上下文',
-  'tool-execution-sync': '工具输出回传',
-  'codebase-indexing': '后台代码索引上传',
-  telemetry: '客户端遥测上报',
+const CATEGORY_LIST: TrafficCategory[] = ['interactive-prompt', 'tool-execution-sync', 'codebase-indexing', 'telemetry'];
+
+const CATEGORY_HINT_KEYS: Record<TrafficCategory, MessageKey> = {
+  'interactive-prompt': 'simulate.hintInteractive',
+  'tool-execution-sync': 'simulate.hintTool',
+  'codebase-indexing': 'simulate.hintIndex',
+  telemetry: 'simulate.hintTelemetry',
 };
 
 /** Run the offline simulator and jump to the record it produced. */
 export function useSimulate() {
   const { navigate, refreshLogs } = useStore();
+  const { t } = useI18n();
   const toast = useToast();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -32,13 +36,13 @@ export function useSimulate() {
       } catch (e) {
         const message = (e as Error).message;
         setError(message);
-        toast.push({ tone: 'danger', title: '模拟请求失败', body: message });
+        toast.push({ tone: 'danger', title: t('simulate.failedTitle'), body: message });
         return false;
       } finally {
         setBusy(false);
       }
     },
-    [navigate, refreshLogs, toast],
+    [navigate, refreshLogs, toast, t],
   );
   return { run, busy, error, clearError };
 }
@@ -55,6 +59,7 @@ function isBrokenJson(text: string): boolean {
 
 export function SimulateDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { config } = useStore();
+  const { locale, t } = useI18n();
   const { run, busy, error, clearError } = useSimulate();
   const [harness, setHarness] = useState<HarnessKind>('claude-code');
   const [category, setCategory] = useState<TrafficCategory>('interactive-prompt');
@@ -75,15 +80,19 @@ export function SimulateDialog({ open, onClose }: { open: boolean; onClose: () =
     <Dialog
       open={open}
       onClose={onClose}
-      title="模拟请求"
-      description="离线演练改写与还原流程，不发送网络请求。"
+      title={t('simulate.title')}
+      description={t('simulate.description')}
       width="max-w-xl"
       footer={
         <>
-          {config && <span className="mr-auto self-center text-xs text-fg-subtle">按当前模式「{MODE_LABEL[config.mode]}」处理</span>}
-          <Button onClick={onClose}>取消</Button>
+          {config && (
+            <span className="mr-auto self-center text-xs text-fg-subtle">
+              {t('simulate.modeNote', { mode: getModeLabel(config.mode, locale) })}
+            </span>
+          )}
+          <Button onClick={onClose}>{t('common.cancel')}</Button>
           <Button variant="primary" icon={<PaperPlaneTilt size={14} />} onClick={submit} disabled={busy}>
-            {busy ? '处理中…' : '发送'}
+            {t(busy ? 'simulate.sending' : 'simulate.send')}
           </Button>
         </>
       }
@@ -96,7 +105,7 @@ export function SimulateDialog({ open, onClose }: { open: boolean; onClose: () =
         }}
       >
         <div className="grid grid-cols-2 gap-4">
-          <Field label="工具" htmlFor="sim-harness">
+          <Field label={t('simulate.fieldTool')} htmlFor="sim-harness">
             <select
               id="sim-harness"
               data-autofocus
@@ -106,12 +115,12 @@ export function SimulateDialog({ open, onClose }: { open: boolean; onClose: () =
             >
               {HARNESS_ORDER.map((h) => (
                 <option key={h} value={h}>
-                  {HARNESS_LABEL[h]}
+                  {getHarnessLabel(h, locale)}
                 </option>
               ))}
             </select>
           </Field>
-          <Field label="流量类别" htmlFor="sim-category" hint={CATEGORY_HINT[category]}>
+          <Field label={t('simulate.fieldCategory')} htmlFor="sim-category" hint={t(CATEGORY_HINT_KEYS[category])}>
             <select
               id="sim-category"
               aria-describedby="sim-category-hint"
@@ -119,23 +128,25 @@ export function SimulateDialog({ open, onClose }: { open: boolean; onClose: () =
               onChange={(e) => setCategory(e.target.value as TrafficCategory)}
               className={cx(inputClass, 'h-8 w-full cursor-pointer')}
             >
-              {(Object.keys(CATEGORY_LABEL) as TrafficCategory[]).map((c) => (
+              {CATEGORY_LIST.map((c) => (
                 <option key={c} value={c}>
-                  {CATEGORY_LABEL[c]}
+                  {getCategoryLabel(c, locale)}
                 </option>
               ))}
             </select>
           </Field>
         </div>
         <Field
-          label="请求正文（可选）"
+          label={t('simulate.fieldPayload')}
           htmlFor="sim-payload"
           hint={
             brokenJson ? (
-              <span className="text-warn">内容以 JSON 开头但无法解析，请检查括号与引号。</span>
+              <span className="text-warn">{t('simulate.brokenJson')}</span>
             ) : (
               <>
-                留空使用内置示例 · <Kbd>Ctrl</Kbd> + <Kbd>Enter</Kbd> 发送
+                {t('simulate.hintBeforeKbd')}
+                <Kbd>Ctrl</Kbd> + <Kbd>Enter</Kbd>
+                {t('simulate.hintAfterKbd')}
               </>
             )
           }
@@ -158,7 +169,7 @@ export function SimulateDialog({ open, onClose }: { open: boolean; onClose: () =
           />
         </Field>
         {error && (
-          <Callout tone="danger" title="模拟请求失败">
+          <Callout tone="danger" title={t('simulate.failedTitle')}>
             {error}
           </Callout>
         )}

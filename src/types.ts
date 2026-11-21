@@ -8,6 +8,8 @@ export type CoverTheme = 'botanical-garden' | 'library-catalog' | 'bakery-recipe
 
 export type ToolCallSecretPolicy = 'never' | 'file-edits-only' | 'always';
 
+export type UiLanguage = 'system' | 'zh-CN' | 'en';
+
 export type Severity = 'critical' | 'high' | 'medium' | 'low';
 
 export interface AllHideConfig {
@@ -59,6 +61,7 @@ export interface HideConfig {
   projectSalt: string;
   toolCallSecretPolicy: ToolCallSecretPolicy;
   customRules: CustomRule[];
+  language?: UiLanguage;
 }
 
 export interface TrafficSummary {

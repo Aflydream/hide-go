@@ -1,22 +1,10 @@
 import { useId, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { ArrowsClockwise, Eye, EyeSlash, ShieldCheck, WarningCircle } from '@phosphor-icons/react';
 import { useStore } from '../store';
-import { Badge, Button, Callout, ConfirmDialog, IconButton, Skeleton, Switch, cx } from '../components/ui';
-import { COVER_THEME_LABEL, MODE_LABEL } from '../lib/format';
+import { Badge, Button, Callout, ConfirmDialog, IconButton, RadioCard, Section, Skeleton, Switch, cx } from '../components/ui';
+import { COVER_THEMES, getCoverThemeLabel, getModeLabel, getPolicyLabel } from '../lib/format';
+import { useI18n } from '../lib/i18n';
 import type { CoverTheme, HideConfig, PrivacyMode, ToolCallSecretPolicy } from '../types';
-
-function Section({ index, title, description, children }: { index: string; title: string; description: ReactNode; children: ReactNode }) {
-  return (
-    <section className="grid grid-cols-1 gap-x-10 gap-y-4 border-b border-line py-7 last:border-b-0 lg:grid-cols-[260px_minmax(0,1fr)]">
-      <div>
-        <p className="tabular font-mono text-2xs text-fg-subtle">{index}</p>
-        <h2 className="mt-1 text-sm font-semibold text-fg">{title}</h2>
-        <div className="mt-1.5 text-xs leading-5 text-fg-subtle">{description}</div>
-      </div>
-      <div className="min-w-0">{children}</div>
-    </section>
-  );
-}
 
 function ToggleRow({
   title,
@@ -50,68 +38,16 @@ function ToggleRow({
   );
 }
 
-function RadioCard<T extends string>({
-  name,
-  value,
-  current,
-  onSelect,
-  title,
-  description,
-  children,
-  badge,
-}: {
-  name: string;
-  value: T;
-  current: T;
-  onSelect: (v: T) => void;
-  title: string;
-  description: ReactNode;
-  children?: ReactNode;
-  badge?: ReactNode;
-}) {
-  const selected = value === current;
-  const id = useId();
-  return (
-    <label
-      htmlFor={id}
-      className={cx(
-        'block cursor-pointer rounded-md border px-4 py-3.5 transition-colors',
-        selected ? 'border-brand bg-brand/[0.06]' : 'border-line bg-surface hover:border-line-strong',
-      )}
-    >
-      <div className="flex items-start gap-3">
-        <input id={id} type="radio" name={name} value={value} checked={selected} onChange={() => onSelect(value)} className="peer sr-only" />
-        <span
-          aria-hidden="true"
-          className={cx(
-            'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-focus',
-            selected ? 'border-brand' : 'border-line-control',
-          )}
-        >
-          {selected && <span className="h-2 w-2 rounded-full bg-brand" />}
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold text-fg">{title}</span>
-            {badge}
-          </div>
-          <div className="mt-0.5 text-xs leading-5 text-fg-muted">{description}</div>
-          {children}
-        </div>
-      </div>
-    </label>
-  );
-}
-
 function Example({ local, vendor }: { local: string; vendor: string }) {
+  const { t } = useI18n();
   return (
     <dl className="mt-3 overflow-hidden rounded border border-line font-mono text-2xs leading-5">
       <div className="flex gap-3 bg-surface-2 px-3 py-1.5">
-        <dt className="w-10 shrink-0 text-fg-subtle">本地</dt>
+        <dt className="w-10 shrink-0 text-fg-subtle">{t('policy.exampleLocal')}</dt>
         <dd className="min-w-0 break-all text-fg">{local}</dd>
       </div>
       <div className="flex gap-3 border-t border-line px-3 py-1.5">
-        <dt className="w-10 shrink-0 text-fg-subtle">厂商</dt>
+        <dt className="w-10 shrink-0 text-fg-subtle">{t('policy.exampleVendor')}</dt>
         <dd className="min-w-0 break-all text-brand">{vendor}</dd>
       </div>
     </dl>
@@ -125,6 +61,7 @@ function randomSalt() {
 
 export function Policy() {
   const { config, saveConfig } = useStore();
+  const { locale, t } = useI18n();
   const [revealSalt, setRevealSalt] = useState(false);
   const [confirmSalt, setConfirmSalt] = useState(false);
   const themeRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -144,20 +81,16 @@ export function Policy() {
 
   return (
     <div className="mx-auto max-w-5xl px-6 pb-10">
-      <Section
-        index="01"
-        title="处理模式"
-        description="决定网关如何改写发往模型厂商的请求。切换立即对所有已接入的工具生效，无需重启。"
-      >
+      <Section index="01" title={t('policy.secModeTitle')} description={t('policy.secModeDesc')}>
         <div className="space-y-2.5">
           <RadioCard<PrivacyMode>
             name="mode"
             value="audit-only"
             current={config.mode}
-            onSelect={(mode) => set({ mode }, `已切换为「${MODE_LABEL[mode]}」`)}
-            title="仅审计"
-            description="原样转发，只在本地记录检测到的敏感数据。适合先摸清工具到底上传了什么。"
-            badge={<Badge tone="warn">不提供保护</Badge>}
+            onSelect={(mode) => set({ mode }, t('shell.modeSwitched', { mode: getModeLabel(mode, locale) }))}
+            title={getModeLabel('audit-only', locale)}
+            description={t('policy.auditDesc')}
+            badge={<Badge tone="warn">{t('policy.auditBadge')}</Badge>}
           >
             <Example local={'db = "postgres://admin:Sec99@10.16.8.9/vault"'} vendor={'db = "postgres://admin:Sec99@10.16.8.9/vault"'} />
           </RadioCard>
@@ -165,10 +98,10 @@ export function Policy() {
             name="mode"
             value="auto-desensitize"
             current={config.mode}
-            onSelect={(mode) => set({ mode }, `已切换为「${MODE_LABEL[mode]}」`)}
-            title="自动脱敏"
-            description="把密钥、连接串、内网地址、用户目录替换为同格式占位符；代码与提示词保持可读，响应返回时自动还原。"
-            badge={<Badge tone="brand">推荐</Badge>}
+            onSelect={(mode) => set({ mode }, t('shell.modeSwitched', { mode: getModeLabel(mode, locale) }))}
+            title={getModeLabel('auto-desensitize', locale)}
+            description={t('policy.autoDesc')}
+            badge={<Badge tone="brand">{t('policy.autoBadge')}</Badge>}
           >
             <Example
               local={'db = "postgres://admin:Sec99@10.16.8.9/vault"  # /home/alice/titan'}
@@ -179,56 +112,55 @@ export function Policy() {
             name="mode"
             value="all-hide"
             current={config.mode}
-            onSelect={(mode) => set({ mode }, `已切换为「${MODE_LABEL[mode]}」`)}
-            title="All-Hide"
-            description="在自动脱敏的基础上，把复合代码标识符、// 注释与字符串字面量映射到无关领域。工具定义、调用 ID 与签名块保持原样，请求始终是合法的 API 调用。"
+            onSelect={(mode) => set({ mode }, t('shell.modeSwitched', { mode: getModeLabel(mode, locale) }))}
+            title={getModeLabel('all-hide', locale)}
+            description={t('policy.allHideDesc')}
           >
-            <Example local={'fn verify_margin(wallet_secret: &str) // 清算阈值校验'} vendor={'fn orchid_lotus_207(fern_moss_481: &str) // [BotanicalSensor-01] Calibrate greenhouse soil humidity and mist interval'} />
+            <Example
+              local={'fn verify_margin(wallet_secret: &str) // liquidation threshold check'}
+              vendor={'fn orchid_lotus_207(fern_moss_481: &str) // [BotanicalSensor-01] Calibrate greenhouse soil humidity and mist interval'}
+            />
           </RadioCard>
         </div>
       </Section>
 
       <Section
         index="02"
-        title="检测范围"
+        title={t('policy.secScopeTitle')}
         description={
           <>
-            在「自动脱敏」与「All-Hide」下替换这些数据；「仅审计」下只记录。
-            {!protecting && <span className="mt-2 block text-warn">当前为仅审计模式，以下设置只影响检测报告。</span>}
+            {t('policy.secScopeDesc')}
+            {!protecting && <span className="mt-2 block text-warn">{t('policy.secScopeAuditNote')}</span>}
           </>
         }
       >
         <div className="divide-y divide-line rounded-md border border-line bg-surface">
           <ToggleRow
-            title="凭据与密钥"
-            description="API 密钥、PEM 私钥、数据库连接串及 token/password 字段"
+            title={t('policy.scopeSecretsTitle')}
+            description={t('policy.scopeSecretsDesc')}
             checked={config.protectSecretsAndKeys}
             onChange={(v) => set({ protectSecretsAndKeys: v })}
           />
           <ToggleRow
-            title="本机路径与身份"
-            description="用户目录前缀与邮箱地址（保留相对目录结构）"
+            title={t('policy.scopePathsTitle')}
+            description={t('policy.scopePathsDesc')}
             checked={config.protectProjectPaths}
             onChange={(v) => set({ protectProjectPaths: v })}
           />
           <ToggleRow
-            title="内网地址与域名"
-            description="RFC 1918 私网 IP（→ 198.18.0.0/15）及 .internal/.local 等内网域名"
+            title={t('policy.scopeNetworkTitle')}
+            description={t('policy.scopeNetworkDesc')}
             checked={config.protectInternalNetwork}
             onChange={(v) => set({ protectInternalNetwork: v })}
           />
         </div>
       </Section>
 
-      <Section
-        index="03"
-        title="静默遥测"
-        description="按路径匹配遥测端点（不影响对话与推理）"
-      >
+      <Section index="03" title={t('policy.secTelemetryTitle')} description={t('policy.secTelemetryDesc')}>
         <div className="divide-y divide-line rounded-md border border-line bg-surface">
           <ToggleRow
-            title="在本地应答遥测请求"
-            description="直接返回成功响应，不外发（仅审计模式除外）"
+            title={t('policy.telemetryRowTitle')}
+            description={t('policy.telemetryRowDesc')}
             checked={config.blockSilentTelemetry}
             onChange={(v) => set({ blockSilentTelemetry: v })}
             disabled={!protecting}
@@ -236,17 +168,13 @@ export function Policy() {
         </div>
       </Section>
 
-      <Section
-        index="04"
-        title="工具调用中的凭据"
-        description="防止提示注入诱导本机执行带真实密钥的工具参数"
-      >
+      <Section index="04" title={t('policy.secToolSecretsTitle')} description={t('policy.secToolSecretsDesc')}>
         <div className="space-y-2.5">
           {(
             [
-              ['never', '始终保留占位符', 'Shell / URL / 文件参数均不还原凭据', undefined],
-              ['file-edits-only', '仅文件写入时还原', '仅写入或编辑文件的内容字段还原；命令与 URL 保留占位符', <Badge tone="brand">推荐</Badge>],
-              ['always', '全部还原', '所有工具调用参数均还原真实凭据', <Badge tone="warn">风险较高</Badge>],
+              ['never', getPolicyLabel('never', locale), t('policy.toolNeverDesc'), undefined],
+              ['file-edits-only', getPolicyLabel('file-edits-only', locale), t('policy.toolEditsDesc'), <Badge tone="brand">{t('policy.autoBadge')}</Badge>],
+              ['always', getPolicyLabel('always', locale), t('policy.toolAlwaysDesc'), <Badge tone="warn">{t('policy.toolAlwaysBadge')}</Badge>],
             ] as Array<[ToolCallSecretPolicy, string, string, ReactNode]>
           ).map(([value, title, description, badge]) => (
             <RadioCard<ToolCallSecretPolicy>
@@ -261,10 +189,11 @@ export function Policy() {
             />
           ))}
           <details className="text-xs text-fg-subtle">
-            <summary className="cursor-pointer select-none hover:text-fg-muted">还原范围说明</summary>
+            <summary className="cursor-pointer select-none hover:text-fg-muted">{t('policy.toolScopeSummary')}</summary>
             <p className="mt-1.5 leading-5">
-              普通文本回复始终还原；本机路径与内网地址不受此项限制。例如启用「仅文件写入时还原」后，
-              <code className="mx-1 font-mono">curl …?k=占位符</code> 会保持占位符而不外泄真实密钥。
+              {t('policy.toolScopeDetailBefore')}
+              <code className="mx-1 font-mono">{t('policy.toolScopeDetailCode')}</code>
+              {t('policy.toolScopeDetailAfter')}
             </p>
           </details>
         </div>
@@ -272,13 +201,19 @@ export function Policy() {
 
       <Section
         index="05"
-        title="All-Hide 伪装层"
+        title={t('policy.secAllHideTitle')}
         description={
           <>
-            仅在 All-Hide 模式下生效
+            {t('policy.secAllHideDesc')}
             {!allHideActive && (
-              <Button size="sm" variant="secondary" className="mt-3" icon={<ShieldCheck size={14} />} onClick={() => set({ mode: 'all-hide' }, '已切换为「All-Hide」')}>
-                切换到 All-Hide
+              <Button
+                size="sm"
+                variant="secondary"
+                className="mt-3"
+                icon={<ShieldCheck size={14} />}
+                onClick={() => set({ mode: 'all-hide' }, t('shell.modeSwitched', { mode: getModeLabel('all-hide', locale) }))}
+              >
+                {t('policy.switchToAllHide')}
               </Button>
             )}
           </>
@@ -286,21 +221,25 @@ export function Policy() {
       >
         <div className={cx('divide-y divide-line rounded-md border border-line bg-surface', !allHideActive && 'opacity-80')}>
           <ToggleRow
-            title="字符串字面量掩码"
-            description="代码引号字面量替换为 <<HIDE_STR_…>>"
+            title={t('policy.literalTitle')}
+            description={t('policy.literalDesc')}
             checked={config.allHide.strictLiteralMasking}
             onChange={(v) => setAllHide({ strictLiteralMasking: v })}
           />
           <div className="px-4 py-3.5">
             <div className="flex items-start justify-between gap-6">
               <div>
-                <p className="text-sm font-medium text-fg">同构领域伪装</p>
-                <p className="mt-0.5 text-xs leading-5 text-fg-subtle">按命名风格映射标识符与 // 注释</p>
+                <p className="text-sm font-medium text-fg">{t('policy.camouflageTitle')}</p>
+                <p className="mt-0.5 text-xs leading-5 text-fg-subtle">{t('policy.camouflageDesc')}</p>
               </div>
-              <Switch checked={config.allHide.enableIsomorphicCamouflage} onChange={(v) => setAllHide({ enableIsomorphicCamouflage: v })} label="同构领域伪装" />
+              <Switch
+                checked={config.allHide.enableIsomorphicCamouflage}
+                onChange={(v) => setAllHide({ enableIsomorphicCamouflage: v })}
+                label={t('policy.camouflageTitle')}
+              />
             </div>
-            <div role="radiogroup" aria-label="伪装词库" className="mt-3 grid grid-cols-3 gap-2">
-              {(Object.keys(COVER_THEME_LABEL) as CoverTheme[]).map((theme, idx, themes) => {
+            <div role="radiogroup" aria-label={t('policy.coverThemesAria')} className="mt-3 grid grid-cols-3 gap-2">
+              {COVER_THEMES.map((theme: CoverTheme, idx, themes) => {
                 const active = config.allHide.coverTheme === theme;
                 const onThemeKeyDown = (e: KeyboardEvent<HTMLButtonElement>) => {
                   const dir =
@@ -327,7 +266,7 @@ export function Policy() {
                       active ? 'border-brand bg-brand/[0.06] text-fg' : 'border-line text-fg-muted hover:border-line-strong',
                     )}
                   >
-                    <span className="block font-medium">{COVER_THEME_LABEL[theme]}</span>
+                    <span className="block font-medium">{getCoverThemeLabel(theme, locale)}</span>
                     <span className="mt-0.5 block font-mono text-2xs text-fg-subtle">
                       {theme === 'botanical-garden' ? 'fern_orchid_204' : theme === 'library-catalog' ? 'folio_atlas_318' : 'brioche_glaze_562'}
                     </span>
@@ -337,49 +276,47 @@ export function Policy() {
             </div>
           </div>
           <ToggleRow
-            title="密钥流加密"
-            description="加密为 ⟦HIDE-CIPHER::…⟧（模型不可读，仅用于原样回传）"
+            title={t('policy.cipherTitle')}
+            description={t('policy.cipherDesc')}
             checked={config.allHide.enableCipherGarble}
             onChange={(v) => setAllHide({ enableCipherGarble: v })}
-            badge={config.allHide.enableCipherGarble ? <Badge tone="warn">模型不可读</Badge> : undefined}
+            badge={config.allHide.enableCipherGarble ? <Badge tone="warn">{t('policy.cipherBadge')}</Badge> : undefined}
           />
           <ToggleRow
-            title="索引上传诱饵"
-            description="保留 JSON 结构与长度，代码内容替换为诱饵"
+            title={t('policy.chaffTitle')}
+            description={t('policy.chaffDesc')}
             checked={config.allHide.enableTelemetryChaff}
             onChange={(v) => setAllHide({ enableTelemetryChaff: v })}
           />
         </div>
         {allHideActive && config.allHide.enableCipherGarble && (
           <div className="mt-3">
-            <Callout tone="warn" title="密钥流加密已开启">
-              模型无法读取密文内容；常规编码建议关闭此层。
+            <Callout tone="warn" title={t('policy.cipherWarnTitle')}>
+              {t('policy.cipherWarnBody')}
             </Callout>
           </div>
         )}
       </Section>
 
-      <Section
-        index="06"
-        title="项目 Salt"
-        description="同构伪装映射种子（存本机配置）"
-      >
+      <Section index="06" title={t('policy.secSaltTitle')} description={t('policy.secSaltDesc')}>
         <div className="flex items-center gap-2 rounded-md border border-line bg-surface px-4 py-3">
-          <code className="min-w-0 flex-1 truncate font-mono text-sm text-fg">{revealSalt ? config.projectSalt : `${config.projectSalt.slice(0, 5)}${'•'.repeat(18)}`}</code>
+          <code className="min-w-0 flex-1 truncate font-mono text-sm text-fg">
+            {revealSalt ? config.projectSalt : `${config.projectSalt.slice(0, 5)}${'•'.repeat(18)}`}
+          </code>
           <IconButton
-            label={revealSalt ? '隐藏 Salt' : '显示 Salt'}
+            label={t(revealSalt ? 'policy.hideSalt' : 'policy.showSalt')}
             pressed={revealSalt}
             icon={revealSalt ? <EyeSlash size={15} /> : <Eye size={15} />}
             onClick={() => setRevealSalt((v) => !v)}
           />
           <Button size="sm" icon={<ArrowsClockwise size={14} />} onClick={() => setConfirmSalt(true)}>
-            重新生成
+            {t('policy.regenerateSalt')}
           </Button>
         </div>
         {config.projectSalt.startsWith('hide-go-quantum-salt') && (
           <p className="mt-2 flex items-center gap-1.5 text-xs text-warn">
             <WarningCircle aria-hidden="true" size={13} weight="bold" />
-            当前为旧版默认 Salt，建议重新生成。
+            {t('policy.legacySaltWarn')}
           </p>
         )}
       </Section>
@@ -389,11 +326,11 @@ export function Policy() {
         onClose={() => setConfirmSalt(false)}
         onConfirm={async () => {
           setConfirmSalt(false);
-          await saveConfig({ ...config, projectSalt: randomSalt() }, '已生成新的项目 Salt');
+          await saveConfig({ ...config, projectSalt: randomSalt() }, t('policy.saltRegenerated'));
         }}
-        title="重新生成项目 Salt？"
-        description="新出现的标识符将使用新映射；已有映射保持不变，彻底重置请清空映射表。"
-        confirmLabel="重新生成"
+        title={t('policy.confirmSaltTitle')}
+        description={t('policy.confirmSaltDesc')}
+        confirmLabel={t('policy.regenerateSalt')}
       />
     </div>
   );

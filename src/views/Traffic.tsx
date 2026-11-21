@@ -3,27 +3,30 @@ import { ArrowsLeftRight, MagnifyingGlass, Trash, PaperPlaneTilt, WarningCircle,
 import { useStore } from '../store';
 import { api } from '../lib/api';
 import {
-  CATEGORY_LABEL,
-  FINDING_LABEL,
-  HARNESS_LABEL,
   HARNESS_ORDER,
-  MODE_LABEL,
-  SEVERITY_LABEL,
   SEVERITY_RANK,
   describeAction,
   formatBytes,
   formatLatency,
+  getCategoryLabel,
+  getFindingLabel,
+  getHarnessLabel,
+  getModeLabel,
+  getSeverityLabel,
 } from '../lib/format';
+import { useI18n } from '../lib/i18n';
 import type { HarnessKind, Severity, TrafficAuditRecord, TrafficCategory } from '../types';
 import { Badge, Button, Callout, ConfirmDialog, EmptyState, Skeleton, Switch, Tabs, cx, inputClass, useToast } from '../components/ui';
 import { CodeView, buildMatcher } from '../components/CodeView';
 
 export function SeverityBadge({ severity, count }: { severity: Severity | null; count: number }) {
+  const { locale, t } = useI18n();
   const tone = severity === 'critical' || severity === 'high' ? 'danger' : severity === 'medium' ? 'warn' : 'neutral';
+  const maxSeverity = severity ? getSeverityLabel(severity, locale) : '';
   return (
     <Badge tone={tone} className="tabular">
       {count}
-      <span className="sr-only">项，最高{severity ? SEVERITY_LABEL[severity] : ''}</span>
+      <span className="sr-only">{t('traffic.severitySr', { severity: maxSeverity })}</span>
     </Badge>
   );
 }
@@ -32,7 +35,7 @@ type DetailTab = 'request' | 'response' | 'findings' | 'meta';
 type ActionFilter = 'all' | 'masked' | 'blocked' | 'passed' | 'error';
 
 function matchesAction(action: string, filter: ActionFilter) {
-  const tone = describeAction(action);
+  const tone = describeAction(action, 'en');
   switch (filter) {
     case 'all':
       return true;
@@ -51,6 +54,7 @@ const selectClass = cx(inputClass, 'h-8 cursor-pointer pr-7');
 
 export function Traffic() {
   const { logs, logsLoading, params, navigate, refreshLogs, openSimulator, vault } = useStore();
+  const { locale, t } = useI18n();
   const toast = useToast();
   const [query, setQuery] = useState('');
   const [harness, setHarness] = useState<HarnessKind | 'all'>('all');
@@ -69,9 +73,12 @@ export function Traffic() {
         (category === 'all' || r.category === category) &&
         (!hideSimulated || !r.simulated) &&
         matchesAction(r.actionTaken, action) &&
-        (!q || r.endpoint.toLowerCase().includes(q) || HARNESS_LABEL[r.harness].toLowerCase().includes(q) || r.id.startsWith(q)),
+        (!q ||
+          r.endpoint.toLowerCase().includes(q) ||
+          getHarnessLabel(r.harness, locale).toLowerCase().includes(q) ||
+          r.id.startsWith(q)),
     );
-  }, [logs, query, harness, category, action, hideSimulated]);
+  }, [logs, query, harness, category, action, hideSimulated, locale]);
 
   const select = useCallback((id: string) => navigate('traffic', { id }), [navigate]);
   const effectiveId = selectedId ?? rows[0]?.id ?? null;
@@ -94,9 +101,9 @@ export function Traffic() {
       await api.clearLogs();
       await refreshLogs();
       navigate('traffic');
-      toast.push({ tone: 'brand', title: '流量记录已清空' });
+      toast.push({ tone: 'brand', title: t('traffic.clearSuccess') });
     } catch (e) {
-      toast.push({ tone: 'danger', title: '清空失败', body: (e as Error).message });
+      toast.push({ tone: 'danger', title: t('traffic.clearFailed'), body: (e as Error).message });
     }
     setConfirmClear(false);
   };
@@ -112,37 +119,37 @@ export function Traffic() {
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="搜索端点或工具"
-            aria-label="搜索流量"
+            placeholder={t('traffic.searchPlaceholder')}
+            aria-label={t('traffic.searchAria')}
             className={cx(inputClass, 'h-8 w-56 pl-8')}
           />
         </div>
-        <select aria-label="按工具筛选" value={harness} onChange={(e) => setHarness(e.target.value as HarnessKind | 'all')} className={selectClass}>
-          <option value="all">全部工具</option>
+        <select aria-label={t('traffic.filterToolAria')} value={harness} onChange={(e) => setHarness(e.target.value as HarnessKind | 'all')} className={selectClass}>
+          <option value="all">{t('traffic.allTools')}</option>
           {HARNESS_ORDER.map((h) => (
             <option key={h} value={h}>
-              {HARNESS_LABEL[h]}
+              {getHarnessLabel(h, locale)}
             </option>
           ))}
         </select>
-        <select aria-label="按类别筛选" value={category} onChange={(e) => setCategory(e.target.value as TrafficCategory | 'all')} className={selectClass}>
-          <option value="all">全部类别</option>
-          {(Object.keys(CATEGORY_LABEL) as TrafficCategory[]).map((c) => (
+        <select aria-label={t('traffic.filterCategoryAria')} value={category} onChange={(e) => setCategory(e.target.value as TrafficCategory | 'all')} className={selectClass}>
+          <option value="all">{t('traffic.allCategories')}</option>
+          {(['interactive-prompt', 'tool-execution-sync', 'codebase-indexing', 'telemetry'] as TrafficCategory[]).map((c) => (
             <option key={c} value={c}>
-              {CATEGORY_LABEL[c]}
+              {getCategoryLabel(c, locale)}
             </option>
           ))}
         </select>
-        <select aria-label="按处理结果筛选" value={action} onChange={(e) => setAction(e.target.value as ActionFilter)} className={selectClass}>
-          <option value="all">全部结果</option>
-          <option value="masked">已脱敏 / 伪装</option>
-          <option value="blocked">已拦截</option>
-          <option value="passed">原样透传</option>
-          <option value="error">转发失败</option>
+        <select aria-label={t('traffic.filterActionAria')} value={action} onChange={(e) => setAction(e.target.value as ActionFilter)} className={selectClass}>
+          <option value="all">{t('traffic.allActions')}</option>
+          <option value="masked">{t('traffic.actionMasked')}</option>
+          <option value="blocked">{t('traffic.actionBlocked')}</option>
+          <option value="passed">{t('traffic.actionPassed')}</option>
+          <option value="error">{t('traffic.actionError')}</option>
         </select>
         <label className="ml-1 flex cursor-pointer items-center gap-2 text-xs text-fg-muted">
-          <Switch checked={hideSimulated} onChange={setHideSimulated} label="隐藏模拟记录" />
-          隐藏模拟记录
+          <Switch checked={hideSimulated} onChange={setHideSimulated} label={t('traffic.hideSimulated')} />
+          {t('traffic.hideSimulated')}
         </label>
         {filtersActive && (
           <Button
@@ -156,18 +163,18 @@ export function Traffic() {
               setHideSimulated(false);
             }}
           >
-            重置筛选
+            {t('common.resetFilters')}
           </Button>
         )}
         <div className="ml-auto flex items-center gap-2">
           <span className="tabular text-xs text-fg-subtle" role="status">
-            {rows.length} / {logs.length} 条
+            {t('traffic.countSummary', { rows: rows.length, total: logs.length })}
           </span>
           <Button size="sm" icon={<PaperPlaneTilt size={14} />} onClick={openSimulator}>
-            模拟请求
+            {t('shell.simulate')}
           </Button>
           <Button size="sm" variant="ghost" icon={<Trash size={14} />} disabled={!logs.length} onClick={() => setConfirmClear(true)}>
-            清空
+            {t('common.clear')}
           </Button>
         </div>
       </div>
@@ -182,38 +189,38 @@ export function Traffic() {
             </div>
           ) : rows.length === 0 ? (
             filtersActive ? (
-              <EmptyState icon={<Funnel size={20} />} title="无匹配记录">
-                尝试调整筛选或搜索词
+              <EmptyState icon={<Funnel size={20} />} title={t('traffic.noMatchesTitle')}>
+                {t('traffic.noMatchesBody')}
               </EmptyState>
             ) : (
               <EmptyState
                 icon={<ArrowsLeftRight size={20} />}
-                title="暂无流量"
+                title={t('traffic.emptyTitle')}
                 action={
                   <Button size="sm" variant="primary" onClick={() => navigate('integrations')}>
-                    查看接入方式
+                    {t('overview.integrationGuide')}
                   </Button>
                 }
               >
-                接入工具或运行模拟请求后，记录将显示在此
+                {t('traffic.emptyBody')}
               </EmptyState>
             )
           ) : (
             <table className="w-full table-fixed text-left text-xs">
-              <caption className="sr-only">流量记录，使用上下方向键切换</caption>
+              <caption className="sr-only">{t('traffic.tableCaption')}</caption>
               <thead className="sticky top-0 z-10 bg-surface-2">
                 <tr className="border-b border-line text-2xs text-fg-subtle">
-                  <th scope="col" className="w-[76px] py-2 pl-4 font-medium">时间</th>
-                  <th scope="col" className="py-2 pl-2 font-medium">工具 / 端点</th>
-                  <th scope="col" className="w-[92px] py-2 pl-2 font-medium">处理</th>
-                  <th scope="col" className="w-12 py-2 pl-2 text-right font-medium">状态</th>
-                  <th scope="col" className="w-14 py-2 pl-2 pr-4 text-right font-medium">敏感项</th>
+                  <th scope="col" className="w-[76px] py-2 pl-4 font-medium">{t('traffic.colTime')}</th>
+                  <th scope="col" className="py-2 pl-2 font-medium">{t('traffic.colToolEndpoint')}</th>
+                  <th scope="col" className="w-[104px] py-2 pl-2 font-medium">{t('traffic.colAction')}</th>
+                  <th scope="col" className="w-12 py-2 pl-2 text-right font-medium">{t('traffic.colStatus')}</th>
+                  <th scope="col" className="w-14 py-2 pl-2 pr-4 text-right font-medium">{t('traffic.colFindings')}</th>
                 </tr>
               </thead>
               <tbody ref={listRef} onKeyDown={onListKey} className="divide-y divide-line">
                 {rows.map((r, idx) => {
                   const active = r.id === effectiveId;
-                  const act = describeAction(r.actionTaken);
+                  const act = describeAction(r.actionTaken, locale);
                   const rowTabIndex = active || (!hasSelectedRow && idx === 0) ? 0 : -1;
                   return (
                     <tr
@@ -234,9 +241,9 @@ export function Traffic() {
                       </td>
                       <td className="min-w-0 py-2 pl-2">
                         <div className="flex items-center gap-1.5">
-                          <span className="truncate font-medium text-fg">{HARNESS_LABEL[r.harness]}</span>
-                          <span className="shrink-0 text-2xs text-fg-subtle">{CATEGORY_LABEL[r.category]}</span>
-                          {r.simulated && <span className="shrink-0 text-2xs text-info">模拟</span>}
+                          <span className="truncate font-medium text-fg">{getHarnessLabel(r.harness, locale)}</span>
+                          <span className="shrink-0 text-2xs text-fg-subtle">{getCategoryLabel(r.category, locale)}</span>
+                          {r.simulated && <span className="shrink-0 text-2xs text-info">{t('overview.simulatedTag')}</span>}
                         </div>
                         <p className="truncate font-mono text-2xs text-fg-subtle" title={r.endpoint}>
                           {r.method} {r.endpoint}
@@ -246,10 +253,10 @@ export function Traffic() {
                         <Badge tone={act.tone}>{act.label}</Badge>
                       </td>
                       <td className={cx('tabular py-2 pl-2 text-right align-top font-mono', r.status >= 400 || r.status === 0 ? 'text-danger' : 'text-fg-muted')}>
-                        {r.status || '—'}
+                        {r.status || t('common.none')}
                       </td>
                       <td className="py-2 pl-2 pr-4 text-right align-top">
-                        {r.findingCount > 0 ? <SeverityBadge severity={r.topSeverity} count={r.findingCount} /> : <span className="text-fg-subtle">—</span>}
+                        {r.findingCount > 0 ? <SeverityBadge severity={r.topSeverity} count={r.findingCount} /> : <span className="text-fg-subtle">{t('common.none')}</span>}
                       </td>
                     </tr>
                   );
@@ -263,8 +270,8 @@ export function Traffic() {
           {effectiveId ? (
             <RecordDetail key={effectiveId} id={effectiveId} vaultTokens={vault} tab={tab} onTabChange={setTab} />
           ) : (
-            <EmptyState icon={<ArrowsLeftRight size={20} />} title="选择一条记录">
-              对比本地原文、厂商视角与还原结果
+            <EmptyState icon={<ArrowsLeftRight size={20} />} title={t('traffic.selectPromptTitle')}>
+              {t('traffic.selectPromptBody')}
             </EmptyState>
           )}
         </div>
@@ -274,9 +281,9 @@ export function Traffic() {
         open={confirmClear}
         onClose={() => setConfirmClear(false)}
         onConfirm={clear}
-        title="清空流量记录？"
-        description="仅清除列表显示，统计计数与映射表保留。"
-        confirmLabel="清空记录"
+        title={t('traffic.confirmClearTitle')}
+        description={t('traffic.confirmClearDesc')}
+        confirmLabel={t('traffic.confirmClearBtn')}
       />
     </div>
   );
@@ -293,6 +300,7 @@ function RecordDetail({
   tab: DetailTab;
   onTabChange: (tab: DetailTab) => void;
 }) {
+  const { locale, t } = useI18n();
   const [record, setRecord] = useState<TrafficAuditRecord | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -322,7 +330,7 @@ function RecordDetail({
     }
     const findingTokens = record.findings
       .map((f) => f.replacementToken)
-      .filter((t) => !t.startsWith('<<CHAFF') && !/[一-鿿]/.test(t));
+      .filter((tok) => !tok.startsWith('<<CHAFF') && !/[一-鿿]/.test(tok));
     return {
       vendor: buildMatcher([...findingTokens, ...presentTokens], true),
       local: buildMatcher(presentOriginals, false),
@@ -332,8 +340,8 @@ function RecordDetail({
   if (error) {
     return (
       <div className="p-6">
-        <Callout tone="warn" title="记录已不可用">
-          {error === 'record has expired from the audit window' ? '该记录已滚出最近 200 条的保留窗口。' : error}
+        <Callout tone="warn" title={t('traffic.recordUnavailable')}>
+          {error === 'record has expired from the audit window' ? t('traffic.recordExpired') : error}
         </Callout>
       </div>
     );
@@ -348,7 +356,7 @@ function RecordDetail({
     );
   }
 
-  const act = describeAction(record.actionTaken);
+  const act = describeAction(record.actionTaken, locale);
   const findingsTotal = record.findings.reduce((n, f) => n + f.count, 0);
   const blockedLocally = record.actionTaken === 'telemetry-blocked';
 
@@ -357,8 +365,8 @@ function RecordDetail({
       <header className="border-b border-line px-5 py-3">
         <div className="flex items-center gap-2">
           <Badge tone={act.tone}>{act.label}</Badge>
-          <Badge>{MODE_LABEL[record.appliedMode]}</Badge>
-          {record.simulated && <Badge tone="info">模拟</Badge>}
+          <Badge>{getModeLabel(record.appliedMode, locale)}</Badge>
+          {record.simulated && <Badge tone="info">{t('overview.simulatedTag')}</Badge>}
           <span className="tabular ml-auto font-mono text-2xs text-fg-subtle">{record.timestamp}</span>
         </div>
         <p className="mt-2 truncate font-mono text-sm text-fg" title={record.endpoint}>
@@ -366,23 +374,25 @@ function RecordDetail({
         </p>
         <dl className="mt-1.5 flex flex-wrap gap-x-5 gap-y-1 text-xs text-fg-subtle">
           <div className="flex gap-1.5">
-            <dt>工具</dt>
-            <dd className="text-fg-muted">{HARNESS_LABEL[record.harness]}</dd>
+            <dt>{t('traffic.labelTool')}</dt>
+            <dd className="text-fg-muted">{getHarnessLabel(record.harness, locale)}</dd>
           </div>
           <div className="flex gap-1.5">
-            <dt>上游</dt>
-            <dd className="text-fg-muted">{blockedLocally ? '未发出（本地应答）' : record.upstreamVendor}</dd>
+            <dt>{t('traffic.labelUpstream')}</dt>
+            <dd className="text-fg-muted">{blockedLocally ? t('traffic.blockedLocally') : record.upstreamVendor}</dd>
           </div>
           <div className="flex gap-1.5">
-            <dt>状态</dt>
-            <dd className={cx('tabular font-mono', record.status >= 400 || record.status === 0 ? 'text-danger' : 'text-fg-muted')}>{record.status || '—'}</dd>
+            <dt>{t('traffic.labelStatus')}</dt>
+            <dd className={cx('tabular font-mono', record.status >= 400 || record.status === 0 ? 'text-danger' : 'text-fg-muted')}>
+              {record.status || t('common.none')}
+            </dd>
           </div>
           <div className="flex gap-1.5">
-            <dt>耗时</dt>
+            <dt>{t('traffic.labelLatency')}</dt>
             <dd className="tabular font-mono text-fg-muted">{formatLatency(record.latencyMs)}</dd>
           </div>
           <div className="flex gap-1.5">
-            <dt>还原</dt>
+            <dt>{t('traffic.labelRestored')}</dt>
             <dd className="tabular font-mono text-fg-muted">{record.restoredCount}</dd>
           </div>
         </dl>
@@ -390,45 +400,65 @@ function RecordDetail({
 
       <Tabs
         idPrefix="detail"
-        label="记录详情"
+        label={t('traffic.detailTabsAria')}
         value={tab}
         onChange={onTabChange}
         tabs={[
-          { value: 'request', label: '请求对照' },
-          { value: 'response', label: '响应对照' },
-          { value: 'findings', label: '敏感项', count: findingsTotal },
-          { value: 'meta', label: '元数据' },
+          { value: 'request', label: t('traffic.tabRequest') },
+          { value: 'response', label: t('traffic.tabResponse') },
+          { value: 'findings', label: t('traffic.tabFindings'), count: findingsTotal },
+          { value: 'meta', label: t('traffic.tabMeta') },
         ]}
       />
 
       <div id="detail-panel" role="tabpanel" aria-labelledby={`detail-tab-${tab}`} className="flex min-h-0 flex-1 flex-col">
         {(record.truncated || record.withheldCount > 0) && (tab === 'request' || tab === 'response') && (
           <div className="space-y-2 border-b border-line px-4 py-2.5">
-            {record.truncated && <p className="text-xs text-fg-subtle">正文已截断（超过 64 KB）</p>}
+            {record.truncated && <p className="text-xs text-fg-subtle">{t('traffic.truncatedNotice')}</p>}
             {record.withheldCount > 0 && tab === 'response' && (
               <p className="flex items-center gap-1.5 text-xs text-warn">
                 <WarningCircle aria-hidden="true" size={13} weight="bold" />
-                已保留 {record.withheldCount} 个工具参数凭据占位符
+                {t('traffic.withheldNotice', { count: record.withheldCount })}
               </p>
             )}
           </div>
         )}
         {tab === 'request' && (
           <div className="grid min-h-0 flex-1 grid-rows-2 divide-y divide-line 2xl:grid-cols-2 2xl:grid-rows-1 2xl:divide-x 2xl:divide-y-0">
-            <CodeView title="本地发出" caption="本地原文" text={record.localRequestPayload} bytes={record.requestBytes} matcher={matchers.local} mark="secret" />
             <CodeView
-              title="厂商收到"
-              caption={blockedLocally ? '未发出' : '已改写'}
+              title={t('traffic.codeLocalOut')}
+              caption={t('traffic.codeLocalOutCaption')}
+              text={record.localRequestPayload}
+              bytes={record.requestBytes}
+              matcher={matchers.local}
+              mark="secret"
+            />
+            <CodeView
+              title={t('traffic.codeVendorIn')}
+              caption={blockedLocally ? t('traffic.codeVendorBlockedCaption') : t('traffic.codeVendorSanitizedCaption')}
               text={record.vendorVisiblePayload}
               matcher={matchers.vendor}
-              emptyText="已在本地拦截"
+              emptyText={t('traffic.codeVendorBlockedEmpty')}
             />
           </div>
         )}
         {tab === 'response' && (
           <div className="grid min-h-0 flex-1 grid-rows-2 divide-y divide-line 2xl:grid-cols-2 2xl:grid-rows-1 2xl:divide-x 2xl:divide-y-0">
-            <CodeView title="厂商返回" caption="含占位符" text={record.vendorRawResponse} matcher={matchers.vendor} emptyText="无上游响应" />
-            <CodeView title="交给工具" caption="已还原" text={record.localRestoredResponse} bytes={record.responseBytes} matcher={matchers.local} mark="secret" />
+            <CodeView
+              title={t('traffic.codeVendorRaw')}
+              caption={t('traffic.codeVendorRawCaption')}
+              text={record.vendorRawResponse}
+              matcher={matchers.vendor}
+              emptyText={t('traffic.codeVendorRawEmpty')}
+            />
+            <CodeView
+              title={t('traffic.codeLocalRestored')}
+              caption={t('traffic.codeLocalRestoredCaption')}
+              text={record.localRestoredResponse}
+              bytes={record.responseBytes}
+              matcher={matchers.local}
+              mark="secret"
+            />
           </div>
         )}
         {tab === 'findings' && <FindingsTable record={record} />}
@@ -439,14 +469,15 @@ function RecordDetail({
 }
 
 function FindingsTable({ record }: { record: TrafficAuditRecord }) {
+  const { locale, t } = useI18n();
   const sorted = useMemo(
     () => [...record.findings].sort((a, b) => SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity]),
     [record.findings],
   );
   if (!sorted.length) {
     return (
-      <EmptyState icon={<MagnifyingGlass size={20} />} title="未检出敏感数据">
-        未命中内置规则或自定义规则
+      <EmptyState icon={<MagnifyingGlass size={20} />} title={t('traffic.findingsEmptyTitle')}>
+        {t('traffic.findingsEmptyBody')}
       </EmptyState>
     );
   }
@@ -455,21 +486,23 @@ function FindingsTable({ record }: { record: TrafficAuditRecord }) {
       <table className="w-full text-left text-xs">
         <thead className="sticky top-0 bg-surface-2">
           <tr className="border-b border-line text-2xs text-fg-subtle">
-            <th scope="col" className="px-4 py-2 font-medium">级别</th>
-            <th scope="col" className="px-2 py-2 font-medium">类型</th>
-            <th scope="col" className="px-2 py-2 font-medium">原值（遮罩）</th>
-            <th scope="col" className="px-2 py-2 font-medium">替换为</th>
-            <th scope="col" className="px-4 py-2 text-right font-medium">次数</th>
+            <th scope="col" className="px-4 py-2 font-medium">{t('traffic.findingsColSeverity')}</th>
+            <th scope="col" className="px-2 py-2 font-medium">{t('traffic.findingsColType')}</th>
+            <th scope="col" className="px-2 py-2 font-medium">{t('traffic.findingsColOriginal')}</th>
+            <th scope="col" className="px-2 py-2 font-medium">{t('traffic.findingsColReplacement')}</th>
+            <th scope="col" className="px-4 py-2 text-right font-medium">{t('traffic.findingsColCount')}</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-line">
           {sorted.map((f, i) => (
             <tr key={i}>
               <td className="px-4 py-2">
-                <Badge tone={f.severity === 'critical' || f.severity === 'high' ? 'danger' : f.severity === 'medium' ? 'warn' : 'neutral'}>{SEVERITY_LABEL[f.severity]}</Badge>
+                <Badge tone={f.severity === 'critical' || f.severity === 'high' ? 'danger' : f.severity === 'medium' ? 'warn' : 'neutral'}>
+                  {getSeverityLabel(f.severity, locale)}
+                </Badge>
               </td>
               <td className="px-2 py-2">
-                <p className="text-fg">{FINDING_LABEL[f.kind]}</p>
+                <p className="text-fg">{getFindingLabel(f.kind, locale)}</p>
                 <p className="text-2xs text-fg-subtle">{f.label}</p>
               </td>
               <td className="px-2 py-2 font-mono text-danger">{f.originalPreview}</td>
@@ -486,21 +519,22 @@ function FindingsTable({ record }: { record: TrafficAuditRecord }) {
 }
 
 function MetaList({ record }: { record: TrafficAuditRecord }) {
+  const { locale, t } = useI18n();
   const rows: Array<[string, React.ReactNode]> = [
-    ['记录 ID', <code className="font-mono">{record.id}</code>],
-    ['时间', record.timestamp],
-    ['工具', HARNESS_LABEL[record.harness]],
-    ['类别', CATEGORY_LABEL[record.category]],
-    ['模式', MODE_LABEL[record.appliedMode]],
-    ['处理动作', <code className="font-mono">{record.actionTaken}</code>],
-    ['上游', record.upstreamVendor],
-    ['HTTP 状态', record.status || '未发出'],
-    ['请求大小', formatBytes(record.requestBytes)],
-    ['响应大小', formatBytes(record.responseBytes)],
-    ['还原的占位符', record.restoredCount],
-    ['保留的凭据占位符', record.withheldCount],
-    ['正文截断', record.truncated ? '是（超过 64 KB）' : '否'],
-    ['来源', record.simulated ? '内置模拟器（未联网）' : '真实流量'],
+    [t('traffic.metaId'), <code className="font-mono">{record.id}</code>],
+    [t('traffic.metaTime'), record.timestamp],
+    [t('traffic.metaTool'), getHarnessLabel(record.harness, locale)],
+    [t('traffic.metaCategory'), getCategoryLabel(record.category, locale)],
+    [t('traffic.metaMode'), getModeLabel(record.appliedMode, locale)],
+    [t('traffic.metaAction'), <code className="font-mono">{record.actionTaken}</code>],
+    [t('traffic.metaUpstream'), record.upstreamVendor],
+    [t('traffic.metaStatus'), record.status || t('common.notSent')],
+    [t('traffic.metaReqSize'), formatBytes(record.requestBytes)],
+    [t('traffic.metaRespSize'), formatBytes(record.responseBytes)],
+    [t('traffic.metaRestored'), record.restoredCount],
+    [t('traffic.metaWithheld'), record.withheldCount],
+    [t('traffic.metaTruncated'), t(record.truncated ? 'traffic.metaTruncatedYes' : 'traffic.metaTruncatedNo')],
+    [t('traffic.metaSource'), t(record.simulated ? 'traffic.metaSourceSim' : 'traffic.metaSourceLive')],
   ];
   return (
     <dl className="min-h-0 divide-y divide-line overflow-auto text-xs">

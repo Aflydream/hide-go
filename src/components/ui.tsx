@@ -12,6 +12,7 @@ import {
   type ReactNode,
 } from 'react';
 import { CheckCircle, Copy, Check, WarningCircle, X, Info } from '@phosphor-icons/react';
+import { useI18n } from '../lib/i18n';
 
 export function cx(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(' ');
@@ -305,10 +306,13 @@ export function Skeleton({ className }: { className?: string }) {
 
 /* ------------------------------------------------------------------ Copy */
 
-export function CopyButton({ text, label = '复制', compact }: { text: string; label?: string; compact?: boolean }) {
+export function CopyButton({ text, label, compact }: { text: string; label?: string; compact?: boolean }) {
+  const { t } = useI18n();
   const [copied, setCopied] = useState(false);
   const timerRef = useRef<number | undefined>(undefined);
   const toast = useToast();
+  const effectiveLabel = label ?? t('common.copy');
+  const copiedLabel = t('common.copied');
 
   useEffect(() => {
     return () => {
@@ -326,14 +330,18 @@ export function CopyButton({ text, label = '复制', compact }: { text: string; 
         setCopied(false);
       }, 1500);
     } catch {
-      toast.push({ tone: 'danger', title: '复制失败', body: '浏览器拒绝了剪贴板访问' });
+      toast.push({
+        tone: 'danger',
+        title: t('common.copyFailed'),
+        body: t('common.copyDenied'),
+      });
     }
-  }, [text, toast]);
+  }, [text, toast, t]);
   const icon = copied ? <Check size={14} weight="bold" /> : <Copy size={14} />;
-  if (compact) return <IconButton label={copied ? '已复制' : label} icon={icon} onClick={copy} />;
+  if (compact) return <IconButton label={copied ? copiedLabel : effectiveLabel} icon={icon} onClick={copy} />;
   return (
     <Button size="sm" variant="ghost" icon={icon} onClick={copy}>
-      {copied ? '已复制' : label}
+      {copied ? copiedLabel : effectiveLabel}
     </Button>
   );
 }
@@ -398,6 +406,7 @@ export function Dialog({
   footer?: ReactNode;
   width?: string;
 }) {
+  const { t } = useI18n();
   const dialogRef = useRef<HTMLDialogElement>(null);
   const titleId = useId();
   const descId = useId();
@@ -487,7 +496,7 @@ export function Dialog({
             </div>
           )}
         </div>
-        <IconButton label="关闭" icon={<X size={16} />} onClick={() => dialogRef.current?.close()} className="-mr-1.5 -mt-0.5" />
+        <IconButton label={t('common.close')} icon={<X size={16} />} onClick={() => dialogRef.current?.close()} className="-mr-1.5 -mt-0.5" />
       </header>
       {children && <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div>}
       {footer && <footer className="flex shrink-0 justify-end gap-2 border-t border-line px-5 py-3">{footer}</footer>}
@@ -512,6 +521,7 @@ export function ConfirmDialog({
   confirmLabel: string;
   busy?: boolean;
 }) {
+  const { t } = useI18n();
   return (
     <Dialog
       open={open}
@@ -522,7 +532,7 @@ export function ConfirmDialog({
       footer={
         <>
           <Button onClick={onClose} data-autofocus>
-            取消
+            {t('common.cancel')}
           </Button>
           <Button variant="danger" onClick={onConfirm} disabled={busy}>
             {confirmLabel}
@@ -549,6 +559,7 @@ export function useToast() {
 }
 
 export function ToastProvider({ children }: { children: ReactNode }) {
+  const { t } = useI18n();
   const [items, setItems] = useState<ToastItem[]>([]);
   const seq = useRef(0);
   const timersRef = useRef<Map<number, number>>(new Map());
@@ -589,25 +600,25 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     <ToastContext.Provider value={ctxValue}>
       {children}
       <div className="pointer-events-none fixed bottom-4 right-4 z-[60] flex w-80 flex-col gap-2">
-        {items.map((t) => {
-          const Icon = t.tone === 'danger' || t.tone === 'warn' ? WarningCircle : CheckCircle;
+        {items.map((item) => {
+          const Icon = item.tone === 'danger' || item.tone === 'warn' ? WarningCircle : CheckCircle;
           return (
             <div
-              key={t.id}
-              role={t.tone === 'danger' ? 'alert' : 'status'}
+              key={item.id}
+              role={item.tone === 'danger' ? 'alert' : 'status'}
               className="hg-toast pointer-events-auto flex gap-2.5 rounded-md border border-line-strong bg-surface px-3.5 py-3 shadow-overlay"
             >
               <Icon
                 aria-hidden="true"
                 size={18}
                 weight="fill"
-                className={cx('mt-px shrink-0', t.tone === 'danger' ? 'text-danger' : t.tone === 'warn' ? 'text-warn' : 'text-brand')}
+                className={cx('mt-px shrink-0', item.tone === 'danger' ? 'text-danger' : item.tone === 'warn' ? 'text-warn' : 'text-brand')}
               />
               <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium text-fg">{t.title}</p>
-                {t.body && <p className="mt-0.5 break-words text-xs text-fg-muted">{t.body}</p>}
+                <p className="text-sm font-medium text-fg">{item.title}</p>
+                {item.body && <p className="mt-0.5 break-words text-xs text-fg-muted">{item.body}</p>}
               </div>
-              <IconButton label="关闭通知" icon={<X size={14} />} onClick={() => dismiss(t.id)} className="-mr-1 -mt-1 h-6 w-6" />
+              <IconButton label={t('common.dismissNotification')} icon={<X size={14} />} onClick={() => dismiss(item.id)} className="-mr-1 -mt-1 h-6 w-6" />
             </div>
           );
         })}
@@ -673,4 +684,72 @@ export function Tabs<T extends string>({
 
 export function Kbd({ children }: { children: ReactNode }) {
   return <kbd className="rounded-sm border border-line-strong bg-surface-2 px-1 font-mono text-2xs text-fg-muted">{children}</kbd>;
+}
+
+/* ------------------------------------------------------------------ Layout Helpers */
+
+export function Section({ index, title, description, children }: { index: string; title: string; description: ReactNode; children: ReactNode }) {
+  return (
+    <section className="grid grid-cols-1 gap-x-10 gap-y-4 border-b border-line py-7 last:border-b-0 lg:grid-cols-[260px_minmax(0,1fr)]">
+      <div>
+        <p className="tabular font-mono text-2xs text-fg-subtle">{index}</p>
+        <h2 className="mt-1 text-sm font-semibold text-fg">{title}</h2>
+        <div className="mt-1.5 text-xs leading-5 text-fg-subtle">{description}</div>
+      </div>
+      <div className="min-w-0">{children}</div>
+    </section>
+  );
+}
+
+export function RadioCard<T extends string>({
+  name,
+  value,
+  current,
+  onSelect,
+  title,
+  description,
+  children,
+  badge,
+}: {
+  name: string;
+  value: T;
+  current: T;
+  onSelect: (v: T) => void;
+  title: string;
+  description: ReactNode;
+  children?: ReactNode;
+  badge?: ReactNode;
+}) {
+  const selected = value === current;
+  const id = useId();
+  return (
+    <label
+      htmlFor={id}
+      className={cx(
+        'block cursor-pointer rounded-md border px-4 py-3.5 transition-colors',
+        selected ? 'border-brand bg-brand/[0.06]' : 'border-line bg-surface hover:border-line-strong',
+      )}
+    >
+      <div className="flex items-start gap-3">
+        <input id={id} type="radio" name={name} value={value} checked={selected} onChange={() => onSelect(value)} className="peer sr-only" />
+        <span
+          aria-hidden="true"
+          className={cx(
+            'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-focus',
+            selected ? 'border-brand' : 'border-line-control',
+          )}
+        >
+          {selected && <span className="h-2 w-2 rounded-full bg-brand" />}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold text-fg">{title}</span>
+            {badge}
+          </div>
+          <div className="mt-0.5 text-xs leading-5 text-fg-muted">{description}</div>
+          {children}
+        </div>
+      </div>
+    </label>
+  );
 }

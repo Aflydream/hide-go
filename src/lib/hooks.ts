@@ -63,8 +63,8 @@ export function usePoll<T>(fetcher: () => Promise<T>, intervalMs: number, enable
   return { data, error, loading, refresh, setData };
 }
 
-export type Route = 'overview' | 'traffic' | 'policy' | 'integrations' | 'vault' | 'rules';
-const ROUTES: Route[] = ['overview', 'traffic', 'policy', 'integrations', 'vault', 'rules'];
+export type Route = 'overview' | 'traffic' | 'policy' | 'integrations' | 'vault' | 'rules' | 'settings';
+const ROUTES: Route[] = ['overview', 'traffic', 'policy', 'integrations', 'vault', 'rules', 'settings'];
 
 function parseHashRoute() {
   const [path, query = ''] = window.location.hash.replace(/^#\/?/, '').split('?');

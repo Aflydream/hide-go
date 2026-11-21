@@ -3,6 +3,7 @@ import { BracketsAngle, CheckCircle, PencilSimple, Plus, Trash } from '@phosphor
 import { useStore } from '../store';
 import { api } from '../lib/api';
 import { useDebounced } from '../lib/hooks';
+import { translate, useI18n, type Locale } from '../lib/i18n';
 import type { CustomRule, RuleValidation } from '../types';
 import { Button, ConfirmDialog, EmptyState, Field, IconButton, Panel, Skeleton, Switch, cx, inputClass } from '../components/ui';
 
@@ -21,13 +22,13 @@ function newRuleId() {
   return `rule-${Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
 }
 
-/** The gateway reports the regex engine's own (English) message; translate the common ones. */
-function explainRegexError(message: string): string {
-  if (/look-around|look-ahead|look-behind/i.test(message)) return '网关的正则引擎不支持环视断言 (?=…) (?!…) (?<=…)，请改用普通分组或字符类。';
-  if (/backreference/i.test(message)) return '网关的正则引擎不支持反向引用（\\1 等）。';
-  if (/empty string/i.test(message)) return '该表达式能匹配空字符串，会在每个位置命中；请至少要求一个字符。';
-  if (/size limit|too big/i.test(message)) return '表达式过于复杂，超出编译大小上限。';
-  return `无法编译：${message}`;
+/** The gateway reports the regex engine's own message; map common ones to locale keys. */
+function explainRegexError(message: string, locale: Locale): string {
+  if (/look-around|look-ahead|look-behind/i.test(message)) return translate(locale, 'rules.errLookaround');
+  if (/backreference/i.test(message)) return translate(locale, 'rules.errBackref');
+  if (/empty string/i.test(message)) return translate(locale, 'rules.errEmpty');
+  if (/size limit|too big/i.test(message)) return translate(locale, 'rules.errTooBig');
+  return translate(locale, 'rules.errCompile', { message });
 }
 
 /** What the vendor sees in place of a match, mirroring the gateway's naming. */
@@ -37,6 +38,7 @@ function replacementPreview(hint: string) {
 
 function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: Draft) => void; onDone: () => void }) {
   const { config, saveConfig, saving } = useStore();
+  const { locale, t } = useI18n();
   const configRef = useRef(config);
   configRef.current = config;
   const [check, setCheck] = useState<{ pattern: string; sample: string; result: RuleValidation } | null>(null);
@@ -76,17 +78,17 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
   if (!config) return null;
   const result = pattern && check?.pattern === pattern ? check.result : null;
   const sampleMatched = result && check?.sample === draft.sample;
-  const validationErr = checkError?.pattern === pattern ? `无法校验表达式：${checkError.message}` : null;
-  const nameError = submitted && !draft.name.trim() ? '请填写规则名称' : null;
+  const validationErr = checkError?.pattern === pattern ? t('rules.errValidate', { message: checkError.message }) : null;
+  const nameError = submitted && !draft.name.trim() ? t('rules.errNameRequired') : null;
   const trimmedHint = draft.replacementHint.trim();
   const hintError =
     trimmedHint && !/^[A-Za-z0-9_-]{1,48}$/.test(trimmedHint)
-      ? '替换前缀仅支持 1–48 位字母、数字、下划线或短横线'
+      ? t('rules.errHintInvalid')
       : null;
   const patternError =
     result && !result.valid
-      ? explainRegexError(result.message ?? '')
-      : validationErr ?? (submitted && !pattern ? '请填写正则表达式' : null);
+      ? explainRegexError(result.message ?? '', locale)
+      : validationErr ?? (submitted && !pattern ? t('rules.errPatternRequired') : null);
   const matches = result?.valid && sampleMatched ? (result.matches ?? []) : [];
 
   const submit = async (e: FormEvent) => {
@@ -118,36 +120,36 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
       enabled: existing?.enabled ?? true,
     };
     const customRules = existing ? latestConfig.customRules.map((r) => (r.id === rule.id ? rule : r)) : [...latestConfig.customRules, rule];
-    if (await saveConfig({ ...latestConfig, customRules }, existing ? '规则已更新' : '规则已添加')) onDone();
+    if (await saveConfig({ ...latestConfig, customRules }, t(existing ? 'rules.updatedToast' : 'rules.addedToast'))) onDone();
   };
 
   return (
-    <Panel title={draft.id ? '编辑规则' : '新建规则'} description="出站替换 · 返回还原">
+    <Panel title={t(draft.id ? 'rules.editorEditTitle' : 'rules.editorNewTitle')} description={t('rules.editorDesc')}>
       <form onSubmit={submit} noValidate className="space-y-4 p-4">
-        <Field label="名称" htmlFor="rule-name" error={nameError}>
+        <Field label={t('rules.fieldName')} htmlFor="rule-name" error={nameError}>
           <input
             id="rule-name"
             type="text"
             value={draft.name}
             onChange={(e) => onChange({ ...draft, name: e.target.value })}
-            placeholder="内部项目代号"
+            placeholder={t('rules.placeholderName')}
             aria-invalid={!!nameError}
             aria-describedby={nameError ? 'rule-name-error' : undefined}
             className={cx(inputClass, 'h-8 w-full')}
           />
         </Field>
         <Field
-          label="正则表达式"
+          label={t('rules.fieldPattern')}
           htmlFor="rule-pattern"
           error={patternError}
           hint={
             result?.valid ? (
               <span className="flex items-center gap-1 text-brand">
                 <CheckCircle aria-hidden="true" size={13} weight="bold" />
-                语法有效
+                {t('rules.patternValid')}
               </span>
             ) : (
-              'Rust regex 语法，不支持环视 (?=…) 与反向引用'
+              t('rules.patternHint')
             )
           }
         >
@@ -165,12 +167,13 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
           />
         </Field>
         <Field
-          label="替换前缀（可选）"
+          label={t('rules.fieldHint')}
           htmlFor="rule-hint"
           error={hintError}
           hint={
             <>
-              示例输出 <code className="font-mono text-brand">{replacementPreview(draft.replacementHint)}</code>
+              {t('rules.hintExamplePrefix')}
+              <code className="font-mono text-brand">{replacementPreview(draft.replacementHint)}</code>
             </>
           }
         >
@@ -187,21 +190,25 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
             className={cx(inputClass, 'h-8 w-full font-mono text-xs')}
           />
         </Field>
-        <Field label="测试文本（可选）" htmlFor="rule-sample" hint="仅用于预览命中，不保存">
+        <Field label={t('rules.fieldSample')} htmlFor="rule-sample" hint={t('rules.sampleHint')}>
           <textarea
             id="rule-sample"
             rows={3}
             spellCheck={false}
             value={draft.sample}
             onChange={(e) => onChange({ ...draft, sample: e.target.value })}
-            placeholder="粘贴一段包含目标内容的文本"
+            placeholder={t('rules.samplePlaceholder')}
             aria-describedby="rule-sample-hint"
             className={cx(inputClass, 'w-full resize-y py-2 font-mono text-xs leading-5')}
           />
         </Field>
         {result?.valid && sampleMatched && draft.sample.trim() && (
           <div role="status" className="rounded border border-line bg-surface-2 px-3 py-2.5">
-            <p className="label-caps">{matches.length ? `命中 ${matches.length}${matches.length === 20 ? '+' : ''} 处` : '测试文本中没有命中'}</p>
+            <p className="label-caps">
+              {matches.length
+                ? t('rules.sampleHits', { count: matches.length, plus: matches.length === 20 ? '+' : '' })
+                : t('rules.sampleNoHits')}
+            </p>
             {matches.length > 0 && (
               <ul className="mt-2 flex flex-wrap gap-1.5">
                 {matches.map((m, i) => (
@@ -214,9 +221,9 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
           </div>
         )}
         <div className="flex justify-end gap-2 border-t border-line pt-4">
-          {draft.id && <Button onClick={onDone}>取消</Button>}
+          {draft.id && <Button onClick={onDone}>{t('common.cancel')}</Button>}
           <Button type="submit" variant="primary" icon={draft.id ? undefined : <Plus size={14} weight="bold" />} disabled={saving}>
-            {draft.id ? '保存修改' : '添加规则'}
+            {t(draft.id ? 'rules.saveChanges' : 'rules.addRule')}
           </Button>
         </div>
       </form>
@@ -226,6 +233,7 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
 
 export function Rules() {
   const { config, saveConfig } = useStore();
+  const { t } = useI18n();
   const [draft, setDraft] = useState<Draft>(EMPTY);
   const [deleting, setDeleting] = useState<CustomRule | null>(null);
 
@@ -248,20 +256,23 @@ export function Rules() {
 
   return (
     <div className="mx-auto grid max-w-[1360px] grid-cols-1 items-start gap-5 p-6 xl:grid-cols-[minmax(0,1fr)_400px]">
-      <Panel title="规则列表" description={rules.length ? `${rules.length} 条规则，${enabledCount} 条生效中` : '尚未添加规则'}>
+      <Panel
+        title={t('rules.listTitle')}
+        description={rules.length ? t('rules.listDesc', { total: rules.length, enabled: enabledCount }) : t('rules.listEmptyDesc')}
+      >
         {rules.length === 0 ? (
-          <EmptyState icon={<BracketsAngle size={20} />} title="暂无自定义规则">
-            在右侧添加内部项目代号、私有域名等正则规则
+          <EmptyState icon={<BracketsAngle size={20} />} title={t('rules.emptyTitle')}>
+            {t('rules.emptyBody')}
           </EmptyState>
         ) : (
           <table className="w-full table-fixed text-left text-xs">
             <thead>
               <tr className="border-b border-line text-2xs text-fg-subtle">
-                <th scope="col" className="w-16 py-2 pl-4 font-medium">启用</th>
-                <th scope="col" className="py-2 pl-2 font-medium">名称 / 表达式</th>
-                <th scope="col" className="w-[30%] py-2 pl-3 font-medium">替换为</th>
+                <th scope="col" className="w-16 py-2 pl-4 font-medium">{t('rules.colEnabled')}</th>
+                <th scope="col" className="py-2 pl-2 font-medium">{t('rules.colNamePattern')}</th>
+                <th scope="col" className="w-[30%] py-2 pl-3 font-medium">{t('rules.colReplacement')}</th>
                 <th scope="col" className="w-20 py-2 pl-2 pr-3">
-                  <span className="sr-only">操作</span>
+                  <span className="sr-only">{t('rules.colActions')}</span>
                 </th>
               </tr>
             </thead>
@@ -271,9 +282,12 @@ export function Rules() {
                   <td className="py-3 pl-4 align-top">
                     <Switch
                       checked={rule.enabled}
-                      label={`启用规则「${rule.name}」`}
+                      label={t('rules.toggleAria', { name: rule.name })}
                       onChange={(enabled) =>
-                        saveConfig({ ...config, customRules: rules.map((r) => (r.id === rule.id ? { ...r, enabled } : r)) }, enabled ? '规则已启用' : '规则已停用')
+                        saveConfig(
+                          { ...config, customRules: rules.map((r) => (r.id === rule.id ? { ...r, enabled } : r)) },
+                          t(enabled ? 'rules.enabledToast' : 'rules.disabledToast'),
+                        )
                       }
                     />
                   </td>
@@ -289,8 +303,8 @@ export function Rules() {
                     </code>
                   </td>
                   <td className="py-2 pl-2 pr-3 text-right align-top">
-                    <IconButton label={`编辑规则「${rule.name}」`} icon={<PencilSimple size={14} />} onClick={() => edit(rule)} />
-                    <IconButton label={`删除规则「${rule.name}」`} icon={<Trash size={14} />} onClick={() => setDeleting(rule)} />
+                    <IconButton label={t('rules.editAria', { name: rule.name })} icon={<PencilSimple size={14} />} onClick={() => edit(rule)} />
+                    <IconButton label={t('rules.deleteAria', { name: rule.name })} icon={<Trash size={14} />} onClick={() => setDeleting(rule)} />
                   </td>
                 </tr>
               ))}
@@ -311,11 +325,11 @@ export function Rules() {
           setDeleting(null);
           if (!target) return;
           if (target.id === draft.id) setDraft(EMPTY);
-          await saveConfig({ ...config, customRules: rules.filter((r) => r.id !== target.id) }, '规则已删除');
+          await saveConfig({ ...config, customRules: rules.filter((r) => r.id !== target.id) }, t('rules.deletedToast'));
         }}
-        title={`删除规则「${deleting?.name ?? ''}」？`}
-        description="后续请求不再匹配该规则；映射表已有条目保留。"
-        confirmLabel="删除规则"
+        title={t('rules.confirmDeleteTitle', { name: deleting?.name ?? '' })}
+        description={t('rules.confirmDeleteDesc')}
+        confirmLabel={t('rules.confirmDeleteBtn')}
       />
     </div>
   );

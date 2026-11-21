@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Desktop, Minus, Moon, Square, SquaresFour, Sun, X } from '@phosphor-icons/react';
 import logoMark from '../assets/logo-mark.png';
+import { useI18n } from '../lib/i18n';
 
 type ResizeDir = 'n' | 's' | 'e' | 'w' | 'nw' | 'ne' | 'sw' | 'se';
 
@@ -40,12 +41,16 @@ function applySchemeMeta(pref: ColorSchemePref) {
   }
 }
 
-export function useColorScheme(): {
+interface ColorSchemeContextValue {
   pref: ColorSchemePref;
   resolved: 'light' | 'dark';
   toggle: () => void;
   setPref: (next: ColorSchemePref) => void;
-} {
+}
+
+const ColorSchemeContext = createContext<ColorSchemeContextValue | null>(null);
+
+export function ColorSchemeProvider({ children }: { children: ReactNode }) {
   const [pref, setPrefState] = useState<ColorSchemePref>(readStoredScheme);
   const [sysDark, setSysDark] = useState<boolean>(() =>
     typeof window !== 'undefined' ? window.matchMedia('(prefers-color-scheme: dark)').matches : false,
@@ -94,17 +99,29 @@ export function useColorScheme(): {
     setPref(target === currentSys ? 'system' : target);
   }, [resolved, sysDark, setPref]);
 
-  return { pref, resolved, toggle, setPref };
+  const value = useMemo<ColorSchemeContextValue>(
+    () => ({ pref, resolved, toggle, setPref }),
+    [pref, resolved, toggle, setPref],
+  );
+
+  return <ColorSchemeContext.Provider value={value}>{children}</ColorSchemeContext.Provider>;
+}
+
+export function useColorScheme(): ColorSchemeContextValue {
+  const ctx = useContext(ColorSchemeContext);
+  if (!ctx) throw new Error('ColorSchemeProvider missing');
+  return ctx;
 }
 
 export function ThemeToggle() {
   const { pref, resolved, toggle } = useColorScheme();
+  const { t } = useI18n();
   const label =
     pref === 'system'
-      ? `跟随系统（当前${resolved === 'dark' ? '深色' : '浅色'}），点击切换主题`
+      ? t(resolved === 'dark' ? 'theme.labelSystemDark' : 'theme.labelSystemLight')
       : pref === 'dark'
-        ? '当前深色主题，点击切换'
-        : '当前浅色主题，点击切换';
+        ? t('theme.labelDark')
+        : t('theme.labelLight');
 
   return (
     <button
@@ -124,7 +141,7 @@ export function ThemeToggle() {
         )}
       </span>
       <span className="max-[1020px]:hidden">
-        {pref === 'system' ? '自动' : pref === 'dark' ? '深色' : '浅色'}
+        {pref === 'system' ? t('theme.auto') : pref === 'dark' ? t('theme.dark') : t('theme.light')}
       </span>
     </button>
   );
@@ -147,6 +164,7 @@ export function WindowFrame({
   resizable = true,
   minWidthClass = 'min-w-[820px]',
   statusSlot,
+  headerSlot,
   children,
 }: {
   title: string;
@@ -154,8 +172,10 @@ export function WindowFrame({
   resizable?: boolean;
   minWidthClass?: string;
   statusSlot?: ReactNode;
+  headerSlot?: ReactNode;
   children: ReactNode;
 }) {
+  const { t } = useI18n();
   const win = typeof window !== 'undefined' ? window.__hideGoWin : undefined;
   const isNative = Boolean(win?.isNative);
   const [maximized, setMaximized] = useState<boolean>(() => Boolean(typeof window !== 'undefined' && window.__hideGoMaximized));
@@ -223,7 +243,8 @@ export function WindowFrame({
         <div className="h-full flex-1" />
 
         <div className="relative z-[85] flex h-full shrink-0 items-center" data-no-drag="true">
-          <div className={isNative ? 'mr-1.5 flex items-center' : 'pr-2 flex items-center'}>
+          <div className={isNative ? 'mr-1.5 flex items-center gap-1' : 'pr-2 flex items-center gap-1'}>
+            {headerSlot}
             <ThemeToggle />
           </div>
           {isNative && (
@@ -231,8 +252,8 @@ export function WindowFrame({
               <span aria-hidden="true" className="h-4 w-px bg-line" />
               <button
                 type="button"
-                aria-label="最小化窗口"
-                title="最小化"
+                aria-label={t('window.minimize')}
+                title={t('window.minimizeTitle')}
                 onClick={() => win?.minimize()}
                 className="inline-flex h-full w-11 cursor-pointer items-center justify-center text-fg-muted transition-colors hover:bg-surface-3 hover:text-fg"
               >
@@ -241,8 +262,8 @@ export function WindowFrame({
               {resizable && (
                 <button
                   type="button"
-                  aria-label={maximized ? '还原窗口大小' : '最大化窗口'}
-                  title={maximized ? '还原' : '最大化'}
+                  aria-label={maximized ? t('window.restore') : t('window.maximize')}
+                  title={maximized ? t('window.restoreTitle') : t('window.maximizeTitle')}
                   onClick={() => win?.toggleMaximize()}
                   className="inline-flex h-full w-11 cursor-pointer items-center justify-center text-fg-muted transition-colors hover:bg-surface-3 hover:text-fg"
                 >
@@ -255,8 +276,8 @@ export function WindowFrame({
               )}
               <button
                 type="button"
-                aria-label="关闭窗口"
-                title="关闭"
+                aria-label={t('window.close')}
+                title={t('window.closeTitle')}
                 onClick={() => win?.close()}
                 className="inline-flex h-full w-11 cursor-pointer items-center justify-center text-fg-muted transition-colors hover:bg-danger-solid hover:text-white"
               >

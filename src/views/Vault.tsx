@@ -2,7 +2,8 @@ import { useCallback, useMemo, useState } from 'react';
 import { Eye, EyeSlash, Funnel, MagnifyingGlass, Trash, Vault as VaultIcon } from '@phosphor-icons/react';
 import { useStore } from '../store';
 import { api } from '../lib/api';
-import { VAULT_CATEGORY_LABEL, formatCount } from '../lib/format';
+import { formatCount, getVaultCategoryLabel } from '../lib/format';
+import { useI18n } from '../lib/i18n';
 import { Badge, Button, ConfirmDialog, CopyButton, EmptyState, IconButton, Skeleton, Switch, cx, inputClass, useToast } from '../components/ui';
 
 /** Rows rendered at once; the table is not virtualised and the vault can hold 50,000 entries. */
@@ -10,6 +11,7 @@ const ROW_LIMIT = 500;
 
 export function VaultView() {
   const { vault, vaultLoading, refreshVault, openSimulator } = useStore();
+  const { locale, t } = useI18n();
   const toast = useToast();
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState('all');
@@ -49,9 +51,9 @@ export function VaultView() {
       await refreshVault();
       setRevealed(new Set());
       setRevealAll(false);
-      toast.push({ tone: 'brand', title: '映射表已清空' });
+      toast.push({ tone: 'brand', title: t('vault.clearedToast') });
     } catch (e) {
-      toast.push({ tone: 'danger', title: '清空失败', body: (e as Error).message });
+      toast.push({ tone: 'danger', title: t('vault.clearFailed'), body: (e as Error).message });
     }
     setClearing(false);
     setConfirmClear(false);
@@ -66,22 +68,22 @@ export function VaultView() {
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="搜索占位符或真实值"
-            aria-label="搜索映射表"
+            placeholder={t('vault.searchPlaceholder')}
+            aria-label={t('vault.searchAria')}
             className={cx(inputClass, 'h-8 w-56 pl-8')}
           />
         </div>
-        <select aria-label="按类型筛选" value={category} onChange={(e) => setCategory(e.target.value)} className={cx(inputClass, 'h-8 cursor-pointer pr-7')}>
-          <option value="all">全部类型</option>
+        <select aria-label={t('vault.filterCategoryAria')} value={category} onChange={(e) => setCategory(e.target.value)} className={cx(inputClass, 'h-8 cursor-pointer pr-7')}>
+          <option value="all">{t('vault.allCategories')}</option>
           {categories.map((c) => (
             <option key={c} value={c}>
-              {VAULT_CATEGORY_LABEL[c] ?? c}
+              {getVaultCategoryLabel(c, locale)}
             </option>
           ))}
         </select>
         <label className="ml-1 flex cursor-pointer items-center gap-2 text-xs text-fg-muted">
-          <Switch checked={secretsOnly} onChange={setSecretsOnly} label="只看凭据" />
-          只看凭据
+          <Switch checked={secretsOnly} onChange={setSecretsOnly} label={t('vault.secretsOnly')} />
+          {t('vault.secretsOnly')}
         </label>
         {filtersActive && (
           <Button
@@ -93,12 +95,15 @@ export function VaultView() {
               setSecretsOnly(false);
             }}
           >
-            重置筛选
+            {t('common.resetFilters')}
           </Button>
         )}
         <div className="ml-auto flex items-center gap-2">
           <span className="tabular text-xs text-fg-subtle" role="status">
-            {formatCount(rows.length)} / {formatCount(vault.length)} 条
+            {t('vault.countSummary', {
+              rows: formatCount(rows.length, locale),
+              total: formatCount(vault.length, locale),
+            })}
           </span>
           <Button
             size="sm"
@@ -107,10 +112,10 @@ export function VaultView() {
             disabled={!vault.length}
             onClick={() => setRevealAll((v) => !v)}
           >
-            {revealAll ? '隐藏真实值' : '显示真实值'}
+            {t(revealAll ? 'vault.hideAll' : 'vault.revealAll')}
           </Button>
           <Button size="sm" variant="ghost" icon={<Trash size={14} />} disabled={!vault.length} onClick={() => setConfirmClear(true)}>
-            清空
+            {t('common.clear')}
           </Button>
         </div>
       </div>
@@ -124,33 +129,33 @@ export function VaultView() {
           </div>
         ) : rows.length === 0 ? (
           filtersActive ? (
-            <EmptyState icon={<Funnel size={20} />} title="无匹配条目">
-              调整筛选或搜索条件
+            <EmptyState icon={<Funnel size={20} />} title={t('vault.noMatchesTitle')}>
+              {t('vault.noMatchesBody')}
             </EmptyState>
           ) : (
             <EmptyState
               icon={<VaultIcon size={20} />}
-              title="映射表为空"
+              title={t('vault.emptyTitle')}
               action={
                 <Button size="sm" onClick={openSimulator}>
-                  发送模拟请求
+                  {t('overview.simulateRequest')}
                 </Button>
               }
             >
-              脱敏或 All-Hide 命中后显示映射关系
+              {t('vault.emptyBody')}
             </EmptyState>
           )
         ) : (
           <table className="w-full table-fixed text-left text-xs">
-            <caption className="sr-only">占位符与真实值映射表</caption>
+            <caption className="sr-only">{t('vault.tableCaption')}</caption>
             <thead className="sticky top-0 z-10 bg-surface-2">
               <tr className="border-b border-line text-2xs text-fg-subtle">
-                <th scope="col" className="w-[34%] py-2 pl-6 font-medium">占位符（厂商可见）</th>
-                <th scope="col" className="py-2 pl-3 font-medium">真实值（仅本机）</th>
-                <th scope="col" className="w-40 py-2 pl-3 font-medium">类型</th>
-                <th scope="col" className="w-16 py-2 pl-3 text-right font-medium">命中</th>
+                <th scope="col" className="w-[34%] py-2 pl-6 font-medium">{t('vault.colToken')}</th>
+                <th scope="col" className="py-2 pl-3 font-medium">{t('vault.colOriginal')}</th>
+                <th scope="col" className="w-40 py-2 pl-3 font-medium">{t('vault.colCategory')}</th>
+                <th scope="col" className="w-16 py-2 pl-3 text-right font-medium">{t('vault.colHits')}</th>
                 <th scope="col" className="w-14 py-2 pl-2 pr-5">
-                  <span className="sr-only">操作</span>
+                  <span className="sr-only">{t('vault.colActions')}</span>
                 </th>
               </tr>
             </thead>
@@ -163,7 +168,7 @@ export function VaultView() {
                       <div className="flex items-start gap-1">
                         <code className="min-w-0 break-all py-1 font-mono text-brand">{v.token}</code>
                         <span className="opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
-                          <CopyButton compact text={v.token} label="复制占位符" />
+                          <CopyButton compact text={v.token} label={t('vault.copyToken')} />
                         </span>
                       </div>
                     </td>
@@ -172,14 +177,14 @@ export function VaultView() {
                     </td>
                     <td className="py-2 pl-3 align-top">
                       <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="py-0.5 text-fg">{VAULT_CATEGORY_LABEL[v.category] ?? v.category}</span>
-                        {v.secret && <Badge tone="danger">凭据</Badge>}
+                        <span className="py-0.5 text-fg">{getVaultCategoryLabel(v.category, locale)}</span>
+                        {v.secret && <Badge tone="danger">{t('vault.secretBadge')}</Badge>}
                       </div>
                     </td>
-                    <td className="tabular py-2.5 pl-3 text-right align-top font-mono text-fg-muted">{formatCount(v.hitCount)}</td>
+                    <td className="tabular py-2.5 pl-3 text-right align-top font-mono text-fg-muted">{formatCount(v.hitCount, locale)}</td>
                     <td className="py-1.5 pl-2 pr-5 text-right align-top">
                       <IconButton
-                        label={shown ? '隐藏真实值' : '显示真实值'}
+                        label={t(shown ? 'vault.hideRow' : 'vault.revealRow')}
                         pressed={revealed.has(v.token)}
                         disabled={revealAll}
                         icon={shown ? <EyeSlash size={14} /> : <Eye size={14} />}
@@ -194,23 +199,21 @@ export function VaultView() {
         )}
         {rows.length > ROW_LIMIT && (
           <p className="border-t border-line px-6 py-3 text-xs text-fg-subtle">
-            仅显示前 {ROW_LIMIT} 条，共 {formatCount(rows.length)} 条符合条件。请用搜索或筛选缩小范围。
+            {t('vault.rowLimitNotice', { limit: ROW_LIMIT, total: formatCount(rows.length, locale) })}
           </p>
         )}
       </div>
 
-      <p className="shrink-0 border-t border-line bg-surface px-6 py-2 text-xs text-fg-subtle">
-        仅驻留内存，退出清空 · 上限 50,000 条（LRU 淘汰）
-      </p>
+      <p className="shrink-0 border-t border-line bg-surface px-6 py-2 text-xs text-fg-subtle">{t('vault.footerNote')}</p>
 
       <ConfirmDialog
         open={confirmClear}
         onClose={() => setConfirmClear(false)}
         onConfirm={clear}
         busy={clearing}
-        title="清空映射表？"
-        description="进行中对话引用的旧占位符将无法继续还原，新请求重新分配。"
-        confirmLabel="清空映射表"
+        title={t('vault.confirmClearTitle')}
+        description={t('vault.confirmClearDesc')}
+        confirmLabel={t('vault.confirmClearBtn')}
       />
     </div>
   );

@@ -1,7 +1,8 @@
 import { memo, useMemo, useState } from 'react';
 import { BracketsCurly } from '@phosphor-icons/react';
 import { CopyButton, IconButton, cx } from './ui';
-import { formatBytes, prettyJson } from '../lib/format';
+import { formatBytes, formatCount, prettyJson } from '../lib/format';
+import { useI18n } from '../lib/i18n';
 
 /** Shapes produced by the gateway, highlighted even when the vault was cleared since. */
 const PLACEHOLDER_PATTERNS = [
@@ -68,7 +69,7 @@ export const CodeView = memo(function CodeView({
   bytes,
   matcher,
   mark = 'token',
-  emptyText = '无内容',
+  emptyText,
   className,
 }: {
   title: string;
@@ -80,27 +81,38 @@ export const CodeView = memo(function CodeView({
   emptyText?: string;
   className?: string;
 }) {
+  const { locale, t } = useI18n();
   const [pretty, setPretty] = useState(true);
   const display = useMemo(() => (pretty ? prettyJson(text) : text), [pretty, text]);
   const { nodes, hits } = useMemo(() => highlight(display, matcher, mark === 'token' ? 'mark-token' : 'mark-secret'), [display, matcher, mark]);
   const isJson = display !== text || /^\s*[[{]/.test(text);
+  const resolvedEmpty = emptyText ?? t('common.noContent');
   return (
     <section aria-label={title} className={cx('flex min-h-0 min-w-0 flex-col', className)}>
       <header className={cx('flex h-9 shrink-0 items-center gap-2 border-b border-l-2 border-b-line bg-surface-2 px-3', mark === 'secret' ? 'border-l-danger' : 'border-l-brand')}>
         <h3 className="truncate text-xs font-semibold text-fg">{title}</h3>
         <span className={cx('shrink-0 rounded-sm px-1 text-2xs font-medium', mark === 'secret' ? 'bg-danger/10 text-danger' : 'bg-brand/10 text-brand')}>
-          {mark === 'secret' ? '仅本机' : '厂商可见'}
+          {mark === 'secret' ? t('codeView.localOnly') : t('codeView.vendorSees')}
         </span>
         {caption && <span className="truncate text-2xs text-fg-subtle">{caption}</span>}
         <span className="ml-auto flex items-center gap-1">
           {hits > 0 && (
             <span className={cx('tabular mr-1 text-2xs', mark === 'secret' ? 'text-danger' : 'text-brand')}>
-              {hits} 处{mark === 'secret' ? '敏感' : '替换'}
+              {t(mark === 'secret' ? 'codeView.hitsSensitive' : 'codeView.hitsReplaced', {
+                count: formatCount(hits, locale),
+              })}
             </span>
           )}
           {bytes !== undefined && <span className="tabular mr-1 text-2xs text-fg-subtle">{formatBytes(bytes)}</span>}
-          {isJson && <IconButton label={pretty ? '显示原始格式' : '格式化 JSON'} pressed={pretty} icon={<BracketsCurly size={14} />} onClick={() => setPretty((p) => !p)} />}
-          <CopyButton text={display} compact label={`复制${title}`} />
+          {isJson && (
+            <IconButton
+              label={pretty ? t('codeView.showRaw') : t('codeView.prettyJson')}
+              pressed={pretty}
+              icon={<BracketsCurly size={14} />}
+              onClick={() => setPretty((p) => !p)}
+            />
+          )}
+          <CopyButton text={display} compact label={t('codeView.copyPanel', { title })} />
         </span>
       </header>
       {text ? (
@@ -108,7 +120,7 @@ export const CodeView = memo(function CodeView({
           {nodes}
         </pre>
       ) : (
-        <p className="flex flex-1 items-center justify-center bg-surface p-6 text-xs text-fg-subtle">{emptyText}</p>
+        <p className="flex flex-1 items-center justify-center bg-surface p-6 text-xs text-fg-subtle">{resolvedEmpty}</p>
       )}
     </section>
   );

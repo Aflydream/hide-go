@@ -6,13 +6,24 @@ import {
   CheckCircle,
   FolderOpen,
   LinkSimple,
+  Translate,
   Trash,
   WarningCircle,
 } from '@phosphor-icons/react';
 import { WindowFrame } from '../components/WindowFrame';
 import logoMark from '../assets/logo-mark.png';
-import { HARNESS_LABEL } from '../lib/format';
-import type { HarnessActionResult, HarnessKind, HarnessProfile } from '../types';
+import { getHarnessLabel } from '../lib/format';
+import {
+  LOCALE_META,
+  SUPPORTED_LOCALES,
+  localizeHarnessIntegrationNote,
+  localizeSetupStepDetail,
+  localizeSetupStepLabel,
+  translate,
+  useI18n,
+  type Locale,
+} from '../lib/i18n';
+import type { HarnessActionResult, HarnessKind, HarnessProfile, UiLanguage } from '../types';
 
 declare global {
   interface Window {
@@ -31,6 +42,8 @@ interface SetupInfo {
   mode: 'install' | 'uninstall';
   version: string;
   platform: 'windows' | 'macos' | 'linux';
+  systemLocale?: string;
+  language?: UiLanguage;
   hasEmbeddedBinaries: boolean;
   defaultInstallDir: string;
   alreadyInstalled: boolean;
@@ -72,24 +85,24 @@ function takeSetupToken(): string {
 
 const setupToken = takeSetupToken();
 
-function getInstallDirError(rawDir: string, platform?: string): string | null {
+function getInstallDirError(rawDir: string, platform: string | undefined, locale: Locale): string | null {
   const trimmed = rawDir.trim();
-  if (!trimmed) return '请选择安装位置';
+  if (!trimmed) return translate(locale, 'setup.dirError.empty');
   const norm = trimmed.replace(/[\\/]+$/, '') || (trimmed.startsWith('/') ? '/' : trimmed);
   const low = (platform === 'windows' || /^[a-zA-Z]:/.test(norm)) ? norm.toLowerCase().replace(/\//g, '\\') : norm;
 
   if (low === '/' || /^[a-z]:$/i.test(low)) {
-    return '不能直接安装到磁盘根目录，请选择专用子目录（例如 …\\Hide-Go）';
+    return translate(locale, 'setup.dirError.root');
   }
   if (/^[a-z]:\\windows(\\|$)/i.test(low)) {
-    return '不能安装到 Windows 系统目录下，请选择用户目录中的子目录';
+    return translate(locale, 'setup.dirError.windowsSys');
   }
   if (
     /^[a-z]:\\(users\\[^\\]+(|\\desktop|\\documents|\\downloads)|program files( \(x86\))?|programdata)$/i.test(low) ||
     /^\/(applications|users|home|tmp|var|etc|usr|usr\/local|bin|sbin|system|library)$/i.test(low) ||
     /^\/(users|home)\/[^/]+(\/(desktop|documents|downloads))?$/i.test(low)
   ) {
-    return '不能直接安装到系统目录或桌面/文档根文件夹，请选择专用的 Hide-Go 子目录';
+    return translate(locale, 'setup.dirError.protected');
   }
   return null;
 }
@@ -162,18 +175,20 @@ function ToggleRow({
   );
 }
 
-const STEPS = [
-  { num: '01', title: '安装位置' },
-  { num: '02', title: '安装程序' },
-  { num: '03', title: '连接工具' },
-  { num: '04', title: '完成' },
+const STEP_NUMS: Array<{ num: string; key: 'setup.stepRail.1' | 'setup.stepRail.2' | 'setup.stepRail.3' | 'setup.stepRail.4' }> = [
+  { num: '01', key: 'setup.stepRail.1' },
+  { num: '02', key: 'setup.stepRail.2' },
+  { num: '03', key: 'setup.stepRail.3' },
+  { num: '04', key: 'setup.stepRail.4' },
 ];
 
 export function SetupApp() {
+  const { pref, locale, systemLocale, setPref, syncPrefFromConfig, t } = useI18n();
   const [info, setInfo] = useState<SetupInfo | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const stepHeadingRef = useRef<HTMLHeadingElement>(null);
+  const userChangedLangRef = useRef(false);
 
   const [installDir, setInstallDir] = useState('');
   const [createShortcuts, setCreateShortcuts] = useState(true);
@@ -190,6 +205,10 @@ export function SetupApp() {
 
   const [removeConfig, setRemoveConfig] = useState(false);
   const [uninstallRes, setUninstallRes] = useState<UninstallResponse | null>(null);
+
+  useEffect(() => {
+    document.title = t(info?.mode === 'uninstall' ? 'setup.windowTitle.uninstall' : 'setup.windowTitle.install');
+  }, [info?.mode, t]);
 
   const transitionStep = useCallback((next: 1 | 2 | 3 | 4) => {
     const focusHeading = () => stepHeadingRef.current?.focus({ preventScroll: true });
@@ -217,6 +236,9 @@ export function SetupApp() {
     try {
       const data = await setupFetch<SetupInfo>('/api/setup/info');
       if (!mountedRef.current) return;
+      if (!userChangedLangRef.current && data.language) {
+        syncPrefFromConfig(data.language);
+      }
       setInfo(data);
       setInstallDir((prev) => prev || data.existingInstallDir || data.defaultInstallDir);
       const autoSelectable = data.harnesses
@@ -226,7 +248,7 @@ export function SetupApp() {
     } catch (e) {
       if (mountedRef.current) setLoadError((e as Error).message);
     }
-  }, []);
+  }, [syncPrefFromConfig]);
 
   useEffect(() => {
     loadInfo();
@@ -248,7 +270,7 @@ export function SetupApp() {
     try {
       const res = await setupFetch<{ path: string | null }>('/api/setup/pick-dir', {
         method: 'POST',
-        body: JSON.stringify({ initialDir: installDir || null }),
+        body: JSON.stringify({ initialDir: installDir || null, locale }),
       });
       if (res.path) setInstallDir(res.path);
     } catch (e) {
@@ -258,10 +280,10 @@ export function SetupApp() {
     }
   };
 
-  const installDirError = installDir.trim() ? getInstallDirError(installDir, info?.platform) : null;
+  const installDirError = installDir.trim() ? getInstallDirError(installDir, info?.platform, locale) : null;
 
   const startInstall = async () => {
-    const dirErr = getInstallDirError(installDir, info?.platform);
+    const dirErr = getInstallDirError(installDir, info?.platform, locale);
     if (dirErr) {
       setActionError(dirErr);
       return;
@@ -278,11 +300,12 @@ export function SetupApp() {
           createShortcuts,
           addToPath: info?.platform !== 'windows' && addToPath,
           autostartDaemon,
+          language: pref,
         }),
       });
       setInstallRes(res);
       if (!res.ok) {
-        setActionError(res.error ?? '安装过程发生错误');
+        setActionError(res.error ?? t('setup.installFailed'));
       } else {
         const autoSelectable = res.harnesses
           .filter((h) => h.installed && h.autoConnectMode !== 'manual')
@@ -355,7 +378,7 @@ export function SetupApp() {
         }),
       });
       setUninstallRes(res);
-      if (!res.ok) setActionError(res.error ?? '卸载未能全部完成');
+      if (!res.ok) setActionError(res.error ?? t('setup.uninstallFailed'));
     } catch (e) {
       setActionError((e as Error).message);
     } finally {
@@ -363,15 +386,39 @@ export function SetupApp() {
     }
   };
 
-  const frameTitle = info?.mode === 'uninstall' ? 'Hide-Go 卸载' : 'Hide-Go 安装';
+  const frameTitle = t(info?.mode === 'uninstall' ? 'setup.frameTitle.uninstall' : 'setup.frameTitle.install');
   const frameBadge = info ? `v${info.version}` : undefined;
+
+  const headerSlot = (
+    <div className="inline-flex h-7 items-center gap-1 rounded px-1.5 text-2xs text-fg-muted transition-colors hover:bg-surface-3 hover:text-fg">
+      <Translate aria-hidden="true" size={13} className="shrink-0" />
+      <select
+        aria-label={t('setup.langAria')}
+        value={pref}
+        onChange={(e) => {
+          userChangedLangRef.current = true;
+          setPref(e.target.value as UiLanguage);
+        }}
+        className="cursor-pointer bg-transparent text-2xs font-medium text-fg focus:outline-none"
+      >
+        <option value="system" className="bg-surface text-fg">
+          {t('setup.langAuto', { lang: LOCALE_META[systemLocale].nativeName })}
+        </option>
+        {SUPPORTED_LOCALES.map((loc) => (
+          <option key={loc.code} value={loc.code} className="bg-surface text-fg">
+            {loc.nativeName}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
 
   if (loadError) {
     return (
-      <WindowFrame title={frameTitle} resizable={false} minWidthClass="min-w-[760px]">
+      <WindowFrame title={frameTitle} headerSlot={headerSlot} resizable={false} minWidthClass="min-w-[760px]">
         <div className="flex flex-1 items-center justify-center p-8">
           <div role="alert" className="w-full max-w-md rounded-md border border-danger/40 bg-surface p-6">
-            <p className="text-sm font-semibold text-danger">无法连接安装服务</p>
+            <p className="text-sm font-semibold text-danger">{t('setup.cannotConnectTitle')}</p>
             <p className="mt-2 text-xs text-fg-muted">{loadError}</p>
           </div>
         </div>
@@ -381,15 +428,15 @@ export function SetupApp() {
 
   if (!info) {
     return (
-      <WindowFrame title={frameTitle} resizable={false} minWidthClass="min-w-[760px]">
-        <div className="flex flex-1 items-center justify-center text-sm text-fg-muted">正在初始化…</div>
+      <WindowFrame title={frameTitle} headerSlot={headerSlot} resizable={false} minWidthClass="min-w-[760px]">
+        <div className="flex flex-1 items-center justify-center text-sm text-fg-muted">{t('common.initializing')}</div>
       </WindowFrame>
     );
   }
 
   if (info.mode === 'uninstall') {
     return (
-      <WindowFrame title={frameTitle} badge={frameBadge} resizable={false} minWidthClass="min-w-[760px]">
+      <WindowFrame title={frameTitle} badge={frameBadge} headerSlot={headerSlot} resizable={false} minWidthClass="min-w-[760px]">
         <main className="mx-auto flex min-h-0 w-full max-w-2xl flex-1 flex-col justify-between bg-surface p-8">
           <div className="min-h-0 flex-1 space-y-5 overflow-y-auto pr-1">
             <header className="flex items-center justify-between border-b border-line pb-5">
@@ -397,10 +444,10 @@ export function SetupApp() {
                 <img src={logoMark} alt="" className="h-8 w-8 shrink-0" />
                 <div>
                   <div className="flex items-baseline gap-2">
-                    <h1 className="text-lg font-semibold text-fg">卸载 Hide-Go</h1>
+                    <h1 className="text-lg font-semibold text-fg">{t('setup.uninstallHeading')}</h1>
                     <span className="font-mono text-xs text-fg-subtle">v{info.version}</span>
                   </div>
-                  <p className="mt-0.5 text-xs text-fg-muted">停止后台服务、还原工具配置并清理程序文件。</p>
+                  <p className="mt-0.5 text-xs text-fg-muted">{t('setup.uninstallSubtitle')}</p>
                 </div>
               </div>
               <Trash aria-hidden="true" size={20} className="text-danger" />
@@ -410,15 +457,19 @@ export function SetupApp() {
               <div className="divide-y divide-line border-b border-line">
                 {info.existingInstallDir && (
                   <div className="flex items-center justify-between gap-4 py-3 text-xs">
-                    <span className="text-fg-subtle">安装位置</span>
+                    <span className="text-fg-subtle">{t('setup.installDirLabel')}</span>
                     <code className="truncate font-mono text-fg" title={info.existingInstallDir}>
                       {info.existingInstallDir}
                     </code>
                   </div>
                 )}
                 <ToggleRow
-                  title="同时删除个人配置与规则"
-                  desc={info.configPath ? `删除 ${info.configPath} 及备份文件` : '删除个人配置目录'}
+                  title={t('setup.removeConfigTitle')}
+                  desc={
+                    info.configPath
+                      ? t('setup.removeConfigDescWithPath', { path: info.configPath })
+                      : t('setup.removeConfigDescGeneric')
+                  }
                   checked={removeConfig}
                   onChange={setRemoveConfig}
                 />
@@ -433,10 +484,10 @@ export function SetupApp() {
                       ) : (
                         <WarningCircle aria-hidden="true" size={15} weight="fill" className="shrink-0 text-danger" />
                       )}
-                      {s.label}
+                      {localizeSetupStepLabel(s.id, s.label, locale)}
                     </span>
                     <span className={`font-mono ${s.state === 'done' ? 'text-fg-muted' : 'text-danger'}`}>
-                      {s.detail ?? s.state}
+                      {localizeSetupStepDetail(s.detail, locale) ?? s.state}
                     </span>
                   </div>
                 ))}
@@ -458,7 +509,7 @@ export function SetupApp() {
                   onClick={closeSetup}
                   className="cursor-pointer rounded border border-line-strong bg-surface px-4 py-2 text-xs font-medium text-fg transition-colors hover:bg-surface-2"
                 >
-                  取消
+                  {t('common.cancel')}
                 </button>
                 <button
                   type="button"
@@ -466,7 +517,7 @@ export function SetupApp() {
                   onClick={runUninstall}
                   className="cursor-pointer rounded bg-danger-solid px-4 py-2 text-xs font-medium text-white transition-opacity hover:opacity-95 disabled:opacity-50"
                 >
-                  {busy ? '正在卸载…' : '确认卸载'}
+                  {t(busy ? 'setup.uninstalling' : 'setup.confirmUninstall')}
                 </button>
               </>
             ) : (
@@ -475,7 +526,7 @@ export function SetupApp() {
                 onClick={closeSetup}
                 className="cursor-pointer rounded bg-brand-solid px-5 py-2 text-xs font-medium text-brand-on transition-opacity hover:opacity-95"
               >
-                完成
+                {t('common.done')}
               </button>
             )}
           </footer>
@@ -485,7 +536,7 @@ export function SetupApp() {
   }
 
   return (
-    <WindowFrame title={frameTitle} badge={frameBadge} resizable={false} minWidthClass="min-w-[760px]">
+    <WindowFrame title={frameTitle} badge={frameBadge} headerSlot={headerSlot} resizable={false} minWidthClass="min-w-[760px]">
       <div className="grid min-h-0 flex-1 grid-cols-[212px_minmax(0,1fr)]">
         {/* Left architectural step rail */}
         <aside className="flex flex-col justify-between border-r border-line bg-surface-2/70 p-6">
@@ -493,18 +544,18 @@ export function SetupApp() {
             <div className="flex items-center gap-2.5">
               <img src={logoMark} alt="" className="h-6 w-6 shrink-0" />
               <div className="flex items-baseline gap-1.5">
-                <span className="text-sm font-semibold tracking-tight text-fg">Hide-Go</span>
+                <span className="text-sm font-semibold tracking-tight text-fg">{t('shell.appName')}</span>
                 <span className="font-mono text-2xs text-fg-subtle">v{info.version}</span>
               </div>
             </div>
-            <p className="mt-1.5 text-xs text-fg-subtle">本地 AI 隐私代理</p>
+            <p className="mt-1.5 text-xs text-fg-subtle">{t('setup.brandTagline')}</p>
 
-            <ol className="mt-8 space-y-5" aria-label="安装步骤">
-              {STEPS.map((s, idx) => {
+            <ol className="mt-8 space-y-5" aria-label={t('setup.stepsNavAria')}>
+              {STEP_NUMS.map((s, idx) => {
                 const n = (idx + 1) as 1 | 2 | 3 | 4;
                 const done = step > n;
                 const current = step === n;
-                const hasNext = idx < STEPS.length - 1;
+                const hasNext = idx < STEP_NUMS.length - 1;
                 return (
                   <li key={s.num} aria-current={current ? 'step' : undefined} className="relative flex items-center gap-3">
                     {hasNext && (
@@ -525,7 +576,7 @@ export function SetupApp() {
                       {done ? <Check aria-hidden="true" size={12} weight="bold" /> : s.num}
                     </span>
                     <span className={`text-xs font-medium ${current ? 'text-fg' : done ? 'text-fg-muted' : 'text-fg-subtle'}`}>
-                      {s.title}
+                      {t(s.key)}
                     </span>
                   </li>
                 );
@@ -535,7 +586,7 @@ export function SetupApp() {
 
           {info.alreadyInstalled && (
             <div className="border-t border-line pt-4 text-2xs leading-5 text-brand">
-              已检测到旧版本，安装时将直接更新并保留配置
+              {t('setup.alreadyInstalledNotice')}
             </div>
           )}
         </aside>
@@ -547,24 +598,24 @@ export function SetupApp() {
               <div className="space-y-5">
                 <div>
                   <h1 ref={stepHeadingRef} tabIndex={-1} className="w-fit text-lg font-semibold text-fg focus:outline-none">
-                    {info.alreadyInstalled ? '更新 Hide-Go' : '安装 Hide-Go'}
+                    {t(info.alreadyInstalled ? 'setup.updateHeading' : 'setup.installHeading')}
                   </h1>
                   <p className="mt-1 text-xs leading-5 text-fg-muted">
-                    {info.alreadyInstalled ? '将覆盖更新现有程序，配置文件不受影响。' : '选择安装位置与启动选项。'}
+                    {t(info.alreadyInstalled ? 'setup.updateSubtitle' : 'setup.installSubtitle')}
                   </p>
                 </div>
 
                 {!info.hasEmbeddedBinaries && (
                   <div className="flex items-start gap-2 rounded-md border border-warn/40 bg-warn/10 px-3.5 py-2.5 text-xs text-warn">
                     <WarningCircle aria-hidden="true" size={16} className="mt-0.5 shrink-0" />
-                    <span>开发构建模式：将从相邻构建目录定位程序文件。</span>
+                    <span>{t('setup.devModeNotice')}</span>
                   </div>
                 )}
 
                 <div>
                   <label htmlFor="install-dir-input" className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-fg">
                     <FolderOpen aria-hidden="true" size={14} className="text-fg-subtle" />
-                    安装位置
+                    {t('setup.installDirLabel')}
                   </label>
                   <div className="flex items-center gap-2">
                     <input
@@ -583,7 +634,7 @@ export function SetupApp() {
                       onClick={pickInstallDir}
                       className="inline-flex h-9 shrink-0 cursor-pointer items-center gap-1.5 rounded border border-line-strong bg-surface px-3.5 text-xs font-medium text-fg transition-colors hover:border-line-control hover:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-50"
                     >
-                      {pickingDir ? '选择中…' : '更改…'}
+                      {t(pickingDir ? 'setup.pickingDir' : 'setup.changeDir')}
                     </button>
                   </div>
                   {installDirError && (
@@ -595,22 +646,22 @@ export function SetupApp() {
 
                 <div className="divide-y divide-line border-y border-line">
                   <ToggleRow
-                    title="创建快捷方式"
-                    desc={info.platform === 'windows' ? '在桌面和开始菜单创建入口' : '在桌面和应用列表创建入口'}
+                    title={t('setup.optShortcutsTitle')}
+                    desc={t(info.platform === 'windows' ? 'setup.optShortcutsWin' : 'setup.optShortcutsUnix')}
                     checked={createShortcuts}
                     onChange={setCreateShortcuts}
                   />
                   {info.platform !== 'windows' && (
                     <ToggleRow
-                      title="添加到 PATH"
-                      desc="支持在终端直接启动"
+                      title={t('setup.optPathTitle')}
+                      desc={t('setup.optPathDesc')}
                       checked={addToPath}
                       onChange={setAddToPath}
                     />
                   )}
                   <ToggleRow
-                    title="开机自动启动"
-                    desc="登录系统后在后台运行代理服务"
+                    title={t('setup.optAutostartTitle')}
+                    desc={t('setup.optAutostartDesc')}
                     checked={autostartDaemon}
                     onChange={setAutostartDaemon}
                   />
@@ -627,7 +678,7 @@ export function SetupApp() {
               <div className="space-y-5">
                 <div>
                   <h1 ref={stepHeadingRef} tabIndex={-1} className="w-fit text-lg font-semibold text-fg focus:outline-none">
-                    正在安装
+                    {t('setup.installingHeading')}
                   </h1>
                   <p className="mt-1 truncate font-mono text-xs text-fg-muted" title={installDir}>
                     {installDir}
@@ -635,8 +686,8 @@ export function SetupApp() {
                 </div>
                 <div
                   role="progressbar"
-                  aria-label="安装进度"
-                  aria-valuetext={busy ? '正在写入程序文件' : installRes?.ok ? '安装完成' : '安装中止'}
+                  aria-label={t('setup.progressAria')}
+                  aria-valuetext={busy ? t('setup.progressWorking') : installRes?.ok ? t('setup.progressDone') : t('setup.progressAborted')}
                   className="h-1.5 w-full overflow-hidden rounded-full bg-surface-3"
                 >
                   {busy ? (
@@ -650,13 +701,13 @@ export function SetupApp() {
                     installRes?.steps ?? [
                       {
                         id: 'dir',
-                        label: '准备安装目录',
+                        label: t('setup.stepDefaultDir'),
                         state: busy ? ('running' as const) : ('error' as const),
-                        detail: busy ? undefined : '失败',
+                        detail: busy ? undefined : t('setup.stepDetailFailed'),
                       },
-                      { id: 'bin', label: '写入程序文件', state: 'pending' as const },
-                      { id: 'sys', label: '配置快捷方式与系统入口', state: 'pending' as const },
-                      { id: 'scan', label: '检测本机 AI 工具', state: 'pending' as const },
+                      { id: 'bin', label: t('setup.stepDefaultBin'), state: 'pending' as const },
+                      { id: 'sys', label: t('setup.stepDefaultSys'), state: 'pending' as const },
+                      { id: 'scan', label: t('setup.stepDefaultScan'), state: 'pending' as const },
                     ]
                   ).map((s) => (
                     <div key={s.id} className="flex items-center justify-between gap-4 py-3 text-xs">
@@ -670,10 +721,15 @@ export function SetupApp() {
                         ) : (
                           <span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full bg-line-strong" />
                         )}
-                        {s.label}
+                        {localizeSetupStepLabel(s.id, s.label, locale)}
                       </span>
                       <span className={`font-mono ${s.state === 'error' ? 'text-danger' : 'text-fg-subtle'}`}>
-                        {s.detail ?? (s.state === 'running' ? '处理中…' : busy ? '等待中' : '已中止')}
+                        {localizeSetupStepDetail(s.detail, locale) ??
+                          (s.state === 'running'
+                            ? t('setup.stepDetailWorking')
+                            : busy
+                              ? t('setup.stepDetailPending')
+                              : t('setup.stepDetailAborted'))}
                       </span>
                     </div>
                   ))}
@@ -691,10 +747,10 @@ export function SetupApp() {
                 <div className="flex items-end justify-between gap-4">
                   <div>
                     <h1 ref={stepHeadingRef} tabIndex={-1} className="w-fit text-lg font-semibold text-fg focus:outline-none">
-                      连接本机 AI 工具
+                      {t('setup.step3Heading')}
                     </h1>
                     <p className="mt-1 text-xs leading-5 text-fg-muted">
-                      将已选工具的请求转发至本地代理 <code className="font-mono text-fg">127.0.0.1:{info.defaultProxyPort}</code>，修改前自动备份原配置。
+                      {t('setup.step3Desc', { addr: `127.0.0.1:${info.defaultProxyPort}` })}
                     </p>
                   </div>
                   {autoConnectableKinds.length >= 2 && (
@@ -703,7 +759,7 @@ export function SetupApp() {
                       onClick={() => setSelectedKinds(allAutoSelected ? [] : autoConnectableKinds)}
                       className="shrink-0 cursor-pointer text-xs font-medium text-brand hover:underline"
                     >
-                      {allAutoSelected ? '取消全选' : '全选'}
+                      {t(allAutoSelected ? 'setup.deselectAll' : 'setup.selectAll')}
                     </button>
                   )}
                 </div>
@@ -713,17 +769,18 @@ export function SetupApp() {
                     const canAuto = h.autoConnectMode !== 'manual';
                     const checked = selectedSet.has(h.kind);
                     const statusLabel = !canAuto
-                      ? '需手动配置'
+                      ? t('setup.statusManual')
                       : h.configured
-                        ? '已接入'
+                        ? t('setup.statusConfigured')
                         : h.installed
-                          ? '已安装'
-                          : '未检测到';
+                          ? t('setup.statusInstalled')
+                          : t('setup.statusNotDetected');
                     const statusTone = !canAuto
                       ? 'text-warn font-medium'
                       : h.configured || h.installed
                         ? 'text-brand font-medium'
                         : 'text-fg-subtle';
+                    const localizedNote = localizeHarnessIntegrationNote(h.kind, h.integrationNote, locale);
                     return (
                       <label
                         key={h.kind}
@@ -752,8 +809,8 @@ export function SetupApp() {
                                 {h.installPaths[0]}
                               </div>
                             )}
-                            {!canAuto && h.integrationNote && (
-                              <div className="mt-0.5 text-2xs leading-4 text-fg-muted">{h.integrationNote}</div>
+                            {!canAuto && localizedNote && (
+                              <div className="mt-0.5 text-2xs leading-4 text-fg-muted">{localizedNote}</div>
                             )}
                           </div>
                         </div>
@@ -776,15 +833,15 @@ export function SetupApp() {
                   <CheckCircle aria-hidden="true" size={26} weight="fill" className="shrink-0 text-brand" />
                   <div>
                     <h1 ref={stepHeadingRef} tabIndex={-1} className="w-fit text-lg font-semibold text-fg focus:outline-none">
-                      安装完成
+                      {t(info.alreadyInstalled ? 'setup.step4UpdateTitle' : 'setup.step4InstallTitle')}
                     </h1>
-                    <p className="mt-0.5 text-xs text-fg-muted">Hide-Go 已准备就绪。</p>
+                    <p className="mt-0.5 text-xs text-fg-muted">{t('setup.step4ReadySubtitle')}</p>
                   </div>
                 </div>
 
                 <dl className="divide-y divide-line border-y border-line text-xs">
                   <div className="flex items-center justify-between gap-4 py-2.5">
-                    <dt className="shrink-0 text-fg-subtle">安装位置</dt>
+                    <dt className="shrink-0 text-fg-subtle">{t('setup.installDirLabel')}</dt>
                     <dd className="min-w-0">
                       <code className="block truncate font-mono text-fg" title={installRes?.installDir ?? installDir}>
                         {installRes?.installDir ?? installDir}
@@ -792,30 +849,38 @@ export function SetupApp() {
                     </dd>
                   </div>
                   <div className="flex items-center justify-between gap-4 py-2.5">
-                    <dt className="shrink-0 text-fg-subtle">快捷方式</dt>
-                    <dd className="text-fg">{(installRes?.shortcutsCreated.length ?? 0) > 0 ? '已创建' : '未创建'}</dd>
+                    <dt className="shrink-0 text-fg-subtle">{t('setup.step4ShortcutsLabel')}</dt>
+                    <dd className="text-fg">
+                      {t((installRes?.shortcutsCreated.length ?? 0) > 0 ? 'setup.step4ShortcutsCreated' : 'setup.step4ShortcutsSkipped')}
+                    </dd>
                   </div>
                   {info.platform !== 'windows' && (
                     <div className="flex items-center justify-between gap-4 py-2.5">
-                      <dt className="shrink-0 text-fg-subtle">环境变量 PATH</dt>
-                      <dd className="text-fg">{installRes?.pathUpdated ? '已添加到用户 PATH（新终端生效）' : '未修改'}</dd>
+                      <dt className="shrink-0 text-fg-subtle">{t('setup.step4PathLabel')}</dt>
+                      <dd className="text-fg">
+                        {t(installRes?.pathUpdated ? 'setup.step4PathUpdated' : 'setup.step4PathUnchanged')}
+                      </dd>
                     </div>
                   )}
                   <div className="flex items-center justify-between gap-4 py-2.5">
-                    <dt className="shrink-0 text-fg-subtle">开机自启</dt>
-                    <dd className="text-fg">{installRes?.autostartEnabled ? '已开启' : '未开启'}</dd>
+                    <dt className="shrink-0 text-fg-subtle">{t('setup.step4AutostartLabel')}</dt>
+                    <dd className="text-fg">
+                      {t(installRes?.autostartEnabled ? 'setup.step4AutostartOn' : 'setup.step4AutostartOff')}
+                    </dd>
                   </div>
                 </dl>
 
                 {connectResults && connectResults.length > 0 && (
                   <div className="space-y-1.5">
-                    <p className="label-caps">已接入工具（{connectResults.filter((r) => r.ok).length} 项）</p>
+                    <p className="label-caps">
+                      {t('setup.step4ConnectedSummary', { count: connectResults.filter((r) => r.ok).length })}
+                    </p>
                     <div className="divide-y divide-line border-y border-line">
                       {connectResults.map((r) => (
                         <div key={r.kind} className="flex items-center justify-between gap-3 py-2 text-xs">
                           <span className="inline-flex shrink-0 items-center gap-1.5 font-medium text-fg">
                             <LinkSimple aria-hidden="true" size={13} className={r.ok ? 'text-brand' : 'text-warn'} />
-                            {HARNESS_LABEL[r.kind] ?? r.kind}
+                            {getHarnessLabel(r.kind, locale)}
                           </span>
                           <span className={`truncate ${r.ok ? 'text-brand' : 'text-warn'}`} title={r.message}>
                             {r.message}
@@ -829,7 +894,7 @@ export function SetupApp() {
                 {launched && (
                   <div role="status" className="flex items-center gap-2 rounded-md border border-brand/30 bg-brand/10 px-3.5 py-2.5 text-xs text-brand">
                     <CheckCircle aria-hidden="true" size={16} weight="fill" />
-                    <span>Hide-Go 已启动，窗口即将关闭。</span>
+                    <span>{t('setup.step4LaunchedBanner')}</span>
                   </div>
                 )}
                 {actionError && (
@@ -845,7 +910,7 @@ export function SetupApp() {
             {step === 1 && (
               <>
                 <button type="button" onClick={closeSetup} className="cursor-pointer text-xs text-fg-subtle transition-colors hover:text-fg">
-                  取消
+                  {t('common.cancel')}
                 </button>
                 <button
                   type="button"
@@ -853,7 +918,7 @@ export function SetupApp() {
                   onClick={startInstall}
                   className="inline-flex cursor-pointer items-center gap-2 rounded bg-brand-solid px-5 py-2 text-xs font-medium text-brand-on transition-opacity hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {info.alreadyInstalled ? '开始更新' : '开始安装'}
+                  {t(info.alreadyInstalled ? 'setup.startUpdate' : 'setup.startInstall')}
                   <ArrowRight aria-hidden="true" size={14} />
                 </button>
               </>
@@ -861,14 +926,14 @@ export function SetupApp() {
 
             {step === 2 && (
               <>
-                <span className="text-xs text-fg-subtle">{busy ? '请稍候…' : '安装已中止'}</span>
+                <span className="text-xs text-fg-subtle">{t(busy ? 'setup.pleaseWait' : 'setup.installAborted')}</span>
                 {actionError && (
                   <button
                     type="button"
                     onClick={() => transitionStep(1)}
                     className="cursor-pointer rounded border border-line-strong bg-surface px-4 py-2 text-xs font-medium text-fg transition-colors hover:bg-surface-2"
                   >
-                    返回修改选项
+                    {t('setup.backToOptions')}
                   </button>
                 )}
               </>
@@ -877,7 +942,7 @@ export function SetupApp() {
             {step === 3 && (
               <>
                 <button type="button" disabled={busy} onClick={() => applyHarnesses(true)} className="cursor-pointer text-xs text-fg-subtle transition-colors hover:text-fg">
-                  跳过
+                  {t('setup.skip')}
                 </button>
                 <button
                   type="button"
@@ -885,7 +950,7 @@ export function SetupApp() {
                   onClick={() => applyHarnesses(false)}
                   className="inline-flex cursor-pointer items-center gap-2 rounded bg-brand-solid px-5 py-2 text-xs font-medium text-brand-on transition-opacity hover:opacity-95 disabled:opacity-50"
                 >
-                  {selectedKinds.length > 0 ? `接入 (${selectedKinds.length}) 并继续` : '下一步'}
+                  {selectedKinds.length > 0 ? t('setup.connectAndContinue', { count: selectedKinds.length }) : t('setup.nextStep')}
                   <ArrowRight aria-hidden="true" size={14} />
                 </button>
               </>
@@ -898,7 +963,7 @@ export function SetupApp() {
                   onClick={closeSetup}
                   className="cursor-pointer rounded border border-line-strong bg-surface px-4 py-2 text-xs font-medium text-fg transition-colors hover:bg-surface-2"
                 >
-                  完成
+                  {t('common.done')}
                 </button>
                 {!launched && (
                   <button
@@ -907,7 +972,7 @@ export function SetupApp() {
                     onClick={launchDesktop}
                     className="inline-flex cursor-pointer items-center gap-2 rounded bg-brand-solid px-5 py-2 text-xs font-medium text-brand-on transition-opacity hover:opacity-95 disabled:opacity-50"
                   >
-                    启动 Hide-Go
+                    {t('setup.launchDesktop')}
                   </button>
                 )}
               </>
