@@ -2,6 +2,22 @@
 
 All notable changes to Hide-Go are documented in this file.
 
+## [0.2.4] - 2026-11-21
+
+### Added
+- Built-in secret detectors for AWS STS (`ASIA`), Google/Firebase (`AIza`), Stripe, GitLab, Slack, HuggingFace, npm, PyPI, Groq, Perplexity, Replicate, SendGrid, Aliyun (`LTAI`), Tencent Cloud (`AKID`), DingTalk/Feishu/WeCom/Discord webhooks, JWTs, `Authorization` headers, authenticated HTTP(S) URLs, and additional database/broker URI schemes
+- Support for prefixed and camelCase credential keys (e.g. `GITHUB_WEBHOOK_SECRET`, `stripeWebhookSecret`), WSL2 `/mnt/<drive>/Users/...` paths, forward-slash Windows workspace paths, and Tailscale/CGNAT (`100.64.0.0/10`) private IPs
+- Support for `# ` line comments and expanded Rust/TypeScript/Python/Go standard library preservation in All-Hide mode
+
+### Changed
+- Replace per-string known-secret rescans with cached, boundary-checked `Matcher::remask_secrets` and record re-masked scope secrets in audit findings
+- Match `FileEditsOnly` tool-call content fields case-insensitively (`CodeContent`, `TargetContent`, `ReplacementContent`, `code_edit`, etc.) and add common file-editing tool aliases
+- Use scheme-appropriate default ports in database URL placeholders and include the checked resource directory path in missing-resource startup errors
+
+### Fixed
+- Inspect the Windows reparse tag via `FindFirstFileW` so `Hide-Go-Setup` and `hide-go-desktop` run normally inside OneDrive Cloud Files and WOF-compressed folders while still blocking symlinks and NTFS junctions
+- Reduce coding-agent false positives by ignoring pagination/counter/metadata keys (`nextPageToken`, `max_token`, `secretArn`, `public_key`), env templates (`$VAR`, `${VAR}`), code references (`process.env.*`), `.env.local` / `settings.local.json`, Retina asset filenames (`icon@2x.png`), invalid IPv4 octets, Windows system directories, and trailing JSON quotes after database URLs
+
 ## [0.2.3] - 2026-11-21
 
 ### Added
