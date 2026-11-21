@@ -124,20 +124,6 @@ fn linked_assets(mut html: &str) -> BTreeMap<String, &'static str> {
     assets
 }
 
-fn emit_optional_binary(var: &str, const_name: &str) -> String {
-    println!("cargo:rerun-if-env-changed={var}");
-    match env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from) {
-        Some(path) => {
-            println!("cargo:rerun-if-changed={}", path.display());
-            let canonical = path
-                .canonicalize()
-                .unwrap_or_else(|e| panic!("Cannot resolve {var}={}: {e}", path.display()));
-            format!("pub const {const_name}: Option<&[u8]> = Some(include_bytes!({canonical:?}));\n")
-        }
-        None => format!("pub const {const_name}: Option<&[u8]> = None;\n"),
-    }
-}
-
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let dist = manifest_dir.join("../../dist");
@@ -169,8 +155,6 @@ fn main() {
         icon_ico,
         icon_png,
     );
-    generated.push_str(&emit_optional_binary("HIDE_GO_BUNDLE_DESKTOP", "EMBEDDED_DESKTOP_BIN"));
-    generated.push_str(&emit_optional_binary("HIDE_GO_BUNDLE_DAEMON", "EMBEDDED_DAEMON_BIN"));
     generated.push_str("pub const EMBEDDED_ASSETS: &[(&str, &str, &[u8])] = &[\n");
 
     let mut embedded = linked_assets(&html);

@@ -45,3 +45,8 @@ tower-service = "0.3"
 webpki-roots = "1.0"
 tao = "0.37"
 wry = "0.57"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1

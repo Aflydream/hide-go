@@ -624,7 +624,7 @@
   "setup.installHeading": "安装 Hide-Go",
   "setup.updateSubtitle": "将覆盖更新现有程序，配置文件不受影响。",
   "setup.installSubtitle": "选择安装位置与启动选项。",
-  "setup.devModeNotice": "开发构建模式：将从相邻构建目录定位程序文件。",
+  "setup.missingPayloadNotice": "未找到同级 payload/ 安装目录，请先完整解压安装包，并保持 payload 文件夹与安装程序在同一目录下。",
   "setup.pickingDir": "选择中…",
   "setup.changeDir": "更改…",
   "setup.optShortcutsTitle": "创建快捷方式",

@@ -5,6 +5,7 @@ use hide_core::config::{HideConfig, UiLanguage};
 use hide_core::harness::HarnessProfile;
 use hide_core::harness_detect::{detect_all_harness_profiles, disconnect_all_managed, HarnessActionResult};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
 #[cfg(windows)]
@@ -78,12 +79,20 @@ pub struct UninstallOutcome {
     pub pending_cleanup_dir: Option<PathBuf>,
 }
 
-pub struct EmbeddedPayloads<'a> {
-    pub desktop_bin: Option<&'a [u8]>,
-    pub daemon_bin: Option<&'a [u8]>,
-    pub icon_ico: &'a [u8],
-    pub icon_png: &'a [u8],
-    pub version: &'a str,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayloadManifest {
+    pub version: String,
+    pub files: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PayloadSource {
+    pub payload_dir: Option<PathBuf>,
+    pub require_manifest: bool,
+    pub fallback_icon_ico: &'static [u8],
+    pub fallback_icon_png: &'static [u8],
+    pub version: &'static str,
 }
 
 pub fn current_platform() -> &'static str {
@@ -159,6 +168,10 @@ pub fn default_install_dir() -> PathBuf {
 
 pub fn manifest_path(install_dir: &Path) -> PathBuf {
     install_dir.join("install-manifest.json")
+}
+
+pub fn payload_manifest_path(payload_dir: &Path) -> PathBuf {
+    payload_dir.join("payload-manifest.json")
 }
 
 pub fn is_reparse_or_symlink(path: &Path) -> bool {
@@ -905,37 +918,112 @@ fn set_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(debug_assertions)]
-fn find_fallback_binary(file_name: &str) -> Option<PathBuf> {
-    let Ok(exe) = std::env::current_exe() else {
-        return None;
-    };
-    let exe_dir = exe.parent()?;
-    let candidates = [
-        exe_dir.join(file_name),
-        exe_dir.join("release").join(file_name),
-        PathBuf::from("target/release").join(file_name),
-        PathBuf::from("target/debug").join(file_name),
-    ];
-    candidates
-        .into_iter()
-        .find(|p| p.is_file() && !is_reparse_or_symlink(p))
+fn is_regular_non_symlink_file(path: &Path) -> bool {
+    !is_reparse_or_symlink(path) && path.is_file()
 }
 
-fn write_binary(embedded: Option<&[u8]>, file_name: &str, dest: &Path) -> Result<(), String> {
-    if let Some(bytes) = embedded {
-        atomic_write_bytes(dest, bytes, true)?;
-    } else {
-        #[cfg(debug_assertions)]
-        {
-            if let Some(src) = find_fallback_binary(file_name) {
-                atomic_copy_file(&src, dest, true)?;
-                return Ok(());
+fn has_required_payload_binaries(dir: &Path) -> bool {
+    dir.is_dir()
+        && !is_reparse_or_symlink(dir)
+        && is_regular_non_symlink_file(&dir.join(desktop_bin_name()))
+        && is_regular_non_symlink_file(&dir.join(daemon_bin_name()))
+}
+
+pub fn discover_payload_dir() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            candidates.push(exe_dir.join("payload"));
+            #[cfg(target_os = "macos")]
+            candidates.push(exe_dir.join("../Resources/payload"));
+            #[cfg(debug_assertions)]
+            {
+                candidates.push(exe_dir.to_path_buf());
+                candidates.push(exe_dir.join("release"));
             }
         }
-        return Err(format!("安装包缺少 {file_name} 载荷且未找到本地构建文件"));
     }
-    Ok(())
+    #[cfg(debug_assertions)]
+    {
+        candidates.push(PathBuf::from("target/release"));
+        candidates.push(PathBuf::from("target/debug"));
+    }
+    candidates.into_iter().find(|dir| has_required_payload_binaries(dir))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn load_payload_manifest(payload_dir: &Path, required: bool) -> Result<Option<PayloadManifest>, String> {
+    let manifest_file = payload_manifest_path(payload_dir);
+    if is_reparse_or_symlink(&manifest_file) {
+        return Err(format!("安装清单 {} 是符号链接，拒绝读取", manifest_file.display()));
+    }
+    if !manifest_file.is_file() {
+        if required {
+            return Err(format!(
+                "安装包缺少校验清单 {}，请重新完整解压",
+                manifest_file.display()
+            ));
+        }
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&manifest_file)
+        .map_err(|e| format!("读取安装包校验清单 {} 失败: {e}", manifest_file.display()))?;
+    let manifest = serde_json::from_str::<PayloadManifest>(raw.trim_start_matches('\u{feff}'))
+        .map_err(|e| format!("解析安装包校验清单 {} 失败: {e}", manifest_file.display()))?;
+    Ok(Some(manifest))
+}
+
+pub fn has_install_payload(source: &PayloadSource) -> bool {
+    let Some(dir) = source.payload_dir.as_deref() else {
+        return false;
+    };
+    has_required_payload_binaries(dir) && load_payload_manifest(dir, source.require_manifest).is_ok()
+}
+
+fn read_verified_payload(
+    payload_dir: &Path,
+    manifest: Option<&PayloadManifest>,
+    file_name: &str,
+) -> Result<Vec<u8>, String> {
+    let src = payload_dir.join(file_name);
+    if is_reparse_or_symlink(&src) {
+        return Err(format!("安装文件 {} 是符号链接，拒绝读取", src.display()));
+    }
+    if !src.is_file() {
+        return Err(format!("安装包缺少必需文件: {}", src.display()));
+    }
+    let bytes = std::fs::read(&src).map_err(|e| format!("读取安装文件 {} 失败: {e}", src.display()))?;
+    if let Some(m) = manifest {
+        let expected = m
+            .files
+            .get(file_name)
+            .ok_or_else(|| format!("校验清单缺少文件 {file_name} 的摘要记录"))?;
+        let actual = sha256_hex(&bytes);
+        if !actual.eq_ignore_ascii_case(expected.trim()) {
+            return Err(format!("文件 {file_name} SHA-256 校验失败（文件可能损坏或被篡改）"));
+        }
+    }
+    Ok(bytes)
+}
+
+fn read_icon_payload(
+    payload_dir: &Path,
+    manifest: Option<&PayloadManifest>,
+    file_name: &str,
+    fallback: &[u8],
+) -> Result<Vec<u8>, String> {
+    let path = payload_dir.join(file_name);
+    let in_manifest = manifest.is_some_and(|m| m.files.contains_key(file_name));
+    if is_reparse_or_symlink(&path) || path.is_file() || in_manifest {
+        read_verified_payload(payload_dir, manifest, file_name)
+    } else {
+        Ok(fallback.to_vec())
+    }
 }
 
 fn load_existing_config(config_path: Option<&Path>) -> Option<HideConfig> {
@@ -957,13 +1045,13 @@ pub fn configured_language(config_path: Option<&Path>) -> UiLanguage {
         .unwrap_or_default()
 }
 
-pub fn perform_install(opts: &InstallOptions, payloads: &EmbeddedPayloads<'_>) -> InstallOutcome {
+pub fn perform_install(opts: &InstallOptions, payloads: &PayloadSource) -> InstallOutcome {
     perform_install_with(opts, payloads, &RealSystemOps, HideConfig::default_path().as_deref())
 }
 
 pub fn perform_install_with(
     opts: &InstallOptions,
-    payloads: &EmbeddedPayloads<'_>,
+    payloads: &PayloadSource,
     sys: &dyn SystemOps,
     config_path: Option<&Path>,
 ) -> InstallOutcome {
@@ -1041,21 +1129,33 @@ pub fn perform_install_with(
         detail: Some(install_dir.to_string_lossy().into_owned()),
     });
 
-    // 2. Write desktop + daemon binaries + icon + self uninstaller copy
+    // 2. Verify and write desktop + daemon binaries + icon + self uninstaller copy
     let icon_ico = install_dir.join("icon.ico");
     let icon_png = install_dir.join("icon.png");
-    let bin_res = write_binary(payloads.desktop_bin, desktop_bin_name(), &desktop_dest)
-        .and_then(|_| write_binary(payloads.daemon_bin, daemon_bin_name(), &daemon_dest))
-        .and_then(|_| atomic_write_bytes(&icon_ico, payloads.icon_ico, false))
-        .and_then(|_| atomic_write_bytes(&icon_png, payloads.icon_png, false))
-        .and_then(|_| {
-            let self_exe = std::env::current_exe().map_err(|e| format!("定位当前安装器路径失败: {e}"))?;
-            if !same_path(&self_exe, &uninstall_dest) {
-                atomic_copy_file(&self_exe, &uninstall_dest, true)
-                    .map_err(|e| format!("写入卸载程序 {} 失败: {e}", uninstall_dest.display()))?;
-            }
-            Ok(())
-        });
+    let bin_res = (|| -> Result<(), String> {
+        let payload_dir = payloads
+            .payload_dir
+            .as_deref()
+            .filter(|dir| !is_reparse_or_symlink(dir) && dir.is_dir())
+            .ok_or_else(|| "未找到同级 payload/ 安装目录，请先完整解压安装包".to_string())?;
+        let manifest = load_payload_manifest(payload_dir, payloads.require_manifest)?;
+        let desktop_bytes = read_verified_payload(payload_dir, manifest.as_ref(), desktop_bin_name())?;
+        let daemon_bytes = read_verified_payload(payload_dir, manifest.as_ref(), daemon_bin_name())?;
+        let icon_ico_bytes = read_icon_payload(payload_dir, manifest.as_ref(), "icon.ico", payloads.fallback_icon_ico)?;
+        let icon_png_bytes = read_icon_payload(payload_dir, manifest.as_ref(), "icon.png", payloads.fallback_icon_png)?;
+
+        atomic_write_bytes(&desktop_dest, &desktop_bytes, true)?;
+        atomic_write_bytes(&daemon_dest, &daemon_bytes, true)?;
+        atomic_write_bytes(&icon_ico, &icon_ico_bytes, false)?;
+        atomic_write_bytes(&icon_png, &icon_png_bytes, false)?;
+
+        let self_exe = std::env::current_exe().map_err(|e| format!("定位当前安装器路径失败: {e}"))?;
+        if !same_path(&self_exe, &uninstall_dest) {
+            atomic_copy_file(&self_exe, &uninstall_dest, true)
+                .map_err(|e| format!("写入卸载程序 {} 失败: {e}", uninstall_dest.display()))?;
+        }
+        Ok(())
+    })();
     if let Err(e) = bin_res {
         steps.push(SetupStepStatus {
             id: "bin".into(),
@@ -1697,6 +1797,40 @@ mod tests {
         }
     }
 
+    fn create_test_payload_dir(root: &Path, version: &str, with_manifest: bool) -> PayloadSource {
+        let payload_dir = root.join("payload");
+        std::fs::create_dir_all(&payload_dir).unwrap();
+        let entries: [(&str, &[u8]); 4] = [
+            (desktop_bin_name(), b"DESKTOP_BIN"),
+            (daemon_bin_name(), b"DAEMON_BIN"),
+            ("icon.ico", b"ICO"),
+            ("icon.png", b"PNG"),
+        ];
+        let mut files = HashMap::new();
+        for (name, content) in entries {
+            std::fs::write(payload_dir.join(name), content).unwrap();
+            files.insert(name.to_string(), sha256_hex(content));
+        }
+        if with_manifest {
+            let manifest = PayloadManifest {
+                version: version.to_string(),
+                files,
+            };
+            std::fs::write(
+                payload_manifest_path(&payload_dir),
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+        }
+        PayloadSource {
+            payload_dir: Some(payload_dir),
+            require_manifest: with_manifest,
+            fallback_icon_ico: b"FALLBACK_ICO",
+            fallback_icon_png: b"FALLBACK_PNG",
+            version: "0.1.2",
+        }
+    }
+
     #[test]
     fn install_preserves_existing_config_and_uninstall_cleans_up() {
         let tmp = TempDir::new();
@@ -1710,13 +1844,7 @@ mod tests {
         };
         custom_cfg.save(&cfg_path).unwrap();
 
-        let payloads = EmbeddedPayloads {
-            desktop_bin: Some(b"DESKTOP_BIN"),
-            daemon_bin: Some(b"DAEMON_BIN"),
-            icon_ico: b"ICO",
-            icon_png: b"PNG",
-            version: "0.1.2",
-        };
+        let payloads = create_test_payload_dir(tmp.path(), "0.1.2", true);
         let ops = MockOps::default();
 
         let outcome = perform_install_with(
@@ -1767,13 +1895,7 @@ mod tests {
         let tmp = TempDir::new();
         let install_dir = tmp.path().join("app");
         let cfg_path = tmp.path().join("cfg").join("config.json");
-        let payloads = EmbeddedPayloads {
-            desktop_bin: Some(b"DESKTOP_BIN"),
-            daemon_bin: Some(b"DAEMON_BIN"),
-            icon_ico: b"ICO",
-            icon_png: b"PNG",
-            version: "0.1.2",
-        };
+        let payloads = create_test_payload_dir(tmp.path(), "0.1.2", true);
         let ops = MockOps::default();
 
         let first = perform_install_with(
@@ -1808,6 +1930,88 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(manifest_path(&install_dir)).unwrap()).unwrap();
         assert_eq!(saved.shortcuts, first.shortcuts_created);
         assert!(saved.path_added);
+    }
+
+    #[test]
+    fn payload_manifest_verifies_sha256_and_rejects_tampered_binary() {
+        let tmp = TempDir::new();
+        let install_dir = tmp.path().join("app");
+        let cfg_path = tmp.path().join("cfg").join("config.json");
+        let payloads = create_test_payload_dir(tmp.path(), "0.2.2", true);
+        let ops = MockOps::default();
+
+        assert!(has_install_payload(&payloads));
+
+        // Corrupt daemon binary on disk without updating payload-manifest.json
+        let payload_dir = payloads.payload_dir.as_ref().unwrap();
+        std::fs::write(payload_dir.join(daemon_bin_name()), b"TAMPERED_DAEMON").unwrap();
+
+        let outcome = perform_install_with(
+            &InstallOptions {
+                install_dir: Some(install_dir.to_string_lossy().into_owned()),
+                create_shortcuts: false,
+                add_to_path: false,
+                autostart_daemon: false,
+                language: None,
+            },
+            &payloads,
+            &ops,
+            Some(&cfg_path),
+        );
+        assert!(!outcome.ok);
+        assert!(outcome.error.as_deref().unwrap_or("").contains("SHA-256"));
+        assert!(!install_dir.join(desktop_bin_name()).exists());
+        assert!(!install_dir.join(daemon_bin_name()).exists());
+    }
+
+    #[test]
+    fn missing_payload_or_manifest_is_rejected_when_required() {
+        let tmp = TempDir::new();
+        let install_dir = tmp.path().join("app");
+        let cfg_path = tmp.path().join("cfg").join("config.json");
+        let ops = MockOps::default();
+
+        // Case 1: missing payload directory
+        let missing_dir_source = PayloadSource {
+            payload_dir: None,
+            require_manifest: true,
+            fallback_icon_ico: b"ICO",
+            fallback_icon_png: b"PNG",
+            version: "0.2.2",
+        };
+        assert!(!has_install_payload(&missing_dir_source));
+        let missing_res = perform_install_with(
+            &InstallOptions {
+                install_dir: Some(install_dir.to_string_lossy().into_owned()),
+                create_shortcuts: false,
+                add_to_path: false,
+                autostart_daemon: false,
+                language: None,
+            },
+            &missing_dir_source,
+            &ops,
+            Some(&cfg_path),
+        );
+        assert!(!missing_res.ok);
+
+        // Case 2: payload directory present without payload-manifest.json while required
+        let no_manifest_root = tmp.path().join("no-manifest");
+        let mut no_manifest_source = create_test_payload_dir(&no_manifest_root, "0.2.2", false);
+        no_manifest_source.require_manifest = true;
+        assert!(!has_install_payload(&no_manifest_source));
+        let manifest_err = perform_install_with(
+            &InstallOptions {
+                install_dir: Some(install_dir.to_string_lossy().into_owned()),
+                create_shortcuts: false,
+                add_to_path: false,
+                autostart_daemon: false,
+                language: None,
+            },
+            &no_manifest_source,
+            &ops,
+            Some(&cfg_path),
+        );
+        assert!(!manifest_err.ok);
     }
 
     #[test]
@@ -1917,13 +2121,7 @@ mod tests {
         assert!(!without_manifest.ok);
         assert!(unrelated.is_file());
 
-        let payloads = EmbeddedPayloads {
-            desktop_bin: Some(b"DESKTOP"),
-            daemon_bin: Some(b"DAEMON"),
-            icon_ico: b"ICO",
-            icon_png: b"PNG",
-            version: "0.1.2",
-        };
+        let payloads = create_test_payload_dir(tmp.path(), "0.1.2", true);
         let installed = perform_install_with(
             &InstallOptions {
                 install_dir: Some(install_dir.to_string_lossy().into_owned()),

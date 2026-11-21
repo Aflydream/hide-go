@@ -166,18 +166,16 @@ $env:NO_PROXY           = "localhost,127.0.0.1,::1"
 
 ## 下载与安装
 
-从 [Releases 页面](https://github.com/Aflydream/hide-go/releases) 下载对应系统的 **Setup 安装向导**（推荐，含完整安装、快捷方式、PATH 注册、AI 工具自动检测与系统卸载器），或下载免安装便携版 `hide-go-desktop`。前端控制台与安装界面均已静态内嵌，无需预先安装 Node.js：
+从 [Releases 页面](https://github.com/Aflydream/hide-go/releases) 下载对应系统的 **Hide-Go Setup** 安装压缩包。包内包含轻量安装向导以及独立的 `payload/` 目录（内含 `hide-go-desktop` 主程序、`hide-go-daemon` 守护进程、图标与 `payload-manifest.json` SHA-256 校验清单）。请完整解压压缩包，保持 `payload/` 与安装向导在同一目录下运行（界面已静态内嵌，无需 Node.js）：
 
-### 完整安装向导（推荐）
-
-* **Windows (x64)**：下载并运行 `Hide-Go-Setup-windows-x64.exe`（图形化向导；支持在系统「应用和功能」中完整卸载并回滚接入配置）
+* **Windows (x64)**：下载 `Hide-Go-Setup-windows-x64.zip`，完整解压后运行其中的 `Hide-Go-Setup.exe`
 * **macOS (Apple Silicon)**：
   ```bash
-  chmod +x Hide-Go-Setup-macos-arm64 && ./Hide-Go-Setup-macos-arm64
+  tar -xzf Hide-Go-Setup-macos-arm64.tar.gz && ./Hide-Go-Setup-macos-arm64/Hide-Go-Setup
   ```
 * **Linux (x86_64)**：
   ```bash
-  chmod +x Hide-Go-Setup-linux-x86_64 && ./Hide-Go-Setup-linux-x86_64
+  tar -xzf Hide-Go-Setup-linux-x86_64.tar.gz && ./Hide-Go-Setup-linux-x86_64/Hide-Go-Setup
   ```
 
 安装程序也支持静默命令行部署与卸载：
@@ -190,9 +188,9 @@ Hide-Go-Setup --silent --install --dir /path/to/Hide-Go --auto-connect
 Hide-Go-Setup --silent --uninstall --dir /path/to/Hide-Go
 ```
 
-### 免安装便携版
+### 运行说明
 
-如果不需要写入安装目录或注册卸载项，可直接运行 `hide-go-desktop-*`；启动后监听 `127.0.0.1:18787` 并打开桌面控制台。若需在无桌面环境下作为后台守护进程运行，设置 `HIDE_GO_HEADLESS=1` 或直接运行安装目录下的 `hide-go-daemon`。
+安装完成后运行桌面程序 `hide-go-desktop`，启动后默认监听 `127.0.0.1:18787` 并打开桌面控制台；若需在无桌面环境下作为后台守护进程运行，设置 `HIDE_GO_HEADLESS=1` 或直接运行安装目录下的 `hide-go-daemon`：
 
 | 环境变量 | 作用 |
 | :--- | :--- |
@@ -220,14 +218,14 @@ Hide-Go-Setup --silent --uninstall --dir /path/to/Hide-Go
 # 1. 运行核心、桌面端与安装器单元测试
 cargo test --workspace
 
-# 2. 打包前端并编译守护进程 + 桌面程序
+# 2. 打包前端并编译桌面端、守护进程与安装向导
 npm install && npm run build
-cargo build --release -p hide-core -p hide-go-desktop
+cargo build --release -p hide-core -p hide-go-desktop -p hide-setup
 
-# 3. 编译内嵌完整负载的独立安装程序（Windows PowerShell 示例）
-$env:HIDE_GO_BUNDLE_DESKTOP = "$PWD\target\release\hide-go-desktop.exe"
-$env:HIDE_GO_BUNDLE_DAEMON  = "$PWD\target\release\hide-go-daemon.exe"
-cargo build --release -p hide-setup
+# 3. 组装本地安装目录（Windows PowerShell 示例）
+New-Item -ItemType Directory -Force -Path Hide-Go-Setup\payload | Out-Null
+Copy-Item target\release\hide-go-setup.exe Hide-Go-Setup\Hide-Go-Setup.exe
+Copy-Item target\release\hide-go-desktop.exe, target\release\hide-go-daemon.exe, desktop\icons\icon.ico, desktop\icons\icon.png Hide-Go-Setup\payload\
 ```
 
 ### 代码结构
@@ -248,7 +246,7 @@ hide-go/
 │   │   ├── harness_detect.rs  # 本机 AI 工具扫描、配置文件/环境变量自动接入与可逆回滚
 │   │   └── proxy.rs           # Axum 反向代理、管理 API 与离线模拟器
 │   └── tests/                 # 代码审查问题的回归测试
-├── crates/hide-setup/         # 图形化安装与卸载向导（内嵌前端与编译负载）
+├── crates/hide-setup/         # 图形化安装与卸载向导（内嵌向导界面，读取同级 payload/ 安装）
 ├── src/                       # 桌面控制台与安装向导 UI（React + Vite + Tailwind）
 └── desktop/                   # 静态资源内嵌与桌面窗口启动器 (hide-go-desktop)
 ```

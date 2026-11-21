@@ -45,25 +45,31 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: hide-go-desktop-linux-x86_64
             bin_name: hide-go-desktop
             daemon_bin_name: hide-go-daemon
-            setup_artifact_name: Hide-Go-Setup-linux-x86_64
             setup_bin_name: hide-go-setup
+            setup_entry_name: Hide-Go-Setup
+            package_dir: Hide-Go-Setup-linux-x86_64
+            archive_name: Hide-Go-Setup-linux-x86_64.tar.gz
+            archive_format: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: hide-go-desktop-macos-arm64
             bin_name: hide-go-desktop
             daemon_bin_name: hide-go-daemon
-            setup_artifact_name: Hide-Go-Setup-macos-arm64
             setup_bin_name: hide-go-setup
+            setup_entry_name: Hide-Go-Setup
+            package_dir: Hide-Go-Setup-macos-arm64
+            archive_name: Hide-Go-Setup-macos-arm64.tar.gz
+            archive_format: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: hide-go-desktop-windows-x64.exe
             bin_name: hide-go-desktop.exe
             daemon_bin_name: hide-go-daemon.exe
-            setup_artifact_name: Hide-Go-Setup-windows-x64.exe
             setup_bin_name: hide-go-setup.exe
+            setup_entry_name: Hide-Go-Setup.exe
+            package_dir: Hide-Go-Setup-windows-x64
+            archive_name: Hide-Go-Setup-windows-x64.zip
+            archive_format: zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -81,39 +87,72 @@ jobs:
         run: |
           npm ci
           npm run build
-      - name: Build daemon and desktop binaries
-        run: cargo build --release --locked -p hide-core -p hide-go-desktop --target ${{ matrix.target }}
-      - name: Build setup installer
+      - name: Build desktop, daemon, and setup binaries
+        run: cargo build --release --locked -p hide-core -p hide-go-desktop -p hide-setup --target ${{ matrix.target }}
+      - name: Package setup archive and checksum
         shell: bash
         run: |
-          if command -v cygpath >/dev/null 2>&1; then
-            WS_ROOT="$(cygpath -w "$PWD")"
-          else
-            WS_ROOT="$PWD"
+          VERSION=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          test -n "${VERSION}"
+
+          PKG_DIR="${{ matrix.package_dir }}"
+          ARCHIVE="${{ matrix.archive_name }}"
+          TARGET_DIR="target/${{ matrix.target }}/release"
+
+          rm -rf "${PKG_DIR}" "${ARCHIVE}" "${ARCHIVE}.sha256"
+          mkdir -p "${PKG_DIR}/payload"
+
+          cp "${TARGET_DIR}/${{ matrix.setup_bin_name }}" "${PKG_DIR}/${{ matrix.setup_entry_name }}"
+          cp "${TARGET_DIR}/${{ matrix.bin_name }}" "${PKG_DIR}/payload/${{ matrix.bin_name }}"
+          cp "${TARGET_DIR}/${{ matrix.daemon_bin_name }}" "${PKG_DIR}/payload/${{ matrix.daemon_bin_name }}"
+          cp "desktop/icons/icon.ico" "${PKG_DIR}/payload/icon.ico"
+          cp "desktop/icons/icon.png" "${PKG_DIR}/payload/icon.png"
+
+          if [ "${{ matrix.archive_format }}" = "tar.gz" ]; then
+            chmod +x "${PKG_DIR}/${{ matrix.setup_entry_name }}" \
+              "${PKG_DIR}/payload/${{ matrix.bin_name }}" \
+              "${PKG_DIR}/payload/${{ matrix.daemon_bin_name }}"
           fi
-          export HIDE_GO_BUNDLE_DESKTOP="${WS_ROOT}/target/${{ matrix.target }}/release/${{ matrix.bin_name }}"
-          export HIDE_GO_BUNDLE_DAEMON="${WS_ROOT}/target/${{ matrix.target }}/release/${{ matrix.daemon_bin_name }}"
-          cargo build --release --locked -p hide-setup --target ${{ matrix.target }}
-      - name: Package installer, portable binary, and checksums
-        shell: bash
-        run: |
-          cp "target/${{ matrix.target }}/release/${{ matrix.setup_bin_name }}" "${{ matrix.setup_artifact_name }}"
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "${{ matrix.artifact_name }}"
-          if command -v sha256sum >/dev/null; then
-            sha256sum "${{ matrix.setup_artifact_name }}" > "${{ matrix.setup_artifact_name }}.sha256"
-            sha256sum "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256"
+
+          sha256_of() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | awk '{print $1}'
+            else
+              shasum -a 256 "$1" | awk '{print $1}'
+            fi
+          }
+
+          DESKTOP_SHA=$(sha256_of "${PKG_DIR}/payload/${{ matrix.bin_name }}")
+          DAEMON_SHA=$(sha256_of "${PKG_DIR}/payload/${{ matrix.daemon_bin_name }}")
+          ICO_SHA=$(sha256_of "${PKG_DIR}/payload/icon.ico")
+          PNG_SHA=$(sha256_of "${PKG_DIR}/payload/icon.png")
+
+          cat > "${PKG_DIR}/payload/payload-manifest.json" <<EOF
+          {
+            "version": "${VERSION}",
+            "files": {
+              "${{ matrix.bin_name }}": "${DESKTOP_SHA}",
+              "${{ matrix.daemon_bin_name }}": "${DAEMON_SHA}",
+              "icon.ico": "${ICO_SHA}",
+              "icon.png": "${PNG_SHA}"
+            }
+          }
+          EOF
+
+          if [ "${{ matrix.archive_format }}" = "zip" ]; then
+            powershell.exe -NoProfile -NonInteractive -Command "Compress-Archive -Path '${PKG_DIR}' -DestinationPath '${ARCHIVE}' -CompressionLevel Optimal -Force"
           else
-            shasum -a 256 "${{ matrix.setup_artifact_name }}" > "${{ matrix.setup_artifact_name }}.sha256"
-            shasum -a 256 "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256"
+            COPYFILE_DISABLE=1 tar -czf "${ARCHIVE}" "${PKG_DIR}"
           fi
+
+          ARCHIVE_SHA=$(sha256_of "${ARCHIVE}")
+          printf "%s  %s\n" "${ARCHIVE_SHA}" "${ARCHIVE}" > "${ARCHIVE}.sha256"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
+          name: ${{ matrix.package_dir }}
           path: |
-            ${{ matrix.setup_artifact_name }}
-            ${{ matrix.setup_artifact_name }}.sha256
-            ${{ matrix.artifact_name }}
-            ${{ matrix.artifact_name }}.sha256
+            ${{ matrix.archive_name }}
+            ${{ matrix.archive_name }}.sha256
 
   release:
     # Releases are cut only from version tags, so every binary matches its tagged source.

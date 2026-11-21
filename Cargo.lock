@@ -1208,10 +1208,12 @@ name = "hide-setup"
 version = "0.2.1"
 dependencies = [
  "axum",
+ "hex",
  "hide-chrome",
  "hide-core",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower",
  "tracing",

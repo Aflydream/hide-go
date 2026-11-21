@@ -15,8 +15,9 @@ use hide_core::harness_detect::{connect_harness, detect_all_harness_profiles};
 use hide_core::proxy::is_local_browser_request;
 use installer::{
     configured_language, configured_proxy_port, current_platform, default_install_dir, desktop_bin_name,
-    detect_existing_install, is_reparse_or_symlink, manifest_path, perform_install, perform_uninstall, same_path,
-    schedule_self_cleanup, validate_install_dir, EmbeddedPayloads, InstallManifest, InstallOptions, UninstallOptions,
+    detect_existing_install, discover_payload_dir, has_install_payload, is_reparse_or_symlink, manifest_path,
+    perform_install, perform_uninstall, same_path, schedule_self_cleanup, validate_install_dir, InstallManifest,
+    InstallOptions, PayloadSource, UninstallOptions,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -55,12 +56,12 @@ fn setup_msg(locale: &str, key: &str) -> String {
         .unwrap_or_else(|| key.to_string())
 }
 
-fn payloads() -> EmbeddedPayloads<'static> {
-    EmbeddedPayloads {
-        desktop_bin: EMBEDDED_DESKTOP_BIN,
-        daemon_bin: EMBEDDED_DAEMON_BIN,
-        icon_ico: EMBEDDED_ICON_ICO,
-        icon_png: EMBEDDED_ICON_PNG,
+fn payloads() -> PayloadSource {
+    PayloadSource {
+        payload_dir: discover_payload_dir(),
+        require_manifest: !cfg!(debug_assertions),
+        fallback_icon_ico: EMBEDDED_ICON_ICO,
+        fallback_icon_png: EMBEDDED_ICON_PNG,
         version: env!("CARGO_PKG_VERSION"),
     }
 }
@@ -82,7 +83,7 @@ struct SetupInfoResponse {
     platform: &'static str,
     system_locale: &'static str,
     language: UiLanguage,
-    has_embedded_binaries: bool,
+    has_install_payload: bool,
     default_install_dir: String,
     already_installed: bool,
     existing_install_dir: Option<String>,
@@ -260,7 +261,7 @@ async fn api_setup_info(State(state): State<SetupState>) -> Response {
             platform: current_platform(),
             system_locale: hide_chrome::detect_system_locale(),
             language,
-            has_embedded_binaries: EMBEDDED_DESKTOP_BIN.is_some() && EMBEDDED_DAEMON_BIN.is_some(),
+            has_install_payload: has_install_payload(&payloads()),
             default_install_dir: default_install_dir().to_string_lossy().into_owned(),
             already_installed: existing.is_some(),
             existing_install_dir: existing.map(|m| m.install_dir),

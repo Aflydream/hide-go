@@ -44,7 +44,7 @@ interface SetupInfo {
   platform: 'windows' | 'macos' | 'linux';
   systemLocale?: string;
   language?: UiLanguage;
-  hasEmbeddedBinaries: boolean;
+  hasInstallPayload: boolean;
   defaultInstallDir: string;
   alreadyInstalled: boolean;
   existingInstallDir: string | null;
@@ -605,10 +605,10 @@ export function SetupApp() {
                   </p>
                 </div>
 
-                {!info.hasEmbeddedBinaries && (
-                  <div className="flex items-start gap-2 rounded-md border border-warn/40 bg-warn/10 px-3.5 py-2.5 text-xs text-warn">
+                {!info.hasInstallPayload && (
+                  <div role="alert" className="flex items-start gap-2 rounded-md border border-danger/40 bg-danger/10 px-3.5 py-2.5 text-xs text-danger">
                     <WarningCircle aria-hidden="true" size={16} className="mt-0.5 shrink-0" />
-                    <span>{t('setup.devModeNotice')}</span>
+                    <span>{t('setup.missingPayloadNotice')}</span>
                   </div>
                 )}
 
@@ -914,7 +914,7 @@ export function SetupApp() {
                 </button>
                 <button
                   type="button"
-                  disabled={busy || !installDir.trim() || !!installDirError}
+                  disabled={busy || !info.hasInstallPayload || !installDir.trim() || !!installDirError}
                   onClick={startInstall}
                   className="inline-flex cursor-pointer items-center gap-2 rounded bg-brand-solid px-5 py-2 text-xs font-medium text-brand-on transition-opacity hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-50"
                 >

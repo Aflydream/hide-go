@@ -166,18 +166,16 @@ Tool calls issued by the model (shell commands, network requests, file writes) r
 
 ## Downloads
 
-Grab the **Hide-Go Setup Installer** (recommended — installs `hide-go-desktop`, `hide-go-daemon`, uninstaller, shortcuts, `PATH`, and optional AI harness auto-connect) or the standalone portable binary from the [Releases page](https://github.com/Aflydream/hide-go/releases). Both UIs are embedded statically via `include_bytes!`, so Node.js is not required at runtime:
+Grab the **Hide-Go Setup** archive for your platform from the [Releases page](https://github.com/Aflydream/hide-go/releases). Each archive contains a lightweight setup wizard alongside a `payload/` folder with `hide-go-desktop`, `hide-go-daemon`, and a SHA-256 `payload-manifest.json` integrity manifest. Extract the full archive so `payload/` remains next to the setup executable, then run it (Node.js is not required at runtime):
 
-### Interactive Setup Wizard (Recommended)
-
-* **Windows (x64)**: Download and run `Hide-Go-Setup-windows-x64.exe` (registers cleanly in Windows Installed Apps for full uninstall & rollback)
+* **Windows (x64)**: Download `Hide-Go-Setup-windows-x64.zip`, extract all files, and run `Hide-Go-Setup.exe`
 * **macOS (Apple Silicon)**:
   ```bash
-  chmod +x Hide-Go-Setup-macos-arm64 && ./Hide-Go-Setup-macos-arm64
+  tar -xzf Hide-Go-Setup-macos-arm64.tar.gz && ./Hide-Go-Setup-macos-arm64/Hide-Go-Setup
   ```
 * **Linux (x86_64)**:
   ```bash
-  chmod +x Hide-Go-Setup-linux-x86_64 && ./Hide-Go-Setup-linux-x86_64
+  tar -xzf Hide-Go-Setup-linux-x86_64.tar.gz && ./Hide-Go-Setup-linux-x86_64/Hide-Go-Setup
   ```
 
 Silent CLI flags are also supported for automated provisioning or removal:
@@ -190,9 +188,9 @@ Hide-Go-Setup --silent --install --dir /path/to/Hide-Go --auto-connect
 Hide-Go-Setup --silent --uninstall --dir /path/to/Hide-Go
 ```
 
-### Portable Single Binary
+### Runtime configuration
 
-If you prefer zero installation, run `hide-go-desktop-*` directly to start the proxy on `127.0.0.1:18787` and open the desktop console. Set `HIDE_GO_HEADLESS=1` (or run `hide-go-daemon`) for headless server mode.
+Once installed, launch `hide-go-desktop` to start the proxy on `127.0.0.1:18787` and open the desktop console, or set `HIDE_GO_HEADLESS=1` (or run `hide-go-daemon`) for headless server mode:
 
 | Environment variable | Effect |
 | :--- | :--- |
@@ -222,12 +220,12 @@ cargo test --workspace
 
 # 2. Build the frontend bundles (desktop console + setup wizard) and release binaries
 npm install && npm run build
-cargo build --release -p hide-core -p hide-go-desktop
+cargo build --release -p hide-core -p hide-go-desktop -p hide-setup
 
-# 3. Build the self-contained Setup installer (macOS / Linux bash example)
-export HIDE_GO_BUNDLE_DESKTOP="$PWD/target/release/hide-go-desktop"
-export HIDE_GO_BUNDLE_DAEMON="$PWD/target/release/hide-go-daemon"
-cargo build --release -p hide-setup
+# 3. Assemble a local Setup package directory (macOS / Linux bash example)
+mkdir -p Hide-Go-Setup/payload
+cp target/release/hide-go-setup Hide-Go-Setup/Hide-Go-Setup
+cp target/release/hide-go-desktop target/release/hide-go-daemon desktop/icons/icon.ico desktop/icons/icon.png Hide-Go-Setup/payload/
 ```
 
 ### Repository layout
@@ -248,7 +246,7 @@ hide-go/
 │   │   ├── harness_detect.rs  # Local tool detection, reversible auto-connect, and config backups
 │   │   └── proxy.rs           # Axum reverse proxy, management API, and offline simulator
 │   └── tests/                 # Regression tests for the code-review findings
-├── crates/hide-setup/         # Self-contained Setup installer & uninstaller wizard
+├── crates/hide-setup/         # Setup installer & uninstaller wizard (reads adjacent payload/)
 ├── src/                       # Desktop console & Setup wizard UIs (React + Vite + Tailwind)
 └── desktop/                   # Single-binary asset embedder & console window launcher
 ```
