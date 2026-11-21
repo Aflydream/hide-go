@@ -250,3 +250,9 @@ hide-go/
 ├── src/                       # Desktop console & Setup wizard UIs (React + Vite + Tailwind)
 └── desktop/                   # Single-binary asset embedder & console window launcher
 ```
+
+---
+
+## Community
+
+- Forum: [linux.do](https://linux.do)

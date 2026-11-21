@@ -250,3 +250,9 @@ hide-go/
 ├── src/                       # 桌面控制台与安装向导 UI（React + Vite + Tailwind）
 └── desktop/                   # 静态资源内嵌与桌面窗口启动器 (hide-go-desktop)
 ```
+
+---
+
+## 社区
+
+- 论坛：[linux.do](https://linux.do)
