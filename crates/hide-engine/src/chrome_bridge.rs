@@ -1,7 +1,5 @@
 use hide_launcher::ChromeVtable;
 use ring::rand::{SecureRandom, SystemRandom};
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -178,17 +176,7 @@ pub fn generate_csp_nonce() -> String {
 }
 
 pub fn is_reparse_or_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| {
-        #[cfg(windows)]
-        {
-            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-            meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-        }
-        #[cfg(not(windows))]
-        {
-            meta.file_type().is_symlink()
-        }
-    })
+    hide_launcher::is_reparse_or_symlink(path)
 }
 
 pub fn create_private_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {

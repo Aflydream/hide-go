@@ -104,10 +104,18 @@ fn load_setup_ui_bundle(exe_dir: Option<&Path>) -> Result<UiBundle, String> {
             return UiBundle::load_from_dir(&cwd_dist, "setup.html");
         }
     }
-    Err(
-        "缺少安装向导界面资源 resources/setup/，请保持安装压缩包目录完整解压后运行。\nMissing resources/setup/ directory; extract the full Setup archive before launching."
-            .to_string(),
-    )
+    let checked = exe_dir
+        .map(|d| d.join("resources/setup"))
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("resources/setup")))
+        })
+        .map(|p| format!(" ({})", p.display()))
+        .unwrap_or_default();
+    Err(format!(
+        "缺少安装向导界面资源 resources/setup/{checked}，请保持安装压缩包目录完整解压后运行。\nMissing resources/setup/ directory{checked}; extract the full Setup archive before launching."
+    ))
 }
 
 fn payloads_for_exe(exe_dir: Option<&Path>) -> PayloadSource {

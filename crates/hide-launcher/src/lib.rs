@@ -31,12 +31,74 @@ pub fn shared_lib_file_name(stem: &str) -> String {
     }
 }
 
-fn is_reparse_or_symlink(path: &Path) -> bool {
+#[cfg(windows)]
+fn windows_is_name_surrogate_reparse(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const IO_REPARSE_TAG_NAME_SURROGATE_BIT: u32 = 0x2000_0000;
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct Win32FindDataW {
+        dw_file_attributes: u32,
+        ft_creation_time: [u32; 2],
+        ft_last_access_time: [u32; 2],
+        ft_last_write_time: [u32; 2],
+        n_file_size_high: u32,
+        n_file_size_low: u32,
+        dw_reserved0: u32,
+        dw_reserved1: u32,
+        c_file_name: [u16; 260],
+        c_alternate_file_name: [u16; 14],
+    }
+    const _: () = assert!(std::mem::size_of::<Win32FindDataW>() == 592);
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn FindFirstFileW(lp_file_name: *const u16, lp_find_file_data: *mut Win32FindDataW) -> isize;
+        fn FindClose(h_find_file: isize) -> i32;
+    }
+
+    // Drive roots (e.g. `C:\`) have no parent directory entry for FindFirstFileW to inspect.
+    if path.parent().is_none() {
+        return false;
+    }
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    while wide.len() > 3 && matches!(wide.last().copied(), Some(92 | 47)) {
+        wide.pop();
+    }
+    wide.push(0);
+
+    let mut data = std::mem::MaybeUninit::<Win32FindDataW>::zeroed();
+    // SAFETY: `wide` is null-terminated UTF-16 and `data` is valid writable storage for Win32FindDataW.
+    let handle = unsafe { FindFirstFileW(wide.as_ptr(), data.as_mut_ptr()) };
+    if handle == INVALID_HANDLE_VALUE {
+        // Conservatively reject unreadable non-root reparse points.
+        return true;
+    }
+    // SAFETY: `handle` is valid and `data` was initialized by FindFirstFileW.
+    let data = unsafe {
+        FindClose(handle);
+        data.assume_init()
+    };
+    (data.dw_reserved0 & IO_REPARSE_TAG_NAME_SURROGATE_BIT) != 0
+}
+
+/// Returns true for POSIX symlinks and Windows symlink/junction name-surrogate reparse points,
+/// while allowing benign Windows reparse points such as OneDrive Cloud Files and WOF compression.
+pub fn is_reparse_or_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| {
         #[cfg(windows)]
         {
             const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-            meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            if meta.file_type().is_symlink() {
+                return true;
+            }
+            if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0 {
+                return false;
+            }
+            windows_is_name_surrogate_reparse(path)
         }
         #[cfg(not(windows))]
         {
@@ -231,4 +293,55 @@ fn try_launch_daemon_entry(symbol: &[u8]) -> Result<i32, String> {
     let exit_code = unsafe { entry() };
     std::mem::forget(engine_lib);
     Ok(exit_code)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    struct TempCleanup(PathBuf);
+    impl Drop for TempCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn windows_reparse_distinguishes_junctions_from_onedrive_cloud_folders() {
+        let root = std::env::temp_dir().join(format!("hide-launcher-reparse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let real_dir = root.join("real");
+        let junction_dir = root.join("junction");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let _cleanup = TempCleanup(root.clone());
+
+        assert!(!is_reparse_or_symlink(&real_dir));
+        assert!(!is_reparse_or_symlink(Path::new(r"C:\")));
+
+        let status = Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &junction_dir.to_string_lossy(),
+                &real_dir.to_string_lossy(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+        assert!(is_reparse_or_symlink(&junction_dir), "junction must be blocked");
+        let _ = std::fs::remove_dir(&junction_dir);
+
+        if let Some(onedrive) = std::env::var_os("OneDrive").filter(|v| !v.is_empty()) {
+            let p = PathBuf::from(onedrive);
+            if p.is_dir() {
+                assert!(
+                    !is_reparse_or_symlink(&p),
+                    "OneDrive folder {} must not be rejected as a symlink",
+                    p.display()
+                );
+            }
+        }
+    }
 }

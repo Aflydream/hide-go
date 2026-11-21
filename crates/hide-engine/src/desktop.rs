@@ -56,10 +56,18 @@ fn load_desktop_ui_bundle(exe_dir: Option<&Path>) -> Result<UiBundle, String> {
         }
     }
 
-    Err(
-        "缺少前端资源目录 resources/ui/，请保持安装目录完整或通过 Hide-Go-Setup 重新安装。\nMissing resources/ui/ directory; keep installation files together or reinstall using Hide-Go-Setup."
-            .to_string(),
-    )
+    let checked = exe_dir
+        .map(|d| d.join("resources/ui"))
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("resources/ui")))
+        })
+        .map(|p| format!(" ({})", p.display()))
+        .unwrap_or_default();
+    Err(format!(
+        "缺少前端资源目录 resources/ui/{checked}，请保持安装目录完整或通过 Hide-Go-Setup 重新安装。\nMissing resources/ui/ directory{checked}; keep installation files together or reinstall using Hide-Go-Setup."
+    ))
 }
 
 impl DesktopBridge {
