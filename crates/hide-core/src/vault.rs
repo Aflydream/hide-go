@@ -349,6 +349,72 @@ impl Matcher {
         (output, count, withheld)
     }
 
+    /// Re-mask verbatim occurrences of known secret originals in `text` (longest-first,
+    /// boundary-checked) outside `existing_ranges`. Returns the rewritten text and `(raw, token, count)`.
+    pub fn remask_secrets(
+        &self,
+        text: &str,
+        existing_ranges: &[(usize, usize)],
+    ) -> (String, Vec<(String, String, usize)>) {
+        if self.pairs.is_empty()
+            || text.len() < 6
+            || !self
+                .pairs
+                .iter()
+                .any(|p| p.secret && p.original.len() >= 6 && !matches!(p.original.as_str(), "true" | "false" | "null"))
+        {
+            return (text.to_string(), Vec::new());
+        }
+        let mut out = String::new();
+        let mut stats: Vec<(String, String, usize)> = Vec::new();
+        let mut pos = 0usize;
+        let mut copied = 0usize;
+        while pos < text.len() {
+            let rem = &text[pos..];
+            let hit = rem
+                .as_bytes()
+                .first()
+                .and_then(|b| self.by_original_first.get(b))
+                .and_then(|idx| {
+                    idx.iter().map(|&i| &self.pairs[i]).find(|p| {
+                        p.secret
+                            && p.original.len() >= 6
+                            && !matches!(p.original.as_str(), "true" | "false" | "null")
+                            && rem.starts_with(p.original.as_str())
+                            && !existing_ranges
+                                .iter()
+                                .any(|&(a, b)| pos < b && a < pos + p.original.len())
+                            && is_valid_token_boundary_with_left(text, pos, &p.original, None)
+                    })
+                });
+            match hit {
+                Some(p) => {
+                    if out.is_empty() {
+                        out.reserve(text.len());
+                    }
+                    out.push_str(&text[copied..pos]);
+                    out.push_str(&p.token);
+                    if let Some(entry) = stats.iter_mut().find(|e| e.1 == p.token) {
+                        entry.2 += 1;
+                    } else {
+                        stats.push((p.original.clone(), p.token.clone(), 1));
+                    }
+                    pos += p.original.len();
+                    copied = pos;
+                }
+                None => {
+                    let Some(ch) = rem.chars().next() else { break };
+                    pos += ch.len_utf8();
+                }
+            }
+        }
+        if copied == 0 {
+            return (text.to_string(), stats);
+        }
+        out.push_str(&text[copied..]);
+        (out, stats)
+    }
+
     /// Restore keys and string values of a JSON document structurally.
     pub fn restore_json_value(&self, value: &mut Value, allow_secret: bool) -> usize {
         self.restore_json_value_depth(value, allow_secret, 0)
@@ -1018,5 +1084,23 @@ mod tests {
         assert_eq!(mask_preview("123456"), "****");
         assert_eq!(mask_preview("P@ssw0rd123"), "****");
         assert_eq!(mask_preview("P@ssw0rd1234"), "P@••••34");
+    }
+
+    #[test]
+    fn remask_secrets_respects_boundaries_and_existing_tokens() {
+        let vault = PrivacyVault::new();
+        vault.insert_explicit("alpha_key", "<<ENV_SECRET_ALPHA>>", "EnvSecret");
+        vault.insert_explicit("/home/bob", "/workspace/user_01", "ProjectPath");
+        let matcher = vault.matcher();
+
+        let input = "alpha_key_config=alpha_key path=/home/bob existing=<<ENV_SECRET_ALPHA>>";
+        let ranges = matcher.token_ranges(input);
+        let (out, hits) = matcher.remask_secrets(input, &ranges);
+        assert_eq!(
+            out,
+            "alpha_key_config=<<ENV_SECRET_ALPHA>> path=/home/bob existing=<<ENV_SECRET_ALPHA>>"
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].2, 1);
     }
 }

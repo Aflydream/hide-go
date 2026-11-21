@@ -20,6 +20,8 @@ pub struct AllHideOutput {
 static IDENTIFIER_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b[a-zA-Z_][a-zA-Z0-9_]{3,}\b").unwrap());
 /// `//` comments that start a line or follow whitespace (so `https://` is not a comment).
 static LINE_COMMENT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)(?:^|[ \t])(//[^\n\r]*)").unwrap());
+/// `# ` comments that start a line or follow whitespace (requiring a space skips `#![attr]`, `#define`, `#rrggbb`).
+static HASH_COMMENT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)(?:^|[ \t])(# [^\n\r]*)").unwrap());
 static QUOTED_LITERAL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#""(?:[^"\r\n\\]|\\.){2,}"|'(?:[^'\r\n\\]|\\.){2,}'"#).unwrap());
 
@@ -167,6 +169,83 @@ static RESERVED_KEYWORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
         "i32",
         "i64",
         "i128",
+        "unwrap_or",
+        "unwrap_or_else",
+        "unwrap_or_default",
+        "map_err",
+        "and_then",
+        "or_else",
+        "ok_or",
+        "ok_or_else",
+        "into_iter",
+        "iter_mut",
+        "as_slice",
+        "as_bytes",
+        "as_mut",
+        "to_vec",
+        "with_capacity",
+        "from_str",
+        "from_utf8",
+        "to_lowercase",
+        "to_uppercase",
+        "to_ascii_lowercase",
+        "trim_start",
+        "trim_end",
+        "starts_with",
+        "ends_with",
+        "split_once",
+        "rsplit_once",
+        "strip_prefix",
+        "strip_suffix",
+        "contains_key",
+        "or_insert",
+        "or_default",
+        "toString",
+        "valueOf",
+        "forEach",
+        "indexOf",
+        "lastIndexOf",
+        "startsWith",
+        "endsWith",
+        "parseInt",
+        "parseFloat",
+        "isNaN",
+        "clearTimeout",
+        "clearInterval",
+        "Uint8Array",
+        "AbortController",
+        "URLSearchParams",
+        "FormData",
+        "Object",
+        "Array",
+        "Number",
+        "Boolean",
+        "Error",
+        "RegExp",
+        "Date",
+        "Math",
+        "Symbol",
+        "BigInt",
+        "Buffer",
+        "isinstance",
+        "issubclass",
+        "enumerate",
+        "defaultdict",
+        "dataclass",
+        "staticmethod",
+        "classmethod",
+        "abstractmethod",
+        "getattr",
+        "setattr",
+        "hasattr",
+        "deepcopy",
+        "filepath",
+        "strconv",
+        "serde_json",
+        "tokio",
+        "tracing",
+        "anyhow",
+        "thiserror",
     ]
     .into_iter()
     .collect()
@@ -579,11 +658,11 @@ impl AllHideEngine {
         let overlaps_token = |s: usize, e: usize| tokens.iter().any(|&(a, b)| s < b && a < e);
         let scoped_salt = format!("{salt}:{}", vault.keyed_tag("cover", scope, 0, 12));
 
-        // 1. Comments become numbered cover comments. When a comment contains already-masked
-        // tokens (paths, keys, strict literals), camouflage the unmasked prose segments around
-        // those tokens instead of skipping the whole comment.
+        // 1. Comments (`//` and `# `) become numbered cover comments. When a comment contains
+        // already-masked tokens (paths, keys, strict literals), camouflage the unmasked prose
+        // segments around those tokens instead of skipping the whole comment.
         let mut replacements: Vec<(usize, usize, String)> = Vec::new();
-        let cover_phrase = |theme: CoverTheme, n: usize, tag: &str, with_slashes: bool| {
+        let cover_phrase = |theme: CoverTheme, n: usize, tag: &str, comment_prefix: &str| {
             let body = match theme {
                 CoverTheme::BotanicalGarden => {
                     format!("[BotanicalSensor-{tag}-{n:02}] Calibrate greenhouse soil humidity and mist interval")
@@ -595,29 +674,38 @@ impl AllHideEngine {
                     format!("[OvenController-{tag}-{n:02}] Adjust sourdough fermentation thermal curve")
                 }
             };
-            if with_slashes {
-                format!("// {body}")
-            } else {
-                body
-            }
+            format!("{comment_prefix}{body}")
         };
-        for caps in LINE_COMMENT_RE.captures_iter(text) {
-            let Some(m) = caps.get(1) else {
+        let mut raw_comments: Vec<(usize, usize)> = LINE_COMMENT_RE
+            .captures_iter(text)
+            .filter_map(|caps| caps.get(1).map(|m| (m.start(), m.end())))
+            .collect();
+        raw_comments.extend(
+            HASH_COMMENT_RE
+                .captures_iter(text)
+                .filter_map(|caps| caps.get(1).map(|m| (m.start(), m.end()))),
+        );
+        raw_comments.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| (b.1 - b.0).cmp(&(a.1 - a.0))));
+
+        let mut prev_comment_end = 0usize;
+        for (c_start, c_end) in raw_comments {
+            if c_start < prev_comment_end {
                 continue;
-            };
+            }
+            prev_comment_end = c_end;
             let mut sub_spans: Vec<(usize, usize)> = Vec::new();
-            let mut cursor = m.start();
+            let mut cursor = c_start;
             for &(tok_s, tok_e) in &tokens {
-                if tok_e <= m.start() || tok_s >= m.end() {
+                if tok_e <= c_start || tok_s >= c_end {
                     continue;
                 }
                 if cursor < tok_s {
                     sub_spans.push((cursor, tok_s));
                 }
-                cursor = cursor.max(tok_e.min(m.end()));
+                cursor = cursor.max(tok_e.min(c_end));
             }
-            if cursor < m.end() {
-                sub_spans.push((cursor, m.end()));
+            if cursor < c_end {
+                sub_spans.push((cursor, c_end));
             }
 
             for (s, e) in sub_spans {
@@ -635,7 +723,14 @@ impl AllHideEngine {
                 }
                 let n = replacements.len() + 1;
                 let tag = vault.keyed_tag("CoverComment", scope, n, 8);
-                let preferred = cover_phrase(theme, n, &tag, seg.starts_with("//"));
+                let comment_prefix = if seg.starts_with("//") {
+                    "// "
+                } else if seg.starts_with("# ") {
+                    "# "
+                } else {
+                    ""
+                };
+                let preferred = cover_phrase(theme, n, &tag, comment_prefix);
                 let cover =
                     vault.register_derived_scoped_with(scope, seg, "CoverComment", DerivedContext::PlainText, |_| {
                         preferred
@@ -1120,6 +1215,26 @@ mod tests {
         assert!(!out.vendor_payload.contains("internal flag"), "{}", out.vendor_payload);
         assert!(!out.vendor_payload.contains("/home/alice"), "{}", out.vendor_payload);
         assert!(out.vendor_payload.contains("BotanicalSensor"), "{}", out.vendor_payload);
+        assert_eq!(vault.restore_text(&out.vendor_payload).0, src);
+    }
+
+    #[test]
+    fn hash_comments_and_stdlib_symbols_behave_cleanly() {
+        let mut cfg = all_hide_cfg();
+        cfg.all_hide.strict_literal_masking = false;
+        let vault = PrivacyVault::new();
+        let src = "#!/usr/bin/env python3\n# Internal proprietary trading loop\n#[derive(Debug)]\ncolor = #1a2b3c\nif isinstance(state, AbortController): serde_json.unwrap_or_else()\ncompute_margin_liquidation()";
+        let out = AllHideEngine::process(src, TrafficCategory::InteractivePrompt, &cfg, &vault);
+        assert!(out
+            .vendor_payload
+            .starts_with("#!/usr/bin/env python3\n# [BotanicalSensor-"));
+        assert!(!out.vendor_payload.contains("proprietary trading"));
+        assert!(out.vendor_payload.contains("#[derive(Debug)]"));
+        assert!(out.vendor_payload.contains("#1a2b3c"));
+        assert!(out.vendor_payload.contains("isinstance"));
+        assert!(out.vendor_payload.contains("AbortController"));
+        assert!(out.vendor_payload.contains("serde_json.unwrap_or_else()"));
+        assert!(!out.vendor_payload.contains("compute_margin_liquidation"));
         assert_eq!(vault.restore_text(&out.vendor_payload).0, src);
     }
 }

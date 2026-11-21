@@ -23,8 +23,22 @@ const FILE_EDIT_KEYS: &[&str] = &[
     "diff",
     "contents",
     "new_content",
+    "old_content",
     "replacement",
+    "codecontent",
+    "targetcontent",
+    "replacementcontent",
+    "code_edit",
+    "file_content",
+    "new_code",
+    "old_code",
+    "insert_text",
 ];
+
+fn is_file_edit_key(key: &str) -> bool {
+    let lower = key.trim().to_ascii_lowercase();
+    FILE_EDIT_KEYS.contains(&lower.as_str())
+}
 
 /// Only explicit file-editing tools may receive restored secrets under `FileEditsOnly`.
 /// All other tools (`Bash`, `shell`, network/MCP tools, unknown names) stay redacted.
@@ -35,7 +49,11 @@ const FILE_EDIT_TOOLS: &[&str] = &[
     "notebookedit",
     "write_file",
     "write_to_file",
+    "write_file_content",
     "create_file",
+    "create_or_update_file",
+    "rewrite_file",
+    "modify_file",
     "edit_file",
     "str_replace",
     "str_replace_editor",
@@ -44,6 +62,7 @@ const FILE_EDIT_TOOLS: &[&str] = &[
     "patch_file",
     "replace_file_content",
     "multi_replace_file_content",
+    "replace_in_file",
     "insert_edit_into_file",
     "save-file",
     "update_file",
@@ -189,8 +208,7 @@ fn walk(m: &Matcher, value: &mut Value, ctx: Ctx, withheld: &mut usize, depth: u
                 *withheld += kw;
                 let in_edit_key = if tool && !is_tool_name_field {
                     ctx.in_edit_key
-                        || (effective_tool_name.is_some_and(is_file_edit_tool)
-                            && FILE_EDIT_KEYS.contains(&new_key.as_str()))
+                        || (effective_tool_name.is_some_and(is_file_edit_tool) && is_file_edit_key(&new_key))
                 } else {
                     false
                 };
@@ -360,5 +378,35 @@ mod tests {
         assert_eq!(restored_args["file_path"], "/home/alice/.env");
         assert_eq!(restored_args["old_string"], "KEY=sk-ant-real-key-123456789");
         assert_eq!(restored_args["new_string"], "KEY=sk-ant-real-key-123456789-updated");
+    }
+
+    #[test]
+    fn case_insensitive_and_extended_file_edit_keys_follow_policy() {
+        let v = vault();
+        let body = json!({"content": [
+            {"type": "tool_use", "id": "t_write", "name": "write_to_file",
+             "input": {"TargetFile": "/workspace/user_01/.env", "CodeContent": "KEY=sk-sem-placeholder-key-0001"}},
+            {"type": "tool_use", "id": "t_replace", "name": "replace_file_content",
+             "input": {"TargetFile": "/workspace/user_01/.env", "ReplacementContent": "KEY=sk-sem-placeholder-key-0001"}},
+            {"type": "tool_use", "id": "t_modify", "name": "modify_file",
+             "input": {"path": "/workspace/user_01/.env", "code_edit": "KEY=sk-sem-placeholder-key-0001"}}
+        ]});
+        let (out, restored, withheld) =
+            restore_response(&v.matcher(), &body.to_string(), ToolCallSecretPolicy::FileEditsOnly);
+        assert_eq!(withheld, 0);
+        assert!(restored >= 6);
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed["content"][0]["input"]["CodeContent"],
+            "KEY=sk-ant-real-key-123456789"
+        );
+        assert_eq!(
+            parsed["content"][1]["input"]["ReplacementContent"],
+            "KEY=sk-ant-real-key-123456789"
+        );
+        assert_eq!(
+            parsed["content"][2]["input"]["code_edit"],
+            "KEY=sk-ant-real-key-123456789"
+        );
     }
 }

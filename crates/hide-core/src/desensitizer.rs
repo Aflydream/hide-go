@@ -1,8 +1,8 @@
 use crate::config::{FindingKind, HideConfig, LeakFinding};
 use crate::protocol::{is_api_schema_container_key, is_opaque_block, is_structural_key, is_tool_call_object};
 use crate::scanner::{
-    compile_custom_regex, decode_inline_unicode, is_placeholder_token, is_sensitive_secret_key, resolve_overlaps,
-    scan_spans, source_span, Span,
+    compile_custom_regex, decode_inline_unicode, is_placeholder_or_template_secret, is_placeholder_token,
+    is_sensitive_secret_key, resolve_overlaps, scan_spans, source_span, Span,
 };
 use crate::vault::{is_bare_ident_token, is_word_char, mask_preview, reserialize_like, PrivacyVault, MAX_JSON_DEPTH};
 use serde_json::Value;
@@ -94,12 +94,15 @@ impl SemanticDesensitizer {
                             if sensitive_field
                                 && !raw.trim().is_empty()
                                 && !is_placeholder_token(raw)
+                                && !is_placeholder_or_template_secret(raw)
                                 && !vault.contains_token_in_scope(raw, scope)
                                 && (!key.eq_ignore_ascii_case("token") || raw.trim().len() >= 6) =>
                         {
                             Some(raw.clone())
                         }
-                        Value::Number(_) if sensitive_field => Some(value.to_string()),
+                        Value::Number(_) if sensitive_field && !key.eq_ignore_ascii_case("token") => {
+                            Some(value.to_string())
+                        }
                         _ => None,
                     };
                     if let Some(raw) = secret {
@@ -166,8 +169,8 @@ impl SemanticDesensitizer {
             None => scan_spans(text, config),
         };
         let existing = vault.matcher_for_scope(scope).token_ranges(text);
-        let after_regex = if spans.is_empty() {
-            text.to_string()
+        let (after_regex, did_replace_spans) = if spans.is_empty() {
+            (text.to_string(), false)
         } else {
             spans.retain(|s| !existing.iter().any(|&(a, b)| s.start < b && a < s.end));
             for span in &mut spans {
@@ -176,6 +179,7 @@ impl SemanticDesensitizer {
 
             let mut out = String::with_capacity(text.len());
             let mut last = 0;
+            let mut replaced_any = false;
             for span in resolve_overlaps(spans) {
                 let raw = &text[span.start..span.end];
                 if raw.len() < 3 {
@@ -197,53 +201,54 @@ impl SemanticDesensitizer {
                 out.push_str(&text[last..span.start]);
                 out.push_str(&token);
                 last = span.end;
+                replaced_any = true;
             }
             out.push_str(&text[last..]);
-            out
+            (out, replaced_any)
         };
 
-        Self::remask_known_scope_secrets(&after_regex, vault, scope)
+        let matcher = vault.matcher_for_scope(scope);
+        let remask_existing = if did_replace_spans {
+            matcher.token_ranges(&after_regex)
+        } else {
+            existing
+        };
+        let (remasked, remask_hits) = matcher.remask_secrets(&after_regex, &remask_existing);
+        for (raw_secret, token, count) in remask_hits {
+            Self::record_finding(
+                findings,
+                FindingKind::EnvSecret,
+                "Previously Seen Scope Secret",
+                &raw_secret,
+                &token,
+                "high",
+                count,
+            );
+        }
+        remasked
     }
 
-    /// Re-mask exact occurrences of known scope secrets (such as JSON-secret-key values)
-    /// that reappear verbatim in plain text outside existing placeholder tokens.
-    fn remask_known_scope_secrets(text: &str, vault: &PrivacyVault, scope: Option<&str>) -> String {
-        let entries = vault.secret_raw_entries(scope);
-        if entries.is_empty() {
-            return text.to_string();
+    fn record_finding(
+        findings: &mut Vec<LeakFinding>,
+        kind: FindingKind,
+        label: &str,
+        raw_val: &str,
+        replacement_token: &str,
+        severity: &str,
+        occurrences: usize,
+    ) {
+        if let Some(existing) = findings.iter_mut().find(|f| f.replacement_token == replacement_token) {
+            existing.count += occurrences;
+        } else {
+            findings.push(LeakFinding {
+                kind,
+                label: label.to_string(),
+                original_preview: mask_preview(raw_val),
+                replacement_token: replacement_token.to_string(),
+                severity: severity.to_string(),
+                count: occurrences,
+            });
         }
-        let existing = vault.matcher_for_scope(scope).token_ranges(text);
-        let mut matches: Vec<(usize, usize, String)> = Vec::new();
-        for (raw, token) in entries {
-            if raw.len() < 6 || matches!(raw.as_str(), "true" | "false" | "null") {
-                continue;
-            }
-            let mut pos = 0;
-            while let Some(rel) = text[pos..].find(&raw) {
-                let start = pos + rel;
-                let end = start + raw.len();
-                if !existing.iter().any(|&(a, b)| start < b && a < end) {
-                    matches.push((start, end, token.clone()));
-                }
-                pos = end;
-            }
-        }
-        if matches.is_empty() {
-            return text.to_string();
-        }
-        matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| (b.1 - b.0).cmp(&(a.1 - a.0))));
-        let mut out = String::with_capacity(text.len());
-        let mut last = 0;
-        for (start, end, token) in matches {
-            if start < last {
-                continue;
-            }
-            out.push_str(&text[last..start]);
-            out.push_str(&token);
-            last = end;
-        }
-        out.push_str(&text[last..]);
-        out
     }
 
     /// A match glued to identifier characters (`ProjectTitanConfig`) would produce a token the
@@ -293,18 +298,15 @@ impl SemanticDesensitizer {
             None => vault.get_or_insert_scoped_with(scope, raw_val, &category_key, generator),
         };
 
-        if let Some(existing) = findings.iter_mut().find(|f| f.replacement_token == replacement_token) {
-            existing.count += occurrences;
-        } else {
-            findings.push(LeakFinding {
-                kind,
-                label: label.to_string(),
-                original_preview: mask_preview(raw_val),
-                replacement_token: replacement_token.clone(),
-                severity: severity.to_string(),
-                count: occurrences,
-            });
-        }
+        Self::record_finding(
+            findings,
+            kind,
+            label,
+            raw_val,
+            &replacement_token,
+            severity,
+            occurrences,
+        );
         replacement_token
     }
 
@@ -347,8 +349,19 @@ impl SemanticDesensitizer {
             FindingKind::PrivateKey => format!("<<HIDE_PEM_PRIVATE_KEY_{tag12}_{idx:03}>>"),
             FindingKind::DatabaseUrl => {
                 let scheme = raw_val.split("://").next().unwrap_or("postgres");
+                let port = match scheme.to_ascii_lowercase().as_str() {
+                    "mysql" | "mariadb" => 3306,
+                    "mongodb" | "mongodb+srv" => 27017,
+                    "redis" | "rediss" => 6379,
+                    "amqp" | "amqps" => 5672,
+                    "mssql" | "sqlserver" => 1433,
+                    "clickhouse" => 8123,
+                    "http" => 80,
+                    "https" => 443,
+                    _ => 5432,
+                };
                 format!(
-                    "{scheme}://db_user_{tag8}_{idx:02}:db_pass_placeholder_{tag12}_{idx:02}@db-{tag8}-{idx:02}.example.internal:5432/app_schema_{idx:02}"
+                    "{scheme}://db_user_{tag8}_{idx:02}:db_pass_placeholder_{tag12}_{idx:02}@db-{tag8}-{idx:02}.example.internal:{port}/app_schema_{idx:02}"
                 )
             }
             FindingKind::InternalIp => ip.to_string(),
@@ -359,7 +372,13 @@ impl SemanticDesensitizer {
                     .next()
                     .filter(|_| raw_val.as_bytes().get(1) == Some(&b':'))
                 {
-                    let sep = if raw_val.contains("\\\\") { "\\\\" } else { "\\" };
+                    let sep = if raw_val.contains("\\\\") {
+                        "\\\\"
+                    } else if raw_val.contains('/') {
+                        "/"
+                    } else {
+                        "\\"
+                    };
                     format!("{drive}:{sep}workspace{sep}user_{tag8}_{idx:02}")
                 } else {
                     format!("/workspace/user_{tag8}_{idx:02}")
@@ -558,5 +577,59 @@ mod tests {
         }
         let res = SemanticDesensitizer::process(&payload, &cfg, &vault);
         assert!(!res.transformed_payload.is_empty());
+    }
+
+    #[test]
+    fn prefixed_camel_case_secrets_bcrypt_db_ports_and_remask_findings_work() {
+        let cfg = HideConfig::default();
+        let vault = PrivacyVault::new();
+        let scope = Some("claude-code:api.anthropic.com");
+
+        let json_req = serde_json::json!({
+            "stripeWebhookSecret": "whsec_real_secret_value_12345",
+            "nextPageToken": "cursor_not_a_secret",
+            "maxToken": 4096,
+            "token": 42,
+            "password": "$2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW",
+            "db": "mysql://dbadmin:MySqlPass99@10.0.0.12:3306/orders",
+            "win_fwd": "C:/Users/alice/my-repo/src/main.rs"
+        })
+        .to_string();
+
+        let res = SemanticDesensitizer::process_with_scope(&json_req, &cfg, &vault, scope);
+        let parsed: Value = serde_json::from_str(&res.transformed_payload).unwrap();
+        assert_eq!(parsed["nextPageToken"], "cursor_not_a_secret");
+        assert_eq!(parsed["maxToken"], 4096);
+        assert_eq!(parsed["token"], 42);
+        assert_ne!(parsed["stripeWebhookSecret"], "whsec_real_secret_value_12345");
+        assert_ne!(
+            parsed["password"],
+            "$2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW"
+        );
+        let masked_db = parsed["db"].as_str().unwrap();
+        assert!(
+            masked_db.starts_with("mysql://") && masked_db.contains(":3306/"),
+            "{masked_db}"
+        );
+        let masked_win = parsed["win_fwd"].as_str().unwrap();
+        assert!(masked_win.starts_with("C:/workspace/user_") && masked_win.ends_with("/my-repo/src/main.rs"));
+
+        let restored = vault
+            .matcher_for_scope(scope)
+            .restore_document(&res.transformed_payload, true)
+            .0;
+        let restored_val: Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(restored_val["stripeWebhookSecret"], "whsec_real_secret_value_12345");
+        assert_eq!(
+            restored_val["password"],
+            "$2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW"
+        );
+        assert_eq!(restored_val["win_fwd"], "C:/Users/alice/my-repo/src/main.rs");
+
+        // Plain-text reappearance records an audit finding and preserves boundary safety
+        let followup =
+            SemanticDesensitizer::process_with_scope("Repeat whsec_real_secret_value_12345 now", &cfg, &vault, scope);
+        assert!(!followup.transformed_payload.contains("whsec_real_secret_value_12345"));
+        assert!(!followup.findings.is_empty());
     }
 }
