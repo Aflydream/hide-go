@@ -191,7 +191,8 @@ export function SetupApp() {
   const userChangedLangRef = useRef(false);
 
   const [installDir, setInstallDir] = useState('');
-  const [createShortcuts, setCreateShortcuts] = useState(true);
+  const [createDesktopShortcut, setCreateDesktopShortcut] = useState(true);
+  const [createStartMenuShortcut, setCreateStartMenuShortcut] = useState(true);
   const [addToPath, setAddToPath] = useState(true);
   const [autostartDaemon, setAutostartDaemon] = useState(false);
 
@@ -297,7 +298,9 @@ export function SetupApp() {
         method: 'POST',
         body: JSON.stringify({
           installDir,
-          createShortcuts,
+          createShortcuts: createDesktopShortcut || createStartMenuShortcut,
+          createDesktopShortcut: info?.platform !== 'macos' && createDesktopShortcut,
+          createStartMenuShortcut,
           addToPath: info?.platform !== 'windows' && addToPath,
           autostartDaemon,
           language: pref,
@@ -645,11 +648,25 @@ export function SetupApp() {
                 </div>
 
                 <div className="divide-y divide-line border-y border-line">
+                  {info.platform !== 'macos' && (
+                    <ToggleRow
+                      title={t('setup.optDesktopShortcutTitle')}
+                      desc={t('setup.optDesktopShortcutDesc')}
+                      checked={createDesktopShortcut}
+                      onChange={setCreateDesktopShortcut}
+                    />
+                  )}
                   <ToggleRow
-                    title={t('setup.optShortcutsTitle')}
-                    desc={t(info.platform === 'windows' ? 'setup.optShortcutsWin' : 'setup.optShortcutsUnix')}
-                    checked={createShortcuts}
-                    onChange={setCreateShortcuts}
+                    title={t(info.platform === 'windows' ? 'setup.optStartMenuTitle' : 'setup.optAppMenuTitle')}
+                    desc={t(
+                      info.platform === 'windows'
+                        ? 'setup.optStartMenuDesc'
+                        : info.platform === 'macos'
+                          ? 'setup.optAppMenuDescMac'
+                          : 'setup.optAppMenuDescLinux',
+                    )}
+                    checked={createStartMenuShortcut}
+                    onChange={setCreateStartMenuShortcut}
                   />
                   {info.platform !== 'windows' && (
                     <ToggleRow

@@ -13,12 +13,16 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 512;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HTTP_BUF_SIZE: usize = 64 * 1024;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
+pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+        .try_init();
 
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run_daemon_async())
+}
+
+async fn run_daemon_async() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(raw_token) = std::env::var("HIDE_GO_ADMIN_TOKEN") {
         let trimmed = raw_token.trim();
         if !trimmed.is_empty() && trimmed.len() < MIN_ADMIN_TOKEN_LEN {

@@ -1,0 +1,9 @@
+[package]
+name = "hide-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Thin dynamic library loader and C-ABI vtable shared by Hide-Go launchers"
+
+[dependencies]
+libloading.workspace = true

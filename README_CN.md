@@ -166,7 +166,7 @@ $env:NO_PROXY           = "localhost,127.0.0.1,::1"
 
 ## 下载与安装
 
-从 [Releases 页面](https://github.com/Aflydream/hide-go/releases) 下载对应系统的 **Hide-Go Setup** 安装压缩包。包内包含轻量安装向导以及独立的 `payload/` 目录（内含 `hide-go-desktop` 主程序、`hide-go-daemon` 守护进程、图标与 `payload-manifest.json` SHA-256 校验清单）。请完整解压压缩包，保持 `payload/` 与安装向导在同一目录下运行（界面已静态内嵌，无需 Node.js）：
+从 [Releases 页面](https://github.com/Aflydream/hide-go/releases) 下载对应系统的 **Hide-Go Setup** 安装压缩包。包内包含轻量原生引导程序 `Hide-Go-Setup`、共享运行库（`hide_engine`、`hide_chrome`）、独立 `resources/` 目录，以及经 `data/payload-manifest.json` SHA-256 校验的压缩负载 `data/app.tar.gz`。请完整解压压缩包后运行安装向导（无需 Node.js）：
 
 * **Windows (x64)**：下载 `Hide-Go-Setup-windows-x64.zip`，完整解压后运行其中的 `Hide-Go-Setup.exe`
 * **macOS (Apple Silicon)**：
@@ -218,21 +218,19 @@ Hide-Go-Setup --silent --uninstall --dir /path/to/Hide-Go
 # 1. 运行核心、桌面端与安装器单元测试
 cargo test --workspace
 
-# 2. 打包前端并编译桌面端、守护进程与安装向导
+# 2. 打包前端并编译共享运行库与各端启动器
 npm install && npm run build
-cargo build --release -p hide-core -p hide-go-desktop -p hide-setup
+cargo build --release -p hide-chrome -p hide-engine -p hide-go-desktop -p hide-daemon -p hide-setup
 
-# 3. 组装本地安装目录（Windows PowerShell 示例）
-New-Item -ItemType Directory -Force -Path Hide-Go-Setup\payload | Out-Null
-Copy-Item target\release\hide-go-setup.exe Hide-Go-Setup\Hide-Go-Setup.exe
-Copy-Item target\release\hide-go-desktop.exe, target\release\hide-go-daemon.exe, desktop\icons\icon.ico, desktop\icons\icon.png Hide-Go-Setup\payload\
+# 3. 组装本地安装压缩包（Windows PowerShell 示例）
+node scripts/package-setup.mjs --os windows --package-dir dist-pkg/Hide-Go-Setup-windows-x64 --archive dist-pkg/Hide-Go-Setup-windows-x64.zip --format zip
 ```
 
 ### 代码结构
 
 ```text
 hide-go/
-├── crates/hide-core/          # Rust 核心引擎与独立守护进程 (hide-go-daemon)
+├── crates/hide-core/          # Rust 核心隐私网关、脱敏引擎、映射表与流式还原库
 │   ├── src/
 │   │   ├── scanner.rs         # 密钥、私钥、DB 连接串、内网 IP、路径与自定义规则扫描
 │   │   ├── vault.rs           # 线程安全双向映射表 (占位符 <-> 原文)，带容量上限
@@ -246,9 +244,14 @@ hide-go/
 │   │   ├── harness_detect.rs  # 本机 AI 工具扫描、配置文件/环境变量自动接入与可逆回滚
 │   │   └── proxy.rs           # Axum 反向代理、管理 API 与离线模拟器
 │   └── tests/                 # 代码审查问题的回归测试
-├── crates/hide-setup/         # 图形化安装与卸载向导（内嵌向导界面，读取同级 payload/ 安装）
+├── crates/hide-chrome/        # 原生 WebView 窗口与系统弹窗动态库 (cdylib)
+├── crates/hide-engine/        # 共享业务动态库 (cdylib)：网关、磁盘 UI 服务、守护进程与安装逻辑
+├── crates/hide-launcher/      # 轻量 C-ABI 动态库加载器与错误弹窗引导层
+├── crates/hide-daemon/        # 轻量守护进程入口 (hide-go-daemon)
+├── crates/hide-setup/         # 轻量图形化安装与卸载引导程序 (hide-go-setup)
+├── scripts/package-setup.mjs  # 组装运行库、resources/ 与 data/app.tar.gz Setup 分发压缩包
 ├── src/                       # 桌面控制台与安装向导 UI（React + Vite + Tailwind）
-└── desktop/                   # 静态资源内嵌与桌面窗口启动器 (hide-go-desktop)
+└── desktop/                   # 轻量桌面控制台引导程序 (hide-go-desktop) 及应用图标资源
 ```
 
 ---

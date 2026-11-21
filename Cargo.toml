@@ -2,6 +2,9 @@
 members = [
     "crates/hide-chrome",
     "crates/hide-core",
+    "crates/hide-daemon",
+    "crates/hide-engine",
+    "crates/hide-launcher",
     "crates/hide-setup",
     "desktop",
 ]
@@ -45,6 +48,8 @@ tower-service = "0.3"
 webpki-roots = "1.0"
 tao = "0.37"
 wry = "0.57"
+libloading = "0.8"
+tar = "0.4"
 
 [profile.release]
 strip = "symbols"

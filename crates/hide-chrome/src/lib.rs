@@ -10,7 +10,8 @@ use tao::{
 use wry::{http::Request, WebContext, WebViewBuilder};
 
 /// Configuration for a frameless native desktop WebView window.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeWindowOptions {
     pub title: String,
     pub url: String,
@@ -94,11 +95,36 @@ pub fn run_frameless_window(opts: NativeWindowOptions) -> Result<(), String> {
     }
 }
 
+const EMBEDDED_APP_ICON_PNG: &[u8] = include_bytes!("../../../desktop/icons/128x128.png");
+
+fn load_default_window_icon() -> Option<tao::window::Icon> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(EMBEDDED_APP_ICON_PNG));
+    decoder.set_transformations(
+        png::Transformations::EXPAND | png::Transformations::ALPHA | png::Transformations::STRIP_16,
+    );
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let raw = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => raw.to_vec(),
+        png::ColorType::Rgb => raw.chunks_exact(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect(),
+        png::ColorType::GrayscaleAlpha => raw.chunks_exact(2).flat_map(|c| [c[0], c[0], c[0], c[1]]).collect(),
+        png::ColorType::Grayscale => raw.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        png::ColorType::Indexed => return None,
+    };
+    tao::window::Icon::from_rgba(rgba, info.width, info.height).ok()
+}
+
 fn try_run_frameless_window(opts: &NativeWindowOptions) -> Result<(), String> {
     let mut event_loop = EventLoopBuilder::<WindowCmd>::with_user_event().build();
+    let app_icon = load_default_window_icon();
+    #[cfg(windows)]
+    let taskbar_icon = app_icon.clone();
 
     let window = WindowBuilder::new()
         .with_title(&opts.title)
+        .with_window_icon(app_icon)
         .with_inner_size(LogicalSize::new(opts.width, opts.height))
         .with_min_inner_size(LogicalSize::new(opts.min_width, opts.min_height))
         .with_resizable(opts.resizable)
@@ -110,6 +136,7 @@ fn try_run_frameless_window(opts: &NativeWindowOptions) -> Result<(), String> {
     {
         use tao::platform::windows::WindowExtWindows;
         window.set_undecorated_shadow(true);
+        window.set_taskbar_icon(taskbar_icon);
     }
     window.set_focus();
 
@@ -817,6 +844,139 @@ pub fn detect_system_locale() -> &'static str {
     }
 }
 
+mod ffi {
+    use super::*;
+
+    unsafe fn str_from_raw<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
+        if ptr.is_null() && len > 0 {
+            return None;
+        }
+        let slice = if len == 0 {
+            &[]
+        } else {
+            // SAFETY: Caller guarantees `ptr` points to `len` readable bytes for this synchronous FFI call.
+            std::slice::from_raw_parts(ptr, len)
+        };
+        std::str::from_utf8(slice).ok()
+    }
+
+    unsafe fn write_utf8(dst: *mut u8, cap: usize, text: &str) -> usize {
+        if dst.is_null() || cap == 0 {
+            return 0;
+        }
+        let mut end = text.len().min(cap);
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        // SAFETY: Caller guarantees `dst` is writable for `cap` bytes and `end <= cap`.
+        std::ptr::copy_nonoverlapping(text.as_ptr(), dst, end);
+        end
+    }
+
+    #[no_mangle]
+    pub extern "C" fn hide_chrome_can_open_gui() -> u8 {
+        match std::panic::catch_unwind(can_open_gui) {
+            Ok(true) => 1,
+            _ => 0,
+        }
+    }
+
+    /// # Safety
+    /// `opts_ptr` must be valid for `opts_len` bytes of JSON-serialized `NativeWindowOptions`.
+    /// When `err_cap > 0`, `err_ptr` must be writable for `err_cap` bytes.
+    #[no_mangle]
+    pub unsafe extern "C" fn hide_chrome_run_frameless_window(
+        opts_ptr: *const u8,
+        opts_len: usize,
+        err_ptr: *mut u8,
+        err_cap: usize,
+    ) -> i32 {
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(json) = (unsafe { str_from_raw(opts_ptr, opts_len) }) else {
+                return Err("invalid window options buffer".to_string());
+            };
+            let opts: NativeWindowOptions =
+                serde_json::from_str(json).map_err(|e| format!("invalid window options JSON: {e}"))?;
+            run_frameless_window(opts)
+        }));
+        match res {
+            Ok(Ok(())) => 0,
+            Ok(Err(msg)) => {
+                write_utf8(err_ptr, err_cap, &msg);
+                1
+            }
+            Err(_) => {
+                write_utf8(err_ptr, err_cap, "hide_chrome panicked");
+                1
+            }
+        }
+    }
+
+    /// # Safety
+    /// `title_ptr` and `body_ptr` must be valid for `title_len` and `body_len` UTF-8 bytes respectively.
+    #[no_mangle]
+    pub unsafe extern "C" fn hide_chrome_show_error_dialog(
+        title_ptr: *const u8,
+        title_len: usize,
+        body_ptr: *const u8,
+        body_len: usize,
+    ) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let title = unsafe { str_from_raw(title_ptr, title_len) }.unwrap_or("Hide-Go");
+            let body = unsafe { str_from_raw(body_ptr, body_len) }.unwrap_or("Unknown error");
+            show_error_dialog(title, body);
+        }));
+    }
+
+    /// # Safety
+    /// `title_ptr`/`title_len` and `init_ptr`/`init_len` must be readable UTF-8 buffers; when
+    /// `out_cap > 0`, `out_ptr` must be writable for `out_cap` bytes.
+    #[no_mangle]
+    pub unsafe extern "C" fn hide_chrome_pick_folder(
+        title_ptr: *const u8,
+        title_len: usize,
+        init_ptr: *const u8,
+        init_len: usize,
+        out_ptr: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let title = unsafe { str_from_raw(title_ptr, title_len) }.unwrap_or("Select folder");
+            let init = unsafe { str_from_raw(init_ptr, init_len) }
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            pick_folder(title, init.as_deref())
+        }));
+        match res {
+            Ok(Some(path)) => {
+                let text = path.to_string_lossy();
+                let written = write_utf8(out_ptr, out_cap, &text);
+                if written < text.len() {
+                    -1
+                } else {
+                    written as isize
+                }
+            }
+            _ => -1,
+        }
+    }
+
+    /// # Safety
+    /// When `out_cap > 0`, `out_ptr` must be writable for `out_cap` bytes.
+    #[no_mangle]
+    pub unsafe extern "C" fn hide_chrome_detect_system_locale(out_ptr: *mut u8, out_cap: usize) -> usize {
+        match std::panic::catch_unwind(detect_system_locale) {
+            Ok(loc) => write_utf8(out_ptr, out_cap, loc),
+            Err(_) => write_utf8(out_ptr, out_cap, "en"),
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn hide_chrome_terminate_other_processes() -> usize {
+        std::panic::catch_unwind(terminate_other_hide_go_processes).unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{existing_initial_dir, is_hide_go_runtime_process_name, normalize_locale_tag, parse_ps_entry};
@@ -899,5 +1059,10 @@ mod tests {
         assert_eq!(normalize_locale_tag("ja-JP"), "en");
         assert_eq!(normalize_locale_tag("C"), "en");
         assert_eq!(normalize_locale_tag(""), "en");
+    }
+
+    #[test]
+    fn embedded_app_icon_decodes_to_valid_window_icon() {
+        assert!(super::load_default_window_icon().is_some());
     }
 }

@@ -1,0 +1,32 @@
+[package]
+name = "hide-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared dynamic engine hosting Hide-Go gateway runtime, disk UI server, daemon, and installer"
+
+[lib]
+name = "hide_engine"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+axum.workspace = true
+flate2.workspace = true
+hex.workspace = true
+hide-core = { path = "../hide-core" }
+hide-launcher = { path = "../hide-launcher" }
+hyper.workspace = true
+hyper-util.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tokio.workspace = true
+tower-service.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

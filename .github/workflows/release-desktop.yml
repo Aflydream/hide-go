@@ -44,29 +44,20 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            pkg_os: linux
             target: x86_64-unknown-linux-gnu
-            bin_name: hide-go-desktop
-            daemon_bin_name: hide-go-daemon
-            setup_bin_name: hide-go-setup
-            setup_entry_name: Hide-Go-Setup
             package_dir: Hide-Go-Setup-linux-x86_64
             archive_name: Hide-Go-Setup-linux-x86_64.tar.gz
             archive_format: tar.gz
           - os: macos-latest
+            pkg_os: macos
             target: aarch64-apple-darwin
-            bin_name: hide-go-desktop
-            daemon_bin_name: hide-go-daemon
-            setup_bin_name: hide-go-setup
-            setup_entry_name: Hide-Go-Setup
             package_dir: Hide-Go-Setup-macos-arm64
             archive_name: Hide-Go-Setup-macos-arm64.tar.gz
             archive_format: tar.gz
           - os: windows-latest
+            pkg_os: windows
             target: x86_64-pc-windows-msvc
-            bin_name: hide-go-desktop.exe
-            daemon_bin_name: hide-go-daemon.exe
-            setup_bin_name: hide-go-setup.exe
-            setup_entry_name: Hide-Go-Setup.exe
             package_dir: Hide-Go-Setup-windows-x64
             archive_name: Hide-Go-Setup-windows-x64.zip
             archive_format: zip
@@ -87,66 +78,16 @@ jobs:
         run: |
           npm ci
           npm run build
-      - name: Build desktop, daemon, and setup binaries
-        run: cargo build --release --locked -p hide-core -p hide-go-desktop -p hide-setup --target ${{ matrix.target }}
+      - name: Build shared runtime libraries and launchers
+        run: cargo build --release --locked -p hide-chrome -p hide-engine -p hide-go-desktop -p hide-daemon -p hide-setup --target ${{ matrix.target }}
       - name: Package setup archive and checksum
-        shell: bash
         run: |
-          VERSION=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
-          test -n "${VERSION}"
-
-          PKG_DIR="${{ matrix.package_dir }}"
-          ARCHIVE="${{ matrix.archive_name }}"
-          TARGET_DIR="target/${{ matrix.target }}/release"
-
-          rm -rf "${PKG_DIR}" "${ARCHIVE}" "${ARCHIVE}.sha256"
-          mkdir -p "${PKG_DIR}/payload"
-
-          cp "${TARGET_DIR}/${{ matrix.setup_bin_name }}" "${PKG_DIR}/${{ matrix.setup_entry_name }}"
-          cp "${TARGET_DIR}/${{ matrix.bin_name }}" "${PKG_DIR}/payload/${{ matrix.bin_name }}"
-          cp "${TARGET_DIR}/${{ matrix.daemon_bin_name }}" "${PKG_DIR}/payload/${{ matrix.daemon_bin_name }}"
-          cp "desktop/icons/icon.ico" "${PKG_DIR}/payload/icon.ico"
-          cp "desktop/icons/icon.png" "${PKG_DIR}/payload/icon.png"
-
-          if [ "${{ matrix.archive_format }}" = "tar.gz" ]; then
-            chmod +x "${PKG_DIR}/${{ matrix.setup_entry_name }}" \
-              "${PKG_DIR}/payload/${{ matrix.bin_name }}" \
-              "${PKG_DIR}/payload/${{ matrix.daemon_bin_name }}"
-          fi
-
-          sha256_of() {
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "$1" | awk '{print $1}'
-            else
-              shasum -a 256 "$1" | awk '{print $1}'
-            fi
-          }
-
-          DESKTOP_SHA=$(sha256_of "${PKG_DIR}/payload/${{ matrix.bin_name }}")
-          DAEMON_SHA=$(sha256_of "${PKG_DIR}/payload/${{ matrix.daemon_bin_name }}")
-          ICO_SHA=$(sha256_of "${PKG_DIR}/payload/icon.ico")
-          PNG_SHA=$(sha256_of "${PKG_DIR}/payload/icon.png")
-
-          cat > "${PKG_DIR}/payload/payload-manifest.json" <<EOF
-          {
-            "version": "${VERSION}",
-            "files": {
-              "${{ matrix.bin_name }}": "${DESKTOP_SHA}",
-              "${{ matrix.daemon_bin_name }}": "${DAEMON_SHA}",
-              "icon.ico": "${ICO_SHA}",
-              "icon.png": "${PNG_SHA}"
-            }
-          }
-          EOF
-
-          if [ "${{ matrix.archive_format }}" = "zip" ]; then
-            powershell.exe -NoProfile -NonInteractive -Command "Compress-Archive -Path '${PKG_DIR}' -DestinationPath '${ARCHIVE}' -CompressionLevel Optimal -Force"
-          else
-            COPYFILE_DISABLE=1 tar -czf "${ARCHIVE}" "${PKG_DIR}"
-          fi
-
-          ARCHIVE_SHA=$(sha256_of "${ARCHIVE}")
-          printf "%s  %s\n" "${ARCHIVE_SHA}" "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          node scripts/package-setup.mjs \
+            --target "${{ matrix.target }}" \
+            --os "${{ matrix.pkg_os }}" \
+            --package-dir "${{ matrix.package_dir }}" \
+            --archive "${{ matrix.archive_name }}" \
+            --format "${{ matrix.archive_format }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.package_dir }}

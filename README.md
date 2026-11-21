@@ -166,7 +166,7 @@ Tool calls issued by the model (shell commands, network requests, file writes) r
 
 ## Downloads
 
-Grab the **Hide-Go Setup** archive for your platform from the [Releases page](https://github.com/Aflydream/hide-go/releases). Each archive contains a lightweight setup wizard alongside a `payload/` folder with `hide-go-desktop`, `hide-go-daemon`, and a SHA-256 `payload-manifest.json` integrity manifest. Extract the full archive so `payload/` remains next to the setup executable, then run it (Node.js is not required at runtime):
+Grab the **Hide-Go Setup** archive for your platform from the [Releases page](https://github.com/Aflydream/hide-go/releases). Each archive ships a thin native `Hide-Go-Setup` launcher alongside shared runtime libraries (`hide_engine`, `hide_chrome`), external `resources/`, and a compressed `data/app.tar.gz` payload verified against `data/payload-manifest.json`. Extract the full archive so all files remain beside `Hide-Go-Setup` before running it:
 
 * **Windows (x64)**: Download `Hide-Go-Setup-windows-x64.zip`, extract all files, and run `Hide-Go-Setup.exe`
 * **macOS (Apple Silicon)**:
@@ -218,21 +218,19 @@ Prerequisites: Rust `1.80+` and Node.js `20+` (only needed when rebuilding the e
 # 1. Run workspace unit & integration tests (engine, desktop, and setup installer)
 cargo test --workspace
 
-# 2. Build the frontend bundles (desktop console + setup wizard) and release binaries
+# 2. Build the frontend bundles (desktop console + setup wizard), shared libraries, and launchers
 npm install && npm run build
-cargo build --release -p hide-core -p hide-go-desktop -p hide-setup
+cargo build --release -p hide-chrome -p hide-engine -p hide-go-desktop -p hide-daemon -p hide-setup
 
-# 3. Assemble a local Setup package directory (macOS / Linux bash example)
-mkdir -p Hide-Go-Setup/payload
-cp target/release/hide-go-setup Hide-Go-Setup/Hide-Go-Setup
-cp target/release/hide-go-desktop target/release/hide-go-daemon desktop/icons/icon.ico desktop/icons/icon.png Hide-Go-Setup/payload/
+# 3. Assemble a local Setup package directory and archive (Linux example)
+node scripts/package-setup.mjs --os linux --package-dir dist-pkg/Hide-Go-Setup-linux-x86_64 --archive dist-pkg/Hide-Go-Setup-linux-x86_64.tar.gz --format tar.gz
 ```
 
 ### Repository layout
 
 ```text
 hide-go/
-├── crates/hide-core/          # Core Rust library & standalone daemon (hide-go-daemon)
+├── crates/hide-core/          # Core Rust privacy proxy, desensitizer, vault, and SSE restorer library
 │   ├── src/
 │   │   ├── scanner.rs         # Scanner for keys, DB URLs, private IPs, paths, and custom rules
 │   │   ├── vault.rs           # Thread-safe bidirectional placeholder <-> raw value table, size-capped
@@ -246,9 +244,14 @@ hide-go/
 │   │   ├── harness_detect.rs  # Local tool detection, reversible auto-connect, and config backups
 │   │   └── proxy.rs           # Axum reverse proxy, management API, and offline simulator
 │   └── tests/                 # Regression tests for the code-review findings
-├── crates/hide-setup/         # Setup installer & uninstaller wizard (reads adjacent payload/)
+├── crates/hide-chrome/        # Shared WebView window & native OS helper dynamic library (cdylib)
+├── crates/hide-engine/        # Shared engine dynamic library (cdylib): gateway, disk UI server, daemon, and installer
+├── crates/hide-launcher/      # Thin C-ABI dynamic loader & crash dialog helper shared by launchers
+├── crates/hide-daemon/        # Thin headless daemon launcher (hide-go-daemon)
+├── crates/hide-setup/         # Thin Setup wizard & uninstaller launcher (hide-go-setup)
+├── scripts/package-setup.mjs  # Assembles runtime DLLs, resources/, and data/app.tar.gz Setup archives
 ├── src/                       # Desktop console & Setup wizard UIs (React + Vite + Tailwind)
-└── desktop/                   # Single-binary asset embedder & console window launcher
+└── desktop/                   # Thin desktop console launcher (hide-go-desktop) with Win32 icon resource
 ```
 
 ---

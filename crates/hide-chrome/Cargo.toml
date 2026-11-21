@@ -5,7 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "Frameless native desktop WebView window host for Hide-Go desktop and setup wizard"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
+png = "0.17"
+serde.workspace = true
+serde_json.workspace = true
 tao.workspace = true
 tracing.workspace = true
 wry.workspace = true

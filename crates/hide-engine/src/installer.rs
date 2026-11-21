@@ -1,18 +1,23 @@
+use crate::chrome_bridge::{daemon_bin_name, desktop_bin_name, is_reparse_or_symlink, uninstall_bin_name, ChromeHost};
 #[cfg(windows)]
-use hide_chrome::{hidden_command_path, windows_system_executable};
+use crate::chrome_bridge::{hidden_command_path, windows_system_executable};
+use flate2::read::GzDecoder;
 use hide_core::ca::{CaManager, RealCaTrustAdapter};
 use hide_core::config::{HideConfig, UiLanguage};
 use hide_core::harness::HarnessProfile;
 use hide_core::harness_detect::{detect_all_harness_profiles, disconnect_all_managed, HarnessActionResult};
+use hide_launcher::shared_lib_file_name;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::io::Write;
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tar::{Archive, EntryType};
+
+const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_TOTAL_EXTRACTED_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,15 +28,41 @@ pub struct SetupStepStatus {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShortcutOptions {
+    pub desktop: bool,
+    pub start_menu: bool,
+}
+
+impl ShortcutOptions {
+    pub fn any(self) -> bool {
+        self.desktop || self.start_menu
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallOptions {
     pub install_dir: Option<String>,
+    #[serde(default)]
     pub create_shortcuts: bool,
+    #[serde(default)]
+    pub create_desktop_shortcut: Option<bool>,
+    #[serde(default)]
+    pub create_start_menu_shortcut: Option<bool>,
     pub add_to_path: bool,
     pub autostart_daemon: bool,
     #[serde(default)]
     pub language: Option<UiLanguage>,
+}
+
+impl InstallOptions {
+    pub fn shortcut_options(&self) -> ShortcutOptions {
+        ShortcutOptions {
+            desktop: self.create_desktop_shortcut.unwrap_or(self.create_shortcuts),
+            start_menu: self.create_start_menu_shortcut.unwrap_or(self.create_shortcuts),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +80,8 @@ pub struct InstallManifest {
     pub shortcuts: Vec<String>,
     pub path_added: bool,
     pub autostart_enabled: bool,
+    #[serde(default)]
+    pub installed_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,15 +116,13 @@ pub struct UninstallOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct PayloadManifest {
     pub version: String,
-    pub files: HashMap<String, String>,
+    pub files: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PayloadSource {
-    pub payload_dir: Option<PathBuf>,
+    pub package_root: Option<PathBuf>,
     pub require_manifest: bool,
-    pub fallback_icon_ico: &'static [u8],
-    pub fallback_icon_png: &'static [u8],
     pub version: &'static str,
 }
 
@@ -102,30 +133,6 @@ pub fn current_platform() -> &'static str {
         "macos"
     } else {
         "linux"
-    }
-}
-
-pub fn desktop_bin_name() -> &'static str {
-    if cfg!(windows) {
-        "hide-go-desktop.exe"
-    } else {
-        "hide-go-desktop"
-    }
-}
-
-pub fn daemon_bin_name() -> &'static str {
-    if cfg!(windows) {
-        "hide-go-daemon.exe"
-    } else {
-        "hide-go-daemon"
-    }
-}
-
-pub fn uninstall_bin_name() -> &'static str {
-    if cfg!(windows) {
-        "hide-go-uninstall.exe"
-    } else {
-        "hide-go-uninstall"
     }
 }
 
@@ -170,22 +177,8 @@ pub fn manifest_path(install_dir: &Path) -> PathBuf {
     install_dir.join("install-manifest.json")
 }
 
-pub fn payload_manifest_path(payload_dir: &Path) -> PathBuf {
-    payload_dir.join("payload-manifest.json")
-}
-
-pub fn is_reparse_or_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| {
-        #[cfg(windows)]
-        {
-            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-            meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-        }
-        #[cfg(not(windows))]
-        {
-            meta.file_type().is_symlink()
-        }
-    })
+pub fn payload_manifest_path(package_root: &Path) -> PathBuf {
+    package_root.join("data").join("payload-manifest.json")
 }
 
 fn normalize_path_lexical(path: &Path) -> PathBuf {
@@ -305,6 +298,49 @@ pub fn validate_install_dir(dir: &Path) -> Result<(), String> {
 
 static ATOMIC_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
+fn ensure_safe_parent_dirs(root: &Path, parts: &[&str]) -> Result<(), String> {
+    let mut cur = root.to_path_buf();
+    for comp in parts {
+        cur.push(comp);
+        if is_reparse_or_symlink(&cur) {
+            return Err(format!("目录 {} 是符号链接，拒绝写入", cur.display()));
+        }
+        if !cur.exists() {
+            std::fs::create_dir(&cur).map_err(|e| format!("创建目录 {} 失败: {e}", cur.display()))?;
+        } else if !cur.is_dir() {
+            return Err(format!("路径 {} 不是目录", cur.display()));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_safe_descendant(root: &Path, parts: &[&str]) -> Result<PathBuf, String> {
+    let mut cur = root.to_path_buf();
+    for comp in parts {
+        cur.push(comp);
+        if is_reparse_or_symlink(&cur) {
+            return Err(format!("路径 {} 包含符号链接，拒绝访问", cur.display()));
+        }
+    }
+    Ok(cur)
+}
+
+fn validate_relative_asset_path(rel: &str) -> Result<Vec<&str>, String> {
+    if rel.is_empty()
+        || rel.starts_with('/')
+        || rel.ends_with('/')
+        || rel.contains(['\\', ':'])
+        || has_control_chars(rel)
+    {
+        return Err(format!("安装包相对路径格式非法: {rel}"));
+    }
+    let parts: Vec<&str> = rel.split('/').collect();
+    if parts.iter().any(|p| matches!(*p, "" | "." | "..")) {
+        return Err(format!("安装包相对路径包含越界片段: {rel}"));
+    }
+    Ok(parts)
+}
+
 fn atomic_write_bytes(dest: &Path, bytes: &[u8], executable: bool) -> Result<(), String> {
     if is_reparse_or_symlink(dest) {
         return Err(format!("目标路径 {} 是符号链接，拒绝写入", dest.display()));
@@ -390,6 +426,18 @@ fn desktop_entry_escape(s: &str) -> Result<String, String> {
     Ok(out)
 }
 
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn build_linux_desktop_entry(desktop_bin: &Path, icon_path: &Path) -> Result<String, String> {
+    let exec_escaped = desktop_entry_escape(&desktop_bin.to_string_lossy())?;
+    let icon_str = icon_path.to_string_lossy();
+    if has_control_chars(&icon_str) {
+        return Err("图标路径包含非法控制字符".into());
+    }
+    Ok(format!(
+        "[Desktop Entry]\nType=Application\nName=Hide-Go\nComment=AI Harness Privacy Firewall\nExec=\"{exec_escaped}\"\nIcon={icon_str}\nTerminal=false\nCategories=Development;Security;\n"
+    ))
+}
+
 pub fn detect_existing_install() -> Option<InstallManifest> {
     let default_dir = default_install_dir();
     let mut candidates = vec![default_dir];
@@ -428,8 +476,7 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Abstract host OS side effects (shortcuts, PATH, autostart, uninstall registration,
-/// process stop) so installer logic can be tested cleanly inside a TempDir.
+/// Abstract host OS side effects so installer logic can be tested cleanly inside a TempDir.
 pub trait SystemOps {
     fn stop_running_processes(&self);
     fn create_shortcuts(
@@ -437,6 +484,7 @@ pub trait SystemOps {
         install_dir: &Path,
         desktop_bin: &Path,
         uninstall_bin: &Path,
+        shortcuts: ShortcutOptions,
     ) -> Result<Vec<String>, String>;
     fn register_uninstaller(
         &self,
@@ -454,11 +502,28 @@ pub trait SystemOps {
     fn remove_ca_trust(&self, ca_dir: &Path) -> Result<String, String>;
 }
 
-pub struct RealSystemOps;
+pub struct RealSystemOps {
+    chrome: Arc<dyn ChromeHost>,
+}
+
+impl RealSystemOps {
+    pub fn new(chrome: Arc<dyn ChromeHost>) -> Self {
+        Self { chrome }
+    }
+}
+
+fn installed_icon_path(install_dir: &Path, name: &str) -> PathBuf {
+    let modular = install_dir.join("resources").join("icons").join(name);
+    if modular.is_file() {
+        modular
+    } else {
+        install_dir.join(name)
+    }
+}
 
 impl SystemOps for RealSystemOps {
     fn stop_running_processes(&self) {
-        hide_chrome::terminate_other_hide_go_processes();
+        self.chrome.terminate_other_processes();
     }
 
     fn create_shortcuts(
@@ -466,39 +531,47 @@ impl SystemOps for RealSystemOps {
         install_dir: &Path,
         desktop_bin: &Path,
         uninstall_bin: &Path,
+        shortcuts: ShortcutOptions,
     ) -> Result<Vec<String>, String> {
+        if !shortcuts.any() {
+            return Ok(Vec::new());
+        }
         #[cfg(windows)]
         {
             let mut created = Vec::new();
-            let icon = install_dir.join("icon.ico");
-            if let Some(desktop_dir) = windows_desktop_dir().or_else(|| home_dir().map(|h| h.join("Desktop"))) {
-                let desktop_lnk = desktop_dir.join("Hide-Go.lnk");
-                create_windows_shortcut(
-                    &desktop_lnk,
-                    desktop_bin,
-                    "",
-                    install_dir,
-                    &icon,
-                    "Hide-Go 本地隐私网关",
-                )?;
-                created.push(desktop_lnk.to_string_lossy().into_owned());
+            let icon = installed_icon_path(install_dir, "icon.ico");
+            if shortcuts.desktop {
+                if let Some(desktop_dir) = windows_desktop_dir().or_else(|| home_dir().map(|h| h.join("Desktop"))) {
+                    let desktop_lnk = desktop_dir.join("Hide-Go.lnk");
+                    create_windows_shortcut(
+                        &desktop_lnk,
+                        desktop_bin,
+                        "",
+                        install_dir,
+                        &icon,
+                        "Hide-Go 本地隐私网关",
+                    )?;
+                    created.push(desktop_lnk.to_string_lossy().into_owned());
+                }
             }
-            if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()).map(PathBuf::from) {
-                let menu_dir = appdata.join("Microsoft/Windows/Start Menu/Programs/Hide-Go");
-                let app_lnk = menu_dir.join("Hide-Go.lnk");
-                create_windows_shortcut(&app_lnk, desktop_bin, "", install_dir, &icon, "Hide-Go 本地隐私网关")?;
-                created.push(app_lnk.to_string_lossy().into_owned());
+            if shortcuts.start_menu {
+                if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()).map(PathBuf::from) {
+                    let menu_dir = appdata.join("Microsoft/Windows/Start Menu/Programs/Hide-Go");
+                    let app_lnk = menu_dir.join("Hide-Go.lnk");
+                    create_windows_shortcut(&app_lnk, desktop_bin, "", install_dir, &icon, "Hide-Go 本地隐私网关")?;
+                    created.push(app_lnk.to_string_lossy().into_owned());
 
-                let uninst_lnk = menu_dir.join("卸载 Hide-Go.lnk");
-                create_windows_shortcut(
-                    &uninst_lnk,
-                    uninstall_bin,
-                    "--uninstall",
-                    install_dir,
-                    &icon,
-                    "卸载 Hide-Go",
-                )?;
-                created.push(uninst_lnk.to_string_lossy().into_owned());
+                    let uninst_lnk = menu_dir.join("卸载 Hide-Go.lnk");
+                    create_windows_shortcut(
+                        &uninst_lnk,
+                        uninstall_bin,
+                        "--uninstall",
+                        install_dir,
+                        &icon,
+                        "卸载 Hide-Go",
+                    )?;
+                    created.push(uninst_lnk.to_string_lossy().into_owned());
+                }
             }
             Ok(created)
         }
@@ -540,24 +613,24 @@ impl SystemOps for RealSystemOps {
                 if let Some(parent) = icon_target.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| format!("failed to create icon dir: {e}"))?;
                 }
-                atomic_copy_file(&install_dir.join("icon.png"), &icon_target, false)
+                atomic_copy_file(&installed_icon_path(install_dir, "icon.png"), &icon_target, false)
                     .map_err(|e| format!("failed to copy desktop icon: {e}"))?;
-
-                let desktop_entry = home.join(".local/share/applications/hide-go.desktop");
-                if let Some(parent) = desktop_entry.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                }
-                let exec_escaped = desktop_entry_escape(&desktop_bin.to_string_lossy())?;
-                let icon_str = icon_target.to_string_lossy();
-                if has_control_chars(&icon_str) {
-                    return Err("图标路径包含非法控制字符".into());
-                }
-                let body = format!(
-                    "[Desktop Entry]\nType=Application\nName=Hide-Go\nComment=AI Harness Privacy Firewall\nExec=\"{exec_escaped}\"\nIcon={icon_str}\nTerminal=false\nCategories=Development;Security;\n",
-                );
-                atomic_write_bytes(&desktop_entry, body.as_bytes(), false)?;
-                created.push(desktop_entry.to_string_lossy().into_owned());
                 created.push(icon_target.to_string_lossy().into_owned());
+
+                let entry_body = build_linux_desktop_entry(desktop_bin, &icon_target)?;
+                if shortcuts.start_menu {
+                    let app_entry = home.join(".local/share/applications/hide-go.desktop");
+                    if let Some(parent) = app_entry.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    atomic_write_bytes(&app_entry, entry_body.as_bytes(), false)?;
+                    created.push(app_entry.to_string_lossy().into_owned());
+                }
+                if shortcuts.desktop && home.join("Desktop").is_dir() {
+                    let desktop_entry = home.join("Desktop/Hide-Go.desktop");
+                    atomic_write_bytes(&desktop_entry, entry_body.as_bytes(), true)?;
+                    created.push(desktop_entry.to_string_lossy().into_owned());
+                }
             }
             Ok(created)
         }
@@ -570,8 +643,6 @@ impl SystemOps for RealSystemOps {
         icon_path: &Path,
         version: &str,
     ) -> Result<(), String> {
-        // Zero Windows Registry writes: desktop uninstall is invoked via Start Menu shortcut
-        // or the uninstaller binary directly using install-manifest.json.
         let _ = (install_dir, uninstall_bin, icon_path, version);
         Ok(())
     }
@@ -579,7 +650,6 @@ impl SystemOps for RealSystemOps {
     fn add_to_path(&self, dir: &Path) -> Result<(), String> {
         #[cfg(windows)]
         {
-            // Zero Windows Registry writes: avoid touching HKCU\Environment\Path on Windows.
             let _ = dir;
             Ok(())
         }
@@ -612,7 +682,7 @@ impl SystemOps for RealSystemOps {
                     return Err("守护进程可执行文件是符号链接，拒绝创建自启快捷方式".into());
                 }
                 let working_dir = daemon_bin.parent().unwrap_or_else(|| Path::new("."));
-                let icon = working_dir.join("icon.ico");
+                let icon = installed_icon_path(working_dir, "icon.ico");
                 create_windows_shortcut(
                     &lnk_path,
                     daemon_bin,
@@ -676,7 +746,6 @@ impl SystemOps for RealSystemOps {
     }
 
     fn unregister_uninstaller(&self) -> Result<(), String> {
-        // Zero Windows Registry writes or deletions.
         Ok(())
     }
 
@@ -781,6 +850,7 @@ fn is_allowed_shortcut_path(p: &Path) -> bool {
         };
         let allowed = [
             home.join(".local/share/applications/hide-go.desktop"),
+            home.join("Desktop/Hide-Go.desktop"),
             home.join(".local/share/icons/hicolor/128x128/apps/hide-go.png"),
             home.join(".config/autostart/hide-go-daemon.desktop"),
         ];
@@ -822,7 +892,7 @@ fn create_windows_shortcut(
         .env("HIDE_GO_LNK_TARGET", target)
         .env("HIDE_GO_LNK_ARGS", args)
         .env("HIDE_GO_LNK_WORKDIR", working_dir)
-        .env("HIDE_GO_LNK_ICON", icon_path)
+        .env("HIDE_GO_LNK_ICON", format!("{},0", icon_path.display()))
         .env("HIDE_GO_LNK_DESC", description)
         .output()
         .map_err(|e| format!("powershell shortcut creation failed: {e}"))?;
@@ -922,33 +992,27 @@ fn is_regular_non_symlink_file(path: &Path) -> bool {
     !is_reparse_or_symlink(path) && path.is_file()
 }
 
-fn has_required_payload_binaries(dir: &Path) -> bool {
-    dir.is_dir()
-        && !is_reparse_or_symlink(dir)
-        && is_regular_non_symlink_file(&dir.join(desktop_bin_name()))
-        && is_regular_non_symlink_file(&dir.join(daemon_bin_name()))
+fn has_required_package_files(root: &Path) -> bool {
+    root.is_dir()
+        && !is_reparse_or_symlink(root)
+        && is_regular_non_symlink_file(&root.join(shared_lib_file_name("hide_engine")))
+        && is_regular_non_symlink_file(&root.join(shared_lib_file_name("hide_chrome")))
+        && is_regular_non_symlink_file(&root.join("data").join("app.tar.gz"))
 }
 
-pub fn discover_payload_dir() -> Option<PathBuf> {
+pub fn discover_package_root(exe_dir: Option<&Path>) -> Option<PathBuf> {
     let mut candidates = Vec::new();
+    if let Some(dir) = exe_dir {
+        candidates.push(dir.to_path_buf());
+        #[cfg(target_os = "macos")]
+        candidates.push(dir.join("../Resources"));
+    }
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            candidates.push(exe_dir.join("payload"));
-            #[cfg(target_os = "macos")]
-            candidates.push(exe_dir.join("../Resources/payload"));
-            #[cfg(debug_assertions)]
-            {
-                candidates.push(exe_dir.to_path_buf());
-                candidates.push(exe_dir.join("release"));
-            }
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.to_path_buf());
         }
     }
-    #[cfg(debug_assertions)]
-    {
-        candidates.push(PathBuf::from("target/release"));
-        candidates.push(PathBuf::from("target/debug"));
-    }
-    candidates.into_iter().find(|dir| has_required_payload_binaries(dir))
+    candidates.into_iter().find(|dir| has_required_package_files(dir))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -957,8 +1021,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn load_payload_manifest(payload_dir: &Path, required: bool) -> Result<Option<PayloadManifest>, String> {
-    let manifest_file = payload_manifest_path(payload_dir);
+fn load_payload_manifest(package_root: &Path, required: bool) -> Result<Option<PayloadManifest>, String> {
+    let manifest_file = payload_manifest_path(package_root);
     if is_reparse_or_symlink(&manifest_file) {
         return Err(format!("安装清单 {} 是符号链接，拒绝读取", manifest_file.display()));
     }
@@ -979,51 +1043,238 @@ fn load_payload_manifest(payload_dir: &Path, required: bool) -> Result<Option<Pa
 }
 
 pub fn has_install_payload(source: &PayloadSource) -> bool {
-    let Some(dir) = source.payload_dir.as_deref() else {
+    let Some(root) = source.package_root.as_deref() else {
         return false;
     };
-    has_required_payload_binaries(dir) && load_payload_manifest(dir, source.require_manifest).is_ok()
+    if !has_required_package_files(root) {
+        return false;
+    }
+    match load_payload_manifest(root, source.require_manifest) {
+        Ok(Some(manifest)) => {
+            manifest.files.contains_key(&shared_lib_file_name("hide_engine"))
+                && manifest.files.contains_key(&shared_lib_file_name("hide_chrome"))
+                && manifest.files.contains_key("data/app.tar.gz")
+        }
+        Ok(None) => true,
+        Err(_) => false,
+    }
 }
 
-fn read_verified_payload(
-    payload_dir: &Path,
-    manifest: Option<&PayloadManifest>,
-    file_name: &str,
-) -> Result<Vec<u8>, String> {
-    let src = payload_dir.join(file_name);
-    if is_reparse_or_symlink(&src) {
-        return Err(format!("安装文件 {} 是符号链接，拒绝读取", src.display()));
+fn is_allowed_package_copy_rel(rel: &str, engine_lib: &str, chrome_lib: &str) -> bool {
+    rel == engine_lib
+        || rel == chrome_lib
+        || rel.starts_with("resources/setup/")
+        || rel.starts_with("resources/locales/")
+        || rel.starts_with("resources/icons/")
+}
+
+fn is_allowed_archive_entry_rel(rel: &str, desktop_bin: &str, daemon_bin: &str) -> bool {
+    rel == desktop_bin
+        || rel == daemon_bin
+        || rel == "resources"
+        || rel == "resources/ui"
+        || rel.starts_with("resources/ui/")
+}
+
+fn is_archive_executable(rel: &str, desktop_bin: &str, daemon_bin: &str) -> bool {
+    rel == desktop_bin || rel == daemon_bin
+}
+
+fn collect_dev_copy_files(root: &Path, sub: &str, out: &mut Vec<String>) -> Result<(), String> {
+    let dir = root.join(sub);
+    if !dir.is_dir() || is_reparse_or_symlink(&dir) {
+        return Ok(());
     }
-    if !src.is_file() {
-        return Err(format!("安装包缺少必需文件: {}", src.display()));
-    }
-    let bytes = std::fs::read(&src).map_err(|e| format!("读取安装文件 {} 失败: {e}", src.display()))?;
-    if let Some(m) = manifest {
-        let expected = m
-            .files
-            .get(file_name)
-            .ok_or_else(|| format!("校验清单缺少文件 {file_name} 的摘要记录"))?;
-        let actual = sha256_hex(&bytes);
-        if !actual.eq_ignore_ascii_case(expected.trim()) {
-            return Err(format!("文件 {file_name} SHA-256 校验失败（文件可能损坏或被篡改）"));
+    for entry in std::fs::read_dir(&dir).map_err(|e| format!("读取目录 {} 失败: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("遍历目录项失败: {e}"))?;
+        let path = entry.path();
+        if is_reparse_or_symlink(&path) {
+            return Err(format!("拒绝读取符号链接文件: {}", path.display()));
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let rel = format!("{sub}/{name}");
+        if path.is_dir() {
+            collect_dev_copy_files(root, &rel, out)?;
+        } else if path.is_file() {
+            out.push(rel);
         }
     }
-    Ok(bytes)
+    Ok(())
 }
 
-fn read_icon_payload(
-    payload_dir: &Path,
-    manifest: Option<&PayloadManifest>,
-    file_name: &str,
-    fallback: &[u8],
-) -> Result<Vec<u8>, String> {
-    let path = payload_dir.join(file_name);
-    let in_manifest = manifest.is_some_and(|m| m.files.contains_key(file_name));
-    if is_reparse_or_symlink(&path) || path.is_file() || in_manifest {
-        read_verified_payload(payload_dir, manifest, file_name)
-    } else {
-        Ok(fallback.to_vec())
+struct StagedFile {
+    rel: String,
+    bytes: Vec<u8>,
+    executable: bool,
+}
+
+fn extract_app_tar_gz(archive_bytes: &[u8]) -> Result<Vec<StagedFile>, String> {
+    if archive_bytes.len() > MAX_ARCHIVE_BYTES {
+        return Err("安装包数据归档超出安全体积上限".to_string());
     }
+    let desktop_bin = desktop_bin_name();
+    let daemon_bin = daemon_bin_name();
+
+    let gz = GzDecoder::new(archive_bytes);
+    let mut archive = Archive::new(gz);
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("解析安装包数据归档 data/app.tar.gz 失败: {e}"))?;
+
+    let mut staged = Vec::new();
+    let mut total_bytes: usize = 0;
+    let mut saw_desktop = false;
+    let mut saw_daemon = false;
+    let mut saw_ui_index = false;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("读取安装包归档条目失败: {e}"))?;
+        let entry_type = entry.header().entry_type();
+        if entry_type == EntryType::Directory {
+            let raw_path = entry
+                .path()
+                .map_err(|e| format!("归档目录路径无效: {e}"))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let trimmed = raw_path.strip_prefix("./").unwrap_or(&raw_path).trim_end_matches('/');
+            if trimmed.is_empty() || trimmed == "." {
+                continue;
+            }
+            validate_relative_asset_path(trimmed)?;
+            if !is_allowed_archive_entry_rel(trimmed, desktop_bin, daemon_bin) {
+                return Err(format!("安装包归档包含未授权目录: {trimmed}"));
+            }
+            continue;
+        }
+        if entry_type != EntryType::Regular {
+            return Err("安装包归档包含不支持的符号链接或特殊条目".to_string());
+        }
+
+        let raw_path = entry
+            .path()
+            .map_err(|e| format!("归档文件路径无效: {e}"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let rel = raw_path.strip_prefix("./").unwrap_or(&raw_path);
+        validate_relative_asset_path(rel)?;
+        if !is_allowed_archive_entry_rel(rel, desktop_bin, daemon_bin) {
+            return Err(format!("安装包归档包含未授权文件路径: {rel}"));
+        }
+
+        let declared_size = entry.header().size().unwrap_or(0);
+        if declared_size as usize > MAX_TOTAL_EXTRACTED_BYTES {
+            return Err(format!("归档文件 {rel} 超出安全体积上限"));
+        }
+
+        let mut buf = Vec::with_capacity((declared_size as usize).min(16 * 1024 * 1024));
+        let mut limited = (&mut entry).take((MAX_TOTAL_EXTRACTED_BYTES - total_bytes + 1) as u64);
+        limited
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("解压归档文件 {rel} 失败: {e}"))?;
+        total_bytes = total_bytes
+            .checked_add(buf.len())
+            .filter(|&sum| sum <= MAX_TOTAL_EXTRACTED_BYTES)
+            .ok_or_else(|| "解压总体积超出安全上限".to_string())?;
+
+        if rel == desktop_bin {
+            saw_desktop = true;
+        } else if rel == daemon_bin {
+            saw_daemon = true;
+        } else if rel == "resources/ui/index.html" {
+            saw_ui_index = true;
+        }
+
+        staged.push(StagedFile {
+            rel: rel.to_string(),
+            bytes: buf,
+            executable: is_archive_executable(rel, desktop_bin, daemon_bin),
+        });
+    }
+
+    if !saw_desktop || !saw_daemon || !saw_ui_index {
+        return Err("安装包归档 data/app.tar.gz 缺少必需的主程序或 UI 资源".to_string());
+    }
+    Ok(staged)
+}
+
+fn prepare_install_files(package_root: &Path, require_manifest: bool) -> Result<Vec<StagedFile>, String> {
+    let manifest = load_payload_manifest(package_root, require_manifest)?;
+    let engine_lib = shared_lib_file_name("hide_engine");
+    let chrome_lib = shared_lib_file_name("hide_chrome");
+    let archive_rel = "data/app.tar.gz";
+
+    let mut staged = Vec::new();
+    let mut archive_bytes_opt: Option<Vec<u8>> = None;
+
+    if let Some(m) = manifest.as_ref() {
+        for req in [&engine_lib, &chrome_lib, &archive_rel.to_string()] {
+            if !m.files.contains_key(req) {
+                return Err(format!("校验清单缺少必需条目 {req}"));
+            }
+        }
+        for (rel, expected_sha) in &m.files {
+            let parts = validate_relative_asset_path(rel)?;
+            if rel != archive_rel && !is_allowed_package_copy_rel(rel, &engine_lib, &chrome_lib) {
+                return Err(format!("校验清单包含未授权安装路径: {rel}"));
+            }
+            let src = resolve_safe_descendant(package_root, &parts)?;
+            if !src.is_file() {
+                return Err(format!("安装包缺少必需文件: {}", src.display()));
+            }
+            let bytes = std::fs::read(&src).map_err(|e| format!("读取安装文件 {rel} 失败: {e}"))?;
+            let actual = sha256_hex(&bytes);
+            if !actual.eq_ignore_ascii_case(expected_sha.trim()) {
+                return Err(format!("文件 {rel} SHA-256 校验失败（文件可能损坏或被篡改）"));
+            }
+            if rel == archive_rel {
+                archive_bytes_opt = Some(bytes);
+            } else {
+                staged.push(StagedFile {
+                    rel: rel.clone(),
+                    bytes,
+                    executable: rel == &engine_lib || rel == &chrome_lib,
+                });
+            }
+        }
+    } else {
+        for rel in [&engine_lib, &chrome_lib] {
+            let parts = validate_relative_asset_path(rel)?;
+            let src = resolve_safe_descendant(package_root, &parts)?;
+            if !src.is_file() {
+                return Err(format!("安装包缺少必需组件: {}", src.display()));
+            }
+            let bytes = std::fs::read(&src).map_err(|e| format!("读取安装文件 {rel} 失败: {e}"))?;
+            staged.push(StagedFile {
+                rel: rel.clone(),
+                bytes,
+                executable: true,
+            });
+        }
+        for sub in ["resources/setup", "resources/locales", "resources/icons"] {
+            let mut rels = Vec::new();
+            collect_dev_copy_files(package_root, sub, &mut rels)?;
+            for rel in rels {
+                let parts = validate_relative_asset_path(&rel)?;
+                let src = resolve_safe_descendant(package_root, &parts)?;
+                let bytes = std::fs::read(&src).map_err(|e| format!("读取资源文件 {rel} 失败: {e}"))?;
+                staged.push(StagedFile {
+                    rel,
+                    bytes,
+                    executable: false,
+                });
+            }
+        }
+        let archive_path = resolve_safe_descendant(package_root, &["data", "app.tar.gz"])?;
+        let bytes = std::fs::read(&archive_path).map_err(|e| format!("读取 {} 失败: {e}", archive_path.display()))?;
+        archive_bytes_opt = Some(bytes);
+    }
+
+    let archive_bytes = archive_bytes_opt.ok_or_else(|| "缺少 data/app.tar.gz 安装归档".to_string())?;
+    let extracted = extract_app_tar_gz(&archive_bytes)?;
+    staged.extend(extracted);
+    Ok(staged)
 }
 
 fn load_existing_config(config_path: Option<&Path>) -> Option<HideConfig> {
@@ -1045,8 +1296,13 @@ pub fn configured_language(config_path: Option<&Path>) -> UiLanguage {
         .unwrap_or_default()
 }
 
-pub fn perform_install(opts: &InstallOptions, payloads: &PayloadSource) -> InstallOutcome {
-    perform_install_with(opts, payloads, &RealSystemOps, HideConfig::default_path().as_deref())
+pub fn perform_install(opts: &InstallOptions, payloads: &PayloadSource, chrome: Arc<dyn ChromeHost>) -> InstallOutcome {
+    perform_install_with(
+        opts,
+        payloads,
+        &RealSystemOps::new(chrome),
+        HideConfig::default_path().as_deref(),
+    )
 }
 
 pub fn perform_install_with(
@@ -1129,31 +1385,33 @@ pub fn perform_install_with(
         detail: Some(install_dir.to_string_lossy().into_owned()),
     });
 
-    // 2. Verify and write desktop + daemon binaries + icon + self uninstaller copy
-    let icon_ico = install_dir.join("icon.ico");
-    let icon_png = install_dir.join("icon.png");
+    // 2. Verify SHA-256 checksums, unpack data/app.tar.gz, write runtime libs & resources, copy uninstaller
+    let mut installed_files_set = BTreeSet::new();
     let bin_res = (|| -> Result<(), String> {
-        let payload_dir = payloads
-            .payload_dir
+        let package_root = payloads
+            .package_root
             .as_deref()
             .filter(|dir| !is_reparse_or_symlink(dir) && dir.is_dir())
-            .ok_or_else(|| "未找到同级 payload/ 安装目录，请先完整解压安装包".to_string())?;
-        let manifest = load_payload_manifest(payload_dir, payloads.require_manifest)?;
-        let desktop_bytes = read_verified_payload(payload_dir, manifest.as_ref(), desktop_bin_name())?;
-        let daemon_bytes = read_verified_payload(payload_dir, manifest.as_ref(), daemon_bin_name())?;
-        let icon_ico_bytes = read_icon_payload(payload_dir, manifest.as_ref(), "icon.ico", payloads.fallback_icon_ico)?;
-        let icon_png_bytes = read_icon_payload(payload_dir, manifest.as_ref(), "icon.png", payloads.fallback_icon_png)?;
+            .ok_or_else(|| "未找到同级运行时组件与 data/app.tar.gz 安装包，请先完整解压安装包".to_string())?;
 
-        atomic_write_bytes(&desktop_dest, &desktop_bytes, true)?;
-        atomic_write_bytes(&daemon_dest, &daemon_bytes, true)?;
-        atomic_write_bytes(&icon_ico, &icon_ico_bytes, false)?;
-        atomic_write_bytes(&icon_png, &icon_png_bytes, false)?;
+        let staged_files = prepare_install_files(package_root, payloads.require_manifest)?;
+
+        for file in &staged_files {
+            let parts = validate_relative_asset_path(&file.rel)?;
+            if parts.len() > 1 {
+                ensure_safe_parent_dirs(&install_dir, &parts[..parts.len() - 1])?;
+            }
+            let dest = resolve_safe_descendant(&install_dir, &parts)?;
+            atomic_write_bytes(&dest, &file.bytes, file.executable)?;
+            installed_files_set.insert(file.rel.clone());
+        }
 
         let self_exe = std::env::current_exe().map_err(|e| format!("定位当前安装器路径失败: {e}"))?;
         if !same_path(&self_exe, &uninstall_dest) {
             atomic_copy_file(&self_exe, &uninstall_dest, true)
                 .map_err(|e| format!("写入卸载程序 {} 失败: {e}", uninstall_dest.display()))?;
         }
+        installed_files_set.insert(uninstall_bin_name().to_string());
         Ok(())
     })();
     if let Err(e) = bin_res {
@@ -1169,7 +1427,7 @@ pub fn perform_install_with(
         id: "bin".into(),
         label: "写入程序文件".into(),
         state: "done",
-        detail: Some("主程序与后台服务".into()),
+        detail: Some("主程序、运行库与资源文件".into()),
     });
 
     // 3. Ensure initial config.json exists without clobbering user's existing settings
@@ -1195,8 +1453,9 @@ pub fn perform_install_with(
     }
 
     // 4. Shortcuts + Uninstaller + PATH + Autostart
-    let shortcuts_created = if opts.create_shortcuts {
-        match sys.create_shortcuts(&install_dir, &desktop_dest, &uninstall_dest) {
+    let shortcut_opts = opts.shortcut_options();
+    let shortcuts_created = if shortcut_opts.any() {
+        match sys.create_shortcuts(&install_dir, &desktop_dest, &uninstall_dest, shortcut_opts) {
             Ok(list) => list,
             Err(e) => {
                 steps.push(SetupStepStatus {
@@ -1212,6 +1471,7 @@ pub fn perform_install_with(
         Vec::new()
     };
 
+    let icon_ico = installed_icon_path(&install_dir, "icon.ico");
     if let Err(e) = sys.register_uninstaller(&install_dir, &uninstall_dest, &icon_ico, payloads.version) {
         steps.push(SetupStepStatus {
             id: "uninst".into(),
@@ -1247,20 +1507,26 @@ pub fn perform_install_with(
         return fail(steps, e);
     }
 
-    let manifest_shortcuts = if opts.create_shortcuts {
-        shortcuts_created.clone()
-    } else {
-        existing_manifest
-            .as_ref()
-            .map(|m| m.shortcuts.clone())
-            .unwrap_or_default()
-    };
+    let mut manifest_shortcuts = existing_manifest
+        .as_ref()
+        .map(|m| m.shortcuts.clone())
+        .unwrap_or_default();
+    for created in &shortcuts_created {
+        let created_path = Path::new(created);
+        if !manifest_shortcuts
+            .iter()
+            .any(|existing| same_path(Path::new(existing), created_path))
+        {
+            manifest_shortcuts.push(created.clone());
+        }
+    }
     let manifest = InstallManifest {
         version: payloads.version.to_string(),
         install_dir: install_dir.to_string_lossy().into_owned(),
         shortcuts: manifest_shortcuts,
         path_added: path_updated || existing_manifest.as_ref().is_some_and(|m| m.path_added),
         autostart_enabled: opts.autostart_daemon,
+        installed_files: installed_files_set.into_iter().collect(),
     };
     let manifest_res = serde_json::to_string_pretty(&manifest)
         .map_err(|e| format!("序列化安装清单失败: {e}"))
@@ -1320,8 +1586,31 @@ pub fn perform_install_with(
     }
 }
 
-pub fn perform_uninstall(opts: &UninstallOptions) -> UninstallOutcome {
-    perform_uninstall_with(opts, &RealSystemOps, HideConfig::default_path().as_deref())
+pub fn perform_uninstall(opts: &UninstallOptions, chrome: Arc<dyn ChromeHost>) -> UninstallOutcome {
+    perform_uninstall_with(opts, &RealSystemOps::new(chrome), HideConfig::default_path().as_deref())
+}
+
+fn prune_empty_resource_subdirs(install_dir: &Path, candidate_rels: &[String]) {
+    let mut dirs = BTreeSet::new();
+    for rel in candidate_rels {
+        let mut path = PathBuf::from(rel);
+        while path.pop() {
+            if !path.as_os_str().is_empty() {
+                dirs.insert(path.clone());
+            }
+        }
+    }
+    let mut sorted: Vec<PathBuf> = dirs.into_iter().collect();
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.components().count()));
+    for rel_dir in sorted {
+        let full = install_dir.join(rel_dir);
+        if full.is_dir()
+            && !is_reparse_or_symlink(&full)
+            && std::fs::read_dir(&full).is_ok_and(|mut d| d.next().is_none())
+        {
+            let _ = std::fs::remove_dir(&full);
+        }
+    }
 }
 
 pub fn perform_uninstall_with(
@@ -1413,6 +1702,7 @@ pub fn perform_uninstall_with(
         shortcuts: Vec::new(),
         path_added: true,
         autostart_enabled: true,
+        installed_files: Vec::new(),
     });
 
     // 4. Clean OS integrations
@@ -1458,28 +1748,60 @@ pub fn perform_uninstall_with(
     } else if valid_manifest.is_none() {
         file_errors.push("未找到有效 install-manifest.json，拒绝删除未知目录文件".into());
     } else {
-        let mut safe_remove_file = |p: &Path| {
-            if is_reparse_or_symlink(p) {
-                file_errors.push(format!("拒绝删除符号链接: {}", p.display()));
-                return;
-            }
-            if p.exists() {
-                match std::fs::remove_file(p) {
-                    Ok(()) => removed_paths.push(p.to_string_lossy().into_owned()),
-                    Err(e) => file_errors.push(format!("删除 {} 失败: {e}", p.display())),
-                }
-            }
-        };
+        let engine_lib = shared_lib_file_name("hide_engine");
+        let chrome_lib = shared_lib_file_name("hide_chrome");
+        let uninst_bin = uninstall_bin_name().to_string();
 
-        for name in [desktop_bin_name(), daemon_bin_name(), "icon.ico", "icon.png"] {
-            safe_remove_file(&install_dir.join(name));
+        let mut known_files: BTreeSet<String> = manifest_for_ops.installed_files.iter().cloned().collect();
+        for fallback in [
+            desktop_bin_name(),
+            daemon_bin_name(),
+            "icon.ico",
+            "icon.png",
+            &engine_lib,
+            &chrome_lib,
+            uninstall_bin_name(),
+        ] {
+            known_files.insert(fallback.to_string());
         }
+
+        let mut pruned_rels = Vec::new();
+        for rel in &known_files {
+            if running_from_install_dir && (rel == &uninst_bin || rel == &engine_lib || rel == &chrome_lib) {
+                continue;
+            }
+            let Ok(parts) = validate_relative_asset_path(rel) else {
+                file_errors.push(format!("安装清单包含非法相对路径: {rel}"));
+                continue;
+            };
+            match resolve_safe_descendant(&install_dir, &parts) {
+                Ok(target) => {
+                    if target.exists() {
+                        match std::fs::remove_file(&target) {
+                            Ok(()) => {
+                                removed_paths.push(target.to_string_lossy().into_owned());
+                                pruned_rels.push(rel.clone());
+                            }
+                            Err(e) => file_errors.push(format!("删除 {} 失败: {e}", target.display())),
+                        }
+                    } else {
+                        pruned_rels.push(rel.clone());
+                    }
+                }
+                Err(msg) => file_errors.push(msg),
+            }
+        }
+        prune_empty_resource_subdirs(&install_dir, &pruned_rels);
 
         if running_from_install_dir {
             pending_cleanup_dir = Some(install_dir.clone());
         } else {
-            safe_remove_file(&mp);
-            safe_remove_file(&install_dir.join(uninstall_bin_name()));
+            if !is_reparse_or_symlink(&mp) && mp.exists() {
+                match std::fs::remove_file(&mp) {
+                    Ok(()) => removed_paths.push(mp.to_string_lossy().into_owned()),
+                    Err(e) => file_errors.push(format!("删除 {} 失败: {e}", mp.display())),
+                }
+            }
             if install_dir.exists()
                 && !is_reparse_or_symlink(&install_dir)
                 && std::fs::read_dir(&install_dir).is_ok_and(|mut d| d.next().is_none())
@@ -1631,31 +1953,34 @@ pub fn schedule_self_cleanup(install_dir: &Path) {
         return;
     }
     let uninst = install_dir.join(uninstall_bin_name());
+    let engine_lib = install_dir.join(shared_lib_file_name("hide_engine"));
+    let chrome_lib = install_dir.join(shared_lib_file_name("hide_chrome"));
 
     #[cfg(windows)]
     {
-        let Ok(tmp_dir) = hide_chrome::create_private_temp_dir("hide-go-cleanup") else {
+        let Ok(tmp_dir) = crate::chrome_bridge::create_private_temp_dir("hide-go-cleanup") else {
             return;
         };
         let script_path = tmp_dir.join("cleanup.ps1");
         let ps_body = "\
 param(\r\n\
     [Parameter(Mandatory=$true)][string]$UninstallExe,\r\n\
+    [Parameter(Mandatory=$true)][string]$EngineDll,\r\n\
+    [Parameter(Mandatory=$true)][string]$ChromeDll,\r\n\
     [Parameter(Mandatory=$true)][string]$ManifestPath,\r\n\
     [Parameter(Mandatory=$true)][string]$InstallDir\r\n\
 )\r\n\
-for ($i = 0; $i -lt 20; $i++) {\r\n\
+$targets = @($ManifestPath, $EngineDll, $ChromeDll, $UninstallExe)\r\n\
+for ($i = 0; $i -lt 30; $i++) {\r\n\
     Start-Sleep -Milliseconds 300\r\n\
-    if (Test-Path -LiteralPath $ManifestPath) {\r\n\
-        $item = Get-Item -LiteralPath $ManifestPath -Force -ErrorAction SilentlyContinue\r\n\
-        if ($item -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {\r\n\
-            Remove-Item -LiteralPath $ManifestPath -Force -ErrorAction SilentlyContinue\r\n\
-        }\r\n\
-    }\r\n\
-    if (Test-Path -LiteralPath $UninstallExe) {\r\n\
-        $item = Get-Item -LiteralPath $UninstallExe -Force -ErrorAction SilentlyContinue\r\n\
-        if ($item -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {\r\n\
-            Remove-Item -LiteralPath $UninstallExe -Force -ErrorAction SilentlyContinue\r\n\
+    $remaining = $false\r\n\
+    foreach ($t in $targets) {\r\n\
+        if (Test-Path -LiteralPath $t) {\r\n\
+            $item = Get-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue\r\n\
+            if ($item -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {\r\n\
+                Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue\r\n\
+            }\r\n\
+            if (Test-Path -LiteralPath $t) { $remaining = $true }\r\n\
         }\r\n\
     }\r\n\
     if (Test-Path -LiteralPath $InstallDir) {\r\n\
@@ -1667,9 +1992,7 @@ for ($i = 0; $i -lt 20; $i++) {\r\n\
             }\r\n\
         }\r\n\
     }\r\n\
-    if (-not (Test-Path -LiteralPath $UninstallExe)) {\r\n\
-        break\r\n\
-    }\r\n\
+    if (-not $remaining) { break }\r\n\
 }\r\n\
 $self = $MyInvocation.MyCommand.Path\r\n\
 if ($self -and (Test-Path -LiteralPath $self)) {\r\n\
@@ -1691,17 +2014,18 @@ if ($self -and (Test-Path -LiteralPath $self)) {\r\n\
             .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(&script_path)
             .arg(&uninst)
+            .arg(&engine_lib)
+            .arg(&chrome_lib)
             .arg(&mp)
             .arg(install_dir)
             .spawn();
     }
     #[cfg(not(windows))]
     {
-        if mp.exists() && !is_reparse_or_symlink(&mp) {
-            let _ = std::fs::remove_file(&mp);
-        }
-        if uninst.exists() && !is_reparse_or_symlink(&uninst) {
-            let _ = std::fs::remove_file(&uninst);
+        for p in [&mp, &engine_lib, &chrome_lib, &uninst] {
+            if p.exists() && !is_reparse_or_symlink(p) {
+                let _ = std::fs::remove_file(p);
+            }
         }
         if install_dir.exists() && std::fs::read_dir(install_dir).is_ok_and(|mut d| d.next().is_none()) {
             let _ = std::fs::remove_dir(install_dir);
@@ -1712,12 +2036,15 @@ if ($self -and (Test-Path -LiteralPath $self)) {\r\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::cell::RefCell;
+    use tar::{Builder, Header};
 
     struct TempDir(PathBuf);
     impl TempDir {
         fn new() -> Self {
-            let p = std::env::temp_dir().join(format!("hide-setup-test-{}", uuid::Uuid::new_v4().simple()));
+            let p = std::env::temp_dir().join(format!("hide-engine-test-{}", uuid::Uuid::new_v4().simple()));
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
         }
@@ -1734,6 +2061,7 @@ mod tests {
     #[derive(Default)]
     struct MockOps {
         shortcuts_created: RefCell<Vec<String>>,
+        shortcut_calls: RefCell<Vec<ShortcutOptions>>,
         path_added: RefCell<bool>,
         autostart: RefCell<bool>,
         registered: RefCell<bool>,
@@ -1747,11 +2075,21 @@ mod tests {
             install_dir: &Path,
             _desktop_bin: &Path,
             _uninstall_bin: &Path,
+            shortcuts: ShortcutOptions,
         ) -> Result<Vec<String>, String> {
-            let p = install_dir.join("Mock.lnk");
-            std::fs::write(&p, b"lnk").unwrap();
-            let list = vec![p.to_string_lossy().into_owned()];
-            *self.shortcuts_created.borrow_mut() = list.clone();
+            self.shortcut_calls.borrow_mut().push(shortcuts);
+            let mut list = Vec::new();
+            if shortcuts.desktop {
+                let p = install_dir.join("MockDesktop.lnk");
+                std::fs::write(&p, b"lnk").unwrap();
+                list.push(p.to_string_lossy().into_owned());
+            }
+            if shortcuts.start_menu {
+                let p = install_dir.join("MockStartMenu.lnk");
+                std::fs::write(&p, b"lnk").unwrap();
+                list.push(p.to_string_lossy().into_owned());
+            }
+            self.shortcuts_created.borrow_mut().extend(list.iter().cloned());
             Ok(list)
         }
         fn register_uninstaller(
@@ -1797,37 +2135,121 @@ mod tests {
         }
     }
 
-    fn create_test_payload_dir(root: &Path, version: &str, with_manifest: bool) -> PayloadSource {
-        let payload_dir = root.join("payload");
-        std::fs::create_dir_all(&payload_dir).unwrap();
-        let entries: [(&str, &[u8]); 4] = [
-            (desktop_bin_name(), b"DESKTOP_BIN"),
-            (daemon_bin_name(), b"DAEMON_BIN"),
-            ("icon.ico", b"ICO"),
-            ("icon.png", b"PNG"),
-        ];
-        let mut files = HashMap::new();
-        for (name, content) in entries {
-            std::fs::write(payload_dir.join(name), content).unwrap();
-            files.insert(name.to_string(), sha256_hex(content));
+    fn build_raw_ustar_gz(raw_name: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        let name_bytes = raw_name.as_bytes();
+        header[..name_bytes.len()].copy_from_slice(name_bytes);
+        header[100..108].copy_from_slice(b"0000755\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        let size_oct = format!("{:011o}\0", bytes.len());
+        header[124..136].copy_from_slice(size_oct.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+        let cksum = format!("{sum:06o}\0 ");
+        header[148..156].copy_from_slice(cksum.as_bytes());
+
+        let mut tar_buf = Vec::new();
+        tar_buf.extend_from_slice(&header);
+        tar_buf.extend_from_slice(bytes);
+        let rem = bytes.len() % 512;
+        if rem != 0 {
+            tar_buf.extend(std::iter::repeat_n(0u8, 512 - rem));
         }
+        tar_buf.extend(std::iter::repeat_n(0u8, 1024));
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_buf).unwrap();
+        gz.finish().unwrap()
+    }
+
+    fn build_tar_gz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar_buf);
+            for &(path, bytes, mode) in entries {
+                let mut header = Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(mode);
+                header.set_entry_type(EntryType::Regular);
+                header.set_cksum();
+                builder.append_data(&mut header, path, bytes).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_buf).unwrap();
+        gz.finish().unwrap()
+    }
+
+    fn create_test_package_root(root: &Path, version: &str, with_manifest: bool) -> PayloadSource {
+        let pkg = root.join("pkg");
+        std::fs::create_dir_all(pkg.join("data")).unwrap();
+        std::fs::create_dir_all(pkg.join("resources/setup/assets")).unwrap();
+        std::fs::create_dir_all(pkg.join("resources/locales")).unwrap();
+        std::fs::create_dir_all(pkg.join("resources/icons")).unwrap();
+
+        let engine_lib = shared_lib_file_name("hide_engine");
+        let chrome_lib = shared_lib_file_name("hide_chrome");
+        let desktop_bin = desktop_bin_name();
+        let daemon_bin = daemon_bin_name();
+
+        let tar_gz = build_tar_gz(&[
+            (desktop_bin, b"DESKTOP_BIN", 0o755),
+            (daemon_bin, b"DAEMON_BIN", 0o755),
+            ("resources/ui/index.html", b"<html><head></head></html>", 0o644),
+            ("resources/ui/assets/index.js", b"console.log('ui');", 0o644),
+            ("resources/ui/assets/index.css", b"body{}", 0o644),
+        ]);
+
+        let package_files: Vec<(String, Vec<u8>)> = vec![
+            (engine_lib, b"ENGINE_DLL".to_vec()),
+            (chrome_lib, b"CHROME_DLL".to_vec()),
+            (
+                "resources/setup/setup.html".into(),
+                b"<html><head></head></html>".to_vec(),
+            ),
+            (
+                "resources/setup/assets/setup.js".into(),
+                b"console.log('setup');".to_vec(),
+            ),
+            ("resources/locales/zh-CN.json".into(), b"{}".to_vec()),
+            ("resources/locales/en.json".into(), b"{}".to_vec()),
+            ("resources/icons/icon.ico".into(), b"ICO".to_vec()),
+            ("resources/icons/icon.png".into(), b"PNG".to_vec()),
+            ("data/app.tar.gz".into(), tar_gz),
+        ];
+
+        let mut manifest_map = BTreeMap::new();
+        for (rel, bytes) in package_files {
+            let full = pkg.join(&rel);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&full, &bytes).unwrap();
+            manifest_map.insert(rel, sha256_hex(&bytes));
+        }
+
         if with_manifest {
             let manifest = PayloadManifest {
                 version: version.to_string(),
-                files,
+                files: manifest_map,
             };
             std::fs::write(
-                payload_manifest_path(&payload_dir),
+                payload_manifest_path(&pkg),
                 serde_json::to_vec_pretty(&manifest).unwrap(),
             )
             .unwrap();
         }
+
         PayloadSource {
-            payload_dir: Some(payload_dir),
+            package_root: Some(pkg),
             require_manifest: with_manifest,
-            fallback_icon_ico: b"FALLBACK_ICO",
-            fallback_icon_png: b"FALLBACK_PNG",
-            version: "0.1.2",
+            version: "0.2.2",
         }
     }
 
@@ -1844,13 +2266,15 @@ mod tests {
         };
         custom_cfg.save(&cfg_path).unwrap();
 
-        let payloads = create_test_payload_dir(tmp.path(), "0.1.2", true);
+        let payloads = create_test_package_root(tmp.path(), "0.2.2", true);
         let ops = MockOps::default();
 
         let outcome = perform_install_with(
             &InstallOptions {
                 install_dir: Some(install_dir.to_string_lossy().into_owned()),
                 create_shortcuts: true,
+                create_desktop_shortcut: None,
+                create_start_menu_shortcut: None,
                 add_to_path: true,
                 autostart_daemon: true,
                 language: Some(UiLanguage::En),
@@ -1862,12 +2286,15 @@ mod tests {
         assert!(outcome.ok, "install failed: {:?}", outcome.error);
         assert!(install_dir.join(desktop_bin_name()).is_file());
         assert!(install_dir.join(daemon_bin_name()).is_file());
+        assert!(install_dir.join(shared_lib_file_name("hide_engine")).is_file());
+        assert!(install_dir.join(shared_lib_file_name("hide_chrome")).is_file());
+        assert!(install_dir.join("resources/ui/index.html").is_file());
+        assert!(install_dir.join("resources/icons/icon.ico").is_file());
         assert!(manifest_path(&install_dir).is_file());
         assert!(*ops.registered.borrow());
         assert!(*ops.path_added.borrow());
         assert!(*ops.autostart.borrow());
 
-        // Existing config salt must survive install/upgrade untouched while selected language is persisted
         let loaded = HideConfig::load_or_create(&cfg_path);
         assert_eq!(loaded.project_salt, "user-custom-salt-123");
         assert_eq!(loaded.language, UiLanguage::En);
@@ -1895,13 +2322,15 @@ mod tests {
         let tmp = TempDir::new();
         let install_dir = tmp.path().join("app");
         let cfg_path = tmp.path().join("cfg").join("config.json");
-        let payloads = create_test_payload_dir(tmp.path(), "0.1.2", true);
+        let payloads = create_test_package_root(tmp.path(), "0.2.2", true);
         let ops = MockOps::default();
 
         let first = perform_install_with(
             &InstallOptions {
                 install_dir: Some(install_dir.to_string_lossy().into_owned()),
                 create_shortcuts: true,
+                create_desktop_shortcut: None,
+                create_start_menu_shortcut: None,
                 add_to_path: true,
                 autostart_daemon: false,
                 language: None,
@@ -1911,12 +2340,14 @@ mod tests {
             Some(&cfg_path),
         );
         assert!(first.ok);
-        assert_eq!(first.shortcuts_created.len(), 1);
+        assert_eq!(first.shortcuts_created.len(), 2);
 
         let second = perform_install_with(
             &InstallOptions {
                 install_dir: Some(install_dir.to_string_lossy().into_owned()),
                 create_shortcuts: false,
+                create_desktop_shortcut: None,
+                create_start_menu_shortcut: None,
                 add_to_path: false,
                 autostart_daemon: false,
                 language: None,
@@ -1933,23 +2364,104 @@ mod tests {
     }
 
     #[test]
-    fn payload_manifest_verifies_sha256_and_rejects_tampered_binary() {
+    fn shortcut_options_support_independent_desktop_and_start_menu_toggles() {
         let tmp = TempDir::new();
         let install_dir = tmp.path().join("app");
         let cfg_path = tmp.path().join("cfg").join("config.json");
-        let payloads = create_test_payload_dir(tmp.path(), "0.2.2", true);
+        let payloads = create_test_package_root(tmp.path(), "0.2.2", true);
+        let ops = MockOps::default();
+
+        let fallback_opts = InstallOptions {
+            install_dir: None,
+            create_shortcuts: true,
+            create_desktop_shortcut: None,
+            create_start_menu_shortcut: None,
+            add_to_path: false,
+            autostart_daemon: false,
+            language: None,
+        };
+        assert_eq!(
+            fallback_opts.shortcut_options(),
+            ShortcutOptions {
+                desktop: true,
+                start_menu: true,
+            }
+        );
+
+        let desktop_only = perform_install_with(
+            &InstallOptions {
+                install_dir: Some(install_dir.to_string_lossy().into_owned()),
+                create_shortcuts: false,
+                create_desktop_shortcut: Some(true),
+                create_start_menu_shortcut: Some(false),
+                add_to_path: false,
+                autostart_daemon: false,
+                language: None,
+            },
+            &payloads,
+            &ops,
+            Some(&cfg_path),
+        );
+        assert!(desktop_only.ok);
+        assert_eq!(desktop_only.shortcuts_created.len(), 1);
+        assert!(desktop_only.shortcuts_created[0].ends_with("MockDesktop.lnk"));
+
+        let menu_only = perform_install_with(
+            &InstallOptions {
+                install_dir: Some(install_dir.to_string_lossy().into_owned()),
+                create_shortcuts: false,
+                create_desktop_shortcut: Some(false),
+                create_start_menu_shortcut: Some(true),
+                add_to_path: false,
+                autostart_daemon: false,
+                language: None,
+            },
+            &payloads,
+            &ops,
+            Some(&cfg_path),
+        );
+        assert!(menu_only.ok);
+        assert_eq!(menu_only.shortcuts_created.len(), 1);
+        assert!(menu_only.shortcuts_created[0].ends_with("MockStartMenu.lnk"));
+
+        let saved: InstallManifest =
+            serde_json::from_str(&std::fs::read_to_string(manifest_path(&install_dir)).unwrap()).unwrap();
+        assert_eq!(saved.shortcuts.len(), 2);
+        assert_eq!(
+            *ops.shortcut_calls.borrow(),
+            vec![
+                ShortcutOptions {
+                    desktop: true,
+                    start_menu: false,
+                },
+                ShortcutOptions {
+                    desktop: false,
+                    start_menu: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn payload_manifest_verifies_sha256_and_rejects_tampered_files_and_bad_tar() {
+        let tmp = TempDir::new();
+        let install_dir = tmp.path().join("app");
+        let cfg_path = tmp.path().join("cfg").join("config.json");
+        let payloads = create_test_package_root(tmp.path(), "0.2.2", true);
         let ops = MockOps::default();
 
         assert!(has_install_payload(&payloads));
 
-        // Corrupt daemon binary on disk without updating payload-manifest.json
-        let payload_dir = payloads.payload_dir.as_ref().unwrap();
-        std::fs::write(payload_dir.join(daemon_bin_name()), b"TAMPERED_DAEMON").unwrap();
+        // Corrupt shared library on disk without updating payload-manifest.json
+        let pkg = payloads.package_root.as_ref().unwrap();
+        std::fs::write(pkg.join(shared_lib_file_name("hide_engine")), b"TAMPERED_ENGINE").unwrap();
 
         let outcome = perform_install_with(
             &InstallOptions {
                 install_dir: Some(install_dir.to_string_lossy().into_owned()),
                 create_shortcuts: false,
+                create_desktop_shortcut: None,
+                create_start_menu_shortcut: None,
                 add_to_path: false,
                 autostart_daemon: false,
                 language: None,
@@ -1961,7 +2473,14 @@ mod tests {
         assert!(!outcome.ok);
         assert!(outcome.error.as_deref().unwrap_or("").contains("SHA-256"));
         assert!(!install_dir.join(desktop_bin_name()).exists());
-        assert!(!install_dir.join(daemon_bin_name()).exists());
+        assert!(!install_dir.join(shared_lib_file_name("hide_engine")).exists());
+
+        // Reject path-traversal and unauthorized archive entries
+        let traversal_tar = build_raw_ustar_gz("../evil.exe", b"BAD");
+        assert!(extract_app_tar_gz(&traversal_tar).is_err());
+
+        let unauthorized_tar = build_tar_gz(&[("resources/other/evil.txt", b"BAD", 0o644)]);
+        assert!(extract_app_tar_gz(&unauthorized_tar).is_err());
     }
 
     #[test]
@@ -1971,12 +2490,9 @@ mod tests {
         let cfg_path = tmp.path().join("cfg").join("config.json");
         let ops = MockOps::default();
 
-        // Case 1: missing payload directory
         let missing_dir_source = PayloadSource {
-            payload_dir: None,
+            package_root: None,
             require_manifest: true,
-            fallback_icon_ico: b"ICO",
-            fallback_icon_png: b"PNG",
             version: "0.2.2",
         };
         assert!(!has_install_payload(&missing_dir_source));
@@ -1984,6 +2500,8 @@ mod tests {
             &InstallOptions {
                 install_dir: Some(install_dir.to_string_lossy().into_owned()),
                 create_shortcuts: false,
+                create_desktop_shortcut: None,
+                create_start_menu_shortcut: None,
                 add_to_path: false,
                 autostart_daemon: false,
                 language: None,
@@ -1994,15 +2512,16 @@ mod tests {
         );
         assert!(!missing_res.ok);
 
-        // Case 2: payload directory present without payload-manifest.json while required
         let no_manifest_root = tmp.path().join("no-manifest");
-        let mut no_manifest_source = create_test_payload_dir(&no_manifest_root, "0.2.2", false);
+        let mut no_manifest_source = create_test_package_root(&no_manifest_root, "0.2.2", false);
         no_manifest_source.require_manifest = true;
         assert!(!has_install_payload(&no_manifest_source));
         let manifest_err = perform_install_with(
             &InstallOptions {
                 install_dir: Some(install_dir.to_string_lossy().into_owned()),
                 create_shortcuts: false,
+                create_desktop_shortcut: None,
+                create_start_menu_shortcut: None,
                 add_to_path: false,
                 autostart_daemon: false,
                 language: None,
@@ -2019,7 +2538,13 @@ mod tests {
         struct FailingOps;
         impl SystemOps for FailingOps {
             fn stop_running_processes(&self) {}
-            fn create_shortcuts(&self, _: &Path, _: &Path, _: &Path) -> Result<Vec<String>, String> {
+            fn create_shortcuts(
+                &self,
+                _: &Path,
+                _: &Path,
+                _: &Path,
+                _: ShortcutOptions,
+            ) -> Result<Vec<String>, String> {
                 Ok(Vec::new())
             }
             fn register_uninstaller(&self, _: &Path, _: &Path, _: &Path, _: &str) -> Result<(), String> {
@@ -2121,11 +2646,13 @@ mod tests {
         assert!(!without_manifest.ok);
         assert!(unrelated.is_file());
 
-        let payloads = create_test_payload_dir(tmp.path(), "0.1.2", true);
+        let payloads = create_test_package_root(tmp.path(), "0.2.2", true);
         let installed = perform_install_with(
             &InstallOptions {
                 install_dir: Some(install_dir.to_string_lossy().into_owned()),
                 create_shortcuts: false,
+                create_desktop_shortcut: None,
+                create_start_menu_shortcut: None,
                 add_to_path: false,
                 autostart_daemon: false,
                 language: None,
@@ -2148,6 +2675,8 @@ mod tests {
         assert!(with_manifest.ok);
         assert!(!install_dir.join(desktop_bin_name()).exists());
         assert!(!install_dir.join(daemon_bin_name()).exists());
+        assert!(!install_dir.join(shared_lib_file_name("hide_engine")).exists());
+        assert!(!install_dir.join("resources").exists());
         assert!(!manifest_path(&install_dir).exists());
         assert!(
             unrelated.is_file(),
