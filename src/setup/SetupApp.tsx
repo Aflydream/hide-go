@@ -81,7 +81,7 @@ function getInstallDirError(rawDir: string, platform?: string): string | null {
   if (low === '/' || /^[a-z]:$/i.test(low)) {
     return '不能直接安装到磁盘根目录，请选择专用子目录（例如 …\\Hide-Go）';
   }
-  if (/^c:\\windows(\\|$)/i.test(low) || /^[a-z]:\\windows(\\|$)/i.test(low)) {
+  if (/^[a-z]:\\windows(\\|$)/i.test(low)) {
     return '不能安装到 Windows 系统目录下，请选择用户目录中的子目录';
   }
   if (
@@ -204,9 +204,19 @@ export function SetupApp() {
     transition.finished.finally(focusHeading);
   }, []);
 
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   const loadInfo = useCallback(async () => {
     try {
       const data = await setupFetch<SetupInfo>('/api/setup/info');
+      if (!mountedRef.current) return;
       setInfo(data);
       setInstallDir((prev) => prev || data.existingInstallDir || data.defaultInstallDir);
       const autoSelectable = data.harnesses
@@ -214,7 +224,7 @@ export function SetupApp() {
         .map((h) => h.kind);
       setSelectedKinds(autoSelectable);
     } catch (e) {
-      setLoadError((e as Error).message);
+      if (mountedRef.current) setLoadError((e as Error).message);
     }
   }, []);
 
@@ -227,8 +237,9 @@ export function SetupApp() {
     () => activeHarnesses.filter((h) => h.autoConnectMode !== 'manual').map((h) => h.kind),
     [activeHarnesses],
   );
+  const selectedSet = useMemo(() => new Set(selectedKinds), [selectedKinds]);
   const allAutoSelected =
-    autoConnectableKinds.length > 0 && autoConnectableKinds.every((k) => selectedKinds.includes(k));
+    autoConnectableKinds.length > 0 && autoConnectableKinds.every((k) => selectedSet.has(k));
 
   const pickInstallDir = async () => {
     if (pickingDir || busy) return;
@@ -700,7 +711,7 @@ export function SetupApp() {
                 <div className="divide-y divide-line border-y border-line">
                   {activeHarnesses.map((h) => {
                     const canAuto = h.autoConnectMode !== 'manual';
-                    const checked = selectedKinds.includes(h.kind);
+                    const checked = selectedSet.has(h.kind);
                     const statusLabel = !canAuto
                       ? '需手动配置'
                       : h.configured
@@ -727,8 +738,11 @@ export function SetupApp() {
                             disabled={!canAuto}
                             checked={canAuto && checked}
                             onChange={(e) => {
-                              if (e.target.checked) setSelectedKinds((prev) => [...prev, h.kind]);
-                              else setSelectedKinds((prev) => prev.filter((k) => k !== h.kind));
+                              if (e.target.checked) {
+                                setSelectedKinds((prev) => (prev.includes(h.kind) ? prev : [...prev, h.kind]));
+                              } else {
+                                setSelectedKinds((prev) => prev.filter((k) => k !== h.kind));
+                              }
                             }}
                           />
                           <div className="min-w-0">

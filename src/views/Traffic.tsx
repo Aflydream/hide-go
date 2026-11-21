@@ -9,6 +9,7 @@ import {
   HARNESS_ORDER,
   MODE_LABEL,
   SEVERITY_LABEL,
+  SEVERITY_RANK,
   describeAction,
   formatBytes,
   formatLatency,
@@ -310,21 +311,21 @@ function RecordDetail({
     if (!record) return null;
     const jsonEscaped = (s: string) => JSON.stringify(s).slice(1, -1);
     const vendorText = record.vendorVisiblePayload + record.vendorRawResponse;
-    const present = vaultTokens.filter(
-      (v) => vendorText.includes(v.token) || vendorText.includes(jsonEscaped(v.token)),
-    );
+    const presentTokens: string[] = [];
+    const presentOriginals: string[] = [];
+    for (const v of vaultTokens) {
+      const escapedToken = jsonEscaped(v.token);
+      if (vendorText.includes(v.token) || vendorText.includes(escapedToken)) {
+        presentTokens.push(v.token, escapedToken);
+        presentOriginals.push(v.originalRaw, jsonEscaped(v.originalRaw));
+      }
+    }
     const findingTokens = record.findings
       .map((f) => f.replacementToken)
       .filter((t) => !t.startsWith('<<CHAFF') && !/[一-鿿]/.test(t));
     return {
-      vendor: buildMatcher(
-        [...findingTokens, ...present.flatMap((v) => [v.token, jsonEscaped(v.token)])],
-        true,
-      ),
-      local: buildMatcher(
-        present.flatMap((v) => [v.originalRaw, jsonEscaped(v.originalRaw)]),
-        false,
-      ),
+      vendor: buildMatcher([...findingTokens, ...presentTokens], true),
+      local: buildMatcher(presentOriginals, false),
     };
   }, [record, vaultTokens]);
 
@@ -438,14 +439,17 @@ function RecordDetail({
 }
 
 function FindingsTable({ record }: { record: TrafficAuditRecord }) {
-  if (!record.findings.length) {
+  const sorted = useMemo(
+    () => [...record.findings].sort((a, b) => SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity]),
+    [record.findings],
+  );
+  if (!sorted.length) {
     return (
       <EmptyState icon={<MagnifyingGlass size={20} />} title="未检出敏感数据">
         未命中内置规则或自定义规则
       </EmptyState>
     );
   }
-  const sorted = [...record.findings].sort((a, b) => ['critical', 'high', 'medium', 'low'].indexOf(a.severity) - ['critical', 'high', 'medium', 'low'].indexOf(b.severity));
   return (
     <div className="min-h-0 overflow-auto">
       <table className="w-full text-left text-xs">

@@ -98,8 +98,10 @@ export function formatBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
+const NUMBER_FORMATTER = new Intl.NumberFormat('zh-CN');
+
 export function formatCount(n: number): string {
-  return new Intl.NumberFormat('zh-CN').format(n);
+  return NUMBER_FORMATTER.format(n);
 }
 
 export function formatDuration(totalSecs: number): string {

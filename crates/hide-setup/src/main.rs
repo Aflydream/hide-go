@@ -15,7 +15,7 @@ use hide_core::harness_detect::{connect_harness, detect_all_harness_profiles};
 use hide_core::proxy::is_local_browser_request;
 use installer::{
     configured_proxy_port, current_platform, default_install_dir, desktop_bin_name, detect_existing_install,
-    is_reparse_or_symlink, manifest_path, perform_install, perform_uninstall, schedule_self_cleanup,
+    is_reparse_or_symlink, manifest_path, perform_install, perform_uninstall, same_path, schedule_self_cleanup,
     validate_install_dir, EmbeddedPayloads, InstallManifest, InstallOptions, UninstallOptions,
 };
 use serde::{Deserialize, Serialize};
@@ -326,20 +326,7 @@ fn validate_launch_target(dir: &std::path::Path) -> Result<PathBuf, (StatusCode,
         )
     })?;
     let manifest_dir = PathBuf::from(manifest.install_dir.trim());
-    let norm = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let same = {
-        let a = norm(&manifest_dir);
-        let b = norm(dir);
-        #[cfg(windows)]
-        {
-            a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
-        }
-        #[cfg(not(windows))]
-        {
-            a == b
-        }
-    };
-    if !same {
+    if !same_path(&manifest_dir, dir) {
         return Err((StatusCode::FORBIDDEN, "安装目录与安装清单不匹配，拒绝启动".into()));
     }
     let exe = dir.join(desktop_bin_name());

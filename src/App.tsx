@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, type ReactNode } from 'react';
 import {
   ChartLineUp,
   ArrowsLeftRight,
@@ -43,7 +43,7 @@ const MODE_OPTIONS: Array<{ value: PrivacyMode; label: string; icon: ReactNode; 
 
 function Sidebar() {
   const { route, navigate, logs, vault, status, config, statusError } = useStore();
-  const liveCount = logs.filter((l) => !l.simulated).length;
+  const liveCount = useMemo(() => logs.reduce((n, l) => n + (l.simulated ? 0 : 1), 0), [logs]);
   const online = !!status && !statusError;
   const counts: Partial<Record<Route, number>> = {
     traffic: liveCount,

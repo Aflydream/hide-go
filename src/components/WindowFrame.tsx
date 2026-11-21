@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { Desktop, Minus, Moon, Square, SquaresFour, Sun, X } from '@phosphor-icons/react';
 import logoMark from '../assets/logo-mark.png';
 
@@ -73,7 +73,7 @@ export function useColorScheme(): {
 
   const resolved: 'light' | 'dark' = pref === 'system' ? (sysDark ? 'dark' : 'light') : pref;
 
-  const setPref = (next: ColorSchemePref) => {
+  const setPref = useCallback((next: ColorSchemePref) => {
     setPrefState(next);
     try {
       if (next === 'system') {
@@ -84,20 +84,15 @@ export function useColorScheme(): {
     } catch {
       /* ignore */
     }
-    applySchemeMeta(next);
-  };
+  }, []);
 
   // Two-state space-constrained toggle matching modern-web-guidance `dark-mode-toggle`:
   // toggles between rendered scheme inverse (stored literally) and reverting to System when target matches OS.
-  const toggle = () => {
+  const toggle = useCallback(() => {
     const target: 'light' | 'dark' = resolved === 'dark' ? 'light' : 'dark';
     const currentSys: 'light' | 'dark' = sysDark ? 'dark' : 'light';
-    if (target === currentSys) {
-      setPref('system');
-    } else {
-      setPref(target);
-    }
-  };
+    setPref(target === currentSys ? 'system' : target);
+  }, [resolved, sysDark, setPref]);
 
   return { pref, resolved, toggle, setPref };
 }

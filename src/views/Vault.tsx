@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { Eye, EyeSlash, Funnel, MagnifyingGlass, Trash, Vault as VaultIcon } from '@phosphor-icons/react';
 import { useStore } from '../store';
 import { api } from '../lib/api';
@@ -15,7 +15,7 @@ export function VaultView() {
   const [category, setCategory] = useState('all');
   const [secretsOnly, setSecretsOnly] = useState(false);
   const [revealAll, setRevealAll] = useState(false);
-  const [revealed, setRevealed] = useState<ReadonlySet<string>>(new Set());
+  const [revealed, setRevealed] = useState<ReadonlySet<string>>(() => new Set());
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearing, setClearing] = useState(false);
 
@@ -29,15 +29,18 @@ export function VaultView() {
         (!q || v.token.toLowerCase().includes(q) || v.originalRaw.toLowerCase().includes(q)),
     );
   }, [vault, query, category, secretsOnly]);
-  const visible = rows.slice(0, ROW_LIMIT);
+  const visible = useMemo(() => rows.slice(0, ROW_LIMIT), [rows]);
   const filtersActive = query || category !== 'all' || secretsOnly;
 
-  const toggle = (token: string) =>
-    setRevealed((prev) => {
-      const next = new Set(prev);
-      if (!next.delete(token)) next.add(token);
-      return next;
-    });
+  const toggle = useCallback(
+    (token: string) =>
+      setRevealed((prev) => {
+        const next = new Set(prev);
+        if (!next.delete(token)) next.add(token);
+        return next;
+      }),
+    [],
+  );
 
   const clear = async () => {
     setClearing(true);

@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useMemo, type ReactNode } from 'react';
 import { ArrowRight, Check, Minus, ArrowsLeftRight, Plugs } from '@phosphor-icons/react';
 import { useStore } from '../store';
 import { Badge, Button, CopyButton, EmptyState, Panel, Skeleton, cx } from '../components/ui';
@@ -14,6 +14,7 @@ import {
   formatLatency,
   proxyBase,
 } from '../lib/format';
+import type { HarnessKind, HarnessProfile, TrafficSummary } from '../types';
 import { SeverityBadge } from './Traffic';
 
 function Metric({ label, value, hint, tone }: { label: string; value: number | undefined; hint: string; tone?: 'brand' | 'warn' }) {
@@ -54,12 +55,34 @@ function ProtectionRow({ on, label, detail }: { on: boolean; label: string; deta
 
 export function Overview() {
   const { status, config, logs, harnesses, navigate, openSimulator } = useStore();
-  const live = logs.filter((l) => !l.simulated);
-  const recent = logs.slice(0, 8);
+  const { liveCount, recent, liveByHarness, profileByKind } = useMemo(() => {
+    const byHarness = new Map<HarnessKind, { count: number; latest?: TrafficSummary }>();
+    let count = 0;
+    for (const l of logs) {
+      if (l.simulated) continue;
+      count += 1;
+      const entry = byHarness.get(l.harness);
+      if (entry) {
+        entry.count += 1;
+      } else {
+        byHarness.set(l.harness, { count: 1, latest: l });
+      }
+    }
+    const profiles = new Map<HarnessKind, HarnessProfile>();
+    for (const h of harnesses) {
+      profiles.set(h.kind, h);
+    }
+    return {
+      liveCount: count,
+      recent: logs.slice(0, 8),
+      liveByHarness: byHarness,
+      profileByKind: profiles,
+    };
+  }, [logs, harnesses]);
   const base = config ? proxyBase(config.proxyPort) : null;
-  const protecting = config && config.mode !== 'audit-only';
+  const protecting = Boolean(config && config.mode !== 'audit-only');
   const telemetryBlocked =
-    !!protecting && (config.blockSilentTelemetry || (config.mode === 'all-hide' && config.allHide.enableTelemetryChaff));
+    Boolean(protecting && config && (config.blockSilentTelemetry || (config.mode === 'all-hide' && config.allHide.enableTelemetryChaff)));
 
   return (
     <div className="mx-auto max-w-[1360px] space-y-5 p-6">
@@ -75,7 +98,7 @@ export function Overview() {
       <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_380px]">
         <Panel
           title="最近流量"
-          description={`窗口内 ${live.length} 条真实请求，${logs.length - live.length} 条模拟`}
+          description={`窗口内 ${liveCount} 条真实请求，${logs.length - liveCount} 条模拟`}
           actions={
             <Button size="sm" variant="ghost" onClick={() => navigate('traffic')}>
               全部流量 <ArrowRight aria-hidden="true" size={13} />
@@ -159,11 +182,11 @@ export function Overview() {
         >
           {config ? (
             <ul className="divide-y divide-line">
-              <ProtectionRow on={protecting && config.protectSecretsAndKeys ? true : false} label="凭据与密钥" detail="API Key、私钥、数据库连接串、配置文件中的密码" />
-              <ProtectionRow on={protecting && config.protectProjectPaths ? true : false} label="本机路径与身份" detail="用户目录、邮箱；目录结构保持不变" />
-              <ProtectionRow on={protecting && config.protectInternalNetwork ? true : false} label="内网地址与域名" detail="RFC 1918 地址、.internal / .corp 等域名" />
+              <ProtectionRow on={protecting && config.protectSecretsAndKeys} label="凭据与密钥" detail="API Key、私钥、数据库连接串、配置文件中的密码" />
+              <ProtectionRow on={protecting && config.protectProjectPaths} label="本机路径与身份" detail="用户目录、邮箱；目录结构保持不变" />
+              <ProtectionRow on={protecting && config.protectInternalNetwork} label="内网地址与域名" detail="RFC 1918 地址、.internal / .corp 等域名" />
               <ProtectionRow on={telemetryBlocked} label="静默遥测" detail="遥测端点在本地应答，推理请求永不拦截" />
-              <ProtectionRow on={!!protecting} label="工具调用中的凭据" detail={POLICY_LABEL[config.toolCallSecretPolicy]} />
+              <ProtectionRow on={protecting} label="工具调用中的凭据" detail={POLICY_LABEL[config.toolCallSecretPolicy]} />
               <ProtectionRow
                 on={config.mode === 'all-hide'}
                 label="All-Hide 代码伪装"
@@ -184,8 +207,10 @@ export function Overview() {
         <Panel title="工具活跃度" description="最近 200 条">
           <ul className="grid grid-cols-2 gap-px bg-line lg:grid-cols-4">
             {HARNESS_ORDER.map((kind) => {
-              const rows = live.filter((l) => l.harness === kind);
-              const profile = harnesses.find((h) => h.kind === kind);
+              const summary = liveByHarness.get(kind);
+              const count = summary?.count ?? 0;
+              const latest = summary?.latest;
+              const profile = profileByKind.get(kind);
               return (
                 <li key={kind} className="bg-surface">
                   <button
@@ -194,12 +219,12 @@ export function Overview() {
                     className="block w-full cursor-pointer px-4 py-3 text-left transition-colors hover:bg-surface-2"
                   >
                     <div className="flex items-center gap-2">
-                      <span aria-hidden="true" className={cx('h-1.5 w-1.5 rounded-full', rows.length ? 'bg-brand' : 'bg-line-strong')} />
+                      <span aria-hidden="true" className={cx('h-1.5 w-1.5 rounded-full', count ? 'bg-brand' : 'bg-line-strong')} />
                       <span className="truncate text-sm text-fg">{HARNESS_LABEL[kind]}</span>
                     </div>
-                    <p className="tabular mt-1 font-mono text-lg font-semibold text-fg">{rows.length}</p>
+                    <p className="tabular mt-1 font-mono text-lg font-semibold text-fg">{count}</p>
                     <p className="truncate text-2xs text-fg-subtle">
-                      {rows[0] ? `${rows[0].timestamp.slice(0, 8)} · ${CATEGORY_LABEL[rows[0].category]}` : profile ? '暂无流量' : '—'}
+                      {latest ? `${latest.timestamp.slice(0, 8)} · ${CATEGORY_LABEL[latest.category]}` : profile ? '暂无流量' : '—'}
                     </p>
                   </button>
                 </li>

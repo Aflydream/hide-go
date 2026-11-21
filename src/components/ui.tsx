@@ -5,6 +5,7 @@ import {
   useContext,
   useEffect,
   useId,
+  useMemo,
   useRef,
   useState,
   type ButtonHTMLAttributes,
@@ -306,16 +307,28 @@ export function Skeleton({ className }: { className?: string }) {
 
 export function CopyButton({ text, label = '复制', compact }: { text: string; label?: string; compact?: boolean }) {
   const [copied, setCopied] = useState(false);
+  const timerRef = useRef<number | undefined>(undefined);
   const toast = useToast();
-  const copy = async () => {
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current !== undefined) window.clearTimeout(timerRef.current);
+    };
+  }, []);
+
+  const copy = useCallback(async () => {
     try {
       await navigator.clipboard.writeText(text);
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
+      if (timerRef.current !== undefined) window.clearTimeout(timerRef.current);
+      timerRef.current = window.setTimeout(() => {
+        timerRef.current = undefined;
+        setCopied(false);
+      }, 1500);
     } catch {
       toast.push({ tone: 'danger', title: '复制失败', body: '浏览器拒绝了剪贴板访问' });
     }
-  };
+  }, [text, toast]);
   const icon = copied ? <Check size={14} weight="bold" /> : <Copy size={14} />;
   if (compact) return <IconButton label={copied ? '已复制' : label} icon={icon} onClick={copy} />;
   return (
@@ -538,17 +551,42 @@ export function useToast() {
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<ToastItem[]>([]);
   const seq = useRef(0);
-  const dismiss = useCallback((id: number) => setItems((all) => all.filter((t) => t.id !== id)), []);
+  const timersRef = useRef<Map<number, number>>(new Map());
+
+  useEffect(() => {
+    const timers = timersRef.current;
+    return () => {
+      timers.forEach((tid) => window.clearTimeout(tid));
+      timers.clear();
+    };
+  }, []);
+
+  const dismiss = useCallback((id: number) => {
+    const tid = timersRef.current.get(id);
+    if (tid !== undefined) {
+      window.clearTimeout(tid);
+      timersRef.current.delete(id);
+    }
+    setItems((all) => all.filter((t) => t.id !== id));
+  }, []);
+
   const push = useCallback(
     (t: Omit<ToastItem, 'id'>) => {
       const id = ++seq.current;
       setItems((all) => [...all.slice(-3), { ...t, id }]);
-      window.setTimeout(() => dismiss(id), t.tone === 'danger' ? 7000 : 3500);
+      const tid = window.setTimeout(() => {
+        timersRef.current.delete(id);
+        dismiss(id);
+      }, t.tone === 'danger' ? 7000 : 3500);
+      timersRef.current.set(id, tid);
     },
     [dismiss],
   );
+
+  const ctxValue = useMemo(() => ({ push }), [push]);
+
   return (
-    <ToastContext.Provider value={{ push }}>
+    <ToastContext.Provider value={ctxValue}>
       {children}
       <div className="pointer-events-none fixed bottom-4 right-4 z-[60] flex w-80 flex-col gap-2">
         {items.map((t) => {

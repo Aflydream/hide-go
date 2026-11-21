@@ -10,23 +10,33 @@ export function usePoll<T>(fetcher: () => Promise<T>, intervalMs: number, enable
   const [error, setError] = useState<Error | null>(null);
   const [loading, setLoading] = useState(true);
   const inFlight = useRef<Promise<T> | null>(null);
+  const mountedRef = useRef(true);
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const refresh = useCallback(async () => {
     if (inFlight.current) return inFlight.current;
     const p = (async () => {
       try {
         const next = await fetcherRef.current();
-        setData(next);
-        setError(null);
+        if (mountedRef.current) {
+          setData(next);
+          setError(null);
+        }
         return next;
       } catch (e) {
-        setError(e as Error);
+        if (mountedRef.current) setError(e as Error);
         throw e;
       } finally {
         inFlight.current = null;
-        setLoading(false);
+        if (mountedRef.current) setLoading(false);
       }
     })();
     inFlight.current = p;
@@ -56,20 +66,21 @@ export function usePoll<T>(fetcher: () => Promise<T>, intervalMs: number, enable
 export type Route = 'overview' | 'traffic' | 'policy' | 'integrations' | 'vault' | 'rules';
 const ROUTES: Route[] = ['overview', 'traffic', 'policy', 'integrations', 'vault', 'rules'];
 
+function parseHashRoute() {
+  const [path, query = ''] = window.location.hash.replace(/^#\/?/, '').split('?');
+  const route = (ROUTES.includes(path as Route) ? path : 'overview') as Route;
+  return { route, params: new URLSearchParams(query) };
+}
+
 /** Hash routing: `#/traffic?id=…`. Survives reloads, needs no server routes. */
 export function useRoute() {
-  const parse = () => {
-    const [path, query = ''] = window.location.hash.replace(/^#\/?/, '').split('?');
-    const route = (ROUTES.includes(path as Route) ? path : 'overview') as Route;
-    return { route, params: new URLSearchParams(query) };
-  };
-  const [state, setState] = useState(parse);
+  const [state, setState] = useState(parseHashRoute);
   const routeRef = useRef(state.route);
   routeRef.current = state.route;
 
   useEffect(() => {
     const onHash = () => {
-      const next = parse();
+      const next = parseHashRoute();
       const routeChanged = next.route !== routeRef.current;
       const focusHeading = () => document.getElementById('view-title')?.focus({ preventScroll: true });
 

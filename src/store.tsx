@@ -27,6 +27,9 @@ interface Store {
 }
 
 const StoreContext = createContext<Store | null>(null);
+const EMPTY_LOGS: TrafficSummary[] = [];
+const EMPTY_HARNESSES: HarnessProfile[] = [];
+const EMPTY_VAULT: VaultEntry[] = [];
 
 export function useStore(): Store {
   const s = useContext(StoreContext);
@@ -43,6 +46,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const saveSeq = useRef(0);
   const confirmedConfigRef = useRef<HideConfig | null>(null);
 
+  const openSimulator = useCallback(() => setSimulatorOpen(true), []);
+  const closeSimulator = useCallback(() => setSimulatorOpen(false), []);
+
   const status = usePoll(api.status, 2500);
   const logs = usePoll(api.logs, 2500);
   const harnesses = usePoll(api.harnesses, 8000);
@@ -52,6 +58,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // Config is loaded once and after each save; it is not polled, so edits are never overwritten.
   useEffect(() => {
     let cancelled = false;
+    let timerId: number | undefined;
     const load = () =>
       api
         .config()
@@ -60,10 +67,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           confirmedConfigRef.current = c;
           setConfig(c);
         })
-        .catch(() => !cancelled && window.setTimeout(load, 2000));
+        .catch(() => {
+          if (!cancelled) {
+            timerId = window.setTimeout(load, 2000);
+          }
+        });
     load();
     return () => {
       cancelled = true;
+      if (timerId !== undefined) window.clearTimeout(timerId);
     };
   }, []);
 
@@ -96,22 +108,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       saving,
       status: status.data,
       statusError: status.error,
-      logs: logs.data ?? [],
+      logs: logs.data ?? EMPTY_LOGS,
       logsLoading: logs.loading,
       refreshLogs: logs.refresh,
-      harnesses: harnesses.data ?? [],
+      harnesses: harnesses.data ?? EMPTY_HARNESSES,
       refreshHarnesses: harnesses.refresh,
-      vault: vault.data ?? [],
+      vault: vault.data ?? EMPTY_VAULT,
       vaultLoading: vault.loading,
       refreshVault: vault.refresh,
       route,
       params,
       navigate,
-      openSimulator: () => setSimulatorOpen(true),
+      openSimulator,
       simulatorOpen,
-      closeSimulator: () => setSimulatorOpen(false),
+      closeSimulator,
     }),
-    [config, saveConfig, saving, status.data, status.error, logs.data, logs.loading, logs.refresh, harnesses.data, harnesses.refresh, vault.data, vault.loading, vault.refresh, route, params, navigate, simulatorOpen],
+    [config, saveConfig, saving, status.data, status.error, logs.data, logs.loading, logs.refresh, harnesses.data, harnesses.refresh, vault.data, vault.loading, vault.refresh, route, params, navigate, openSimulator, simulatorOpen, closeSimulator],
   );
 
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;

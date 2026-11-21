@@ -258,7 +258,7 @@ pub fn validate_install_dir(dir: &Path) -> Result<(), String> {
     }
 
     for blocked in &blocked_exact {
-        if same_dir(&norm, &normalize_path_lexical(blocked)) {
+        if same_path(&norm, &normalize_path_lexical(blocked)) {
             return Err(format!("拒绝使用系统或用户关键目录作为安装目录: {}", norm.display()));
         }
     }
@@ -380,7 +380,7 @@ pub fn detect_existing_install() -> Option<InstallManifest> {
     let mut candidates = vec![default_dir];
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            if manifest_path(parent).is_file() && !candidates.iter().any(|c| same_dir(c, parent)) {
+            if manifest_path(parent).is_file() && !candidates.iter().any(|c| same_path(c, parent)) {
                 candidates.push(parent.to_path_buf());
             }
         }
@@ -399,7 +399,7 @@ pub fn detect_existing_install() -> Option<InstallManifest> {
     None
 }
 
-fn same_dir(a: &Path, b: &Path) -> bool {
+pub fn same_path(a: &Path, b: &Path) -> bool {
     let norm = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let na = norm(a);
     let nb = norm(b);
@@ -756,7 +756,7 @@ fn is_allowed_shortcut_path(p: &Path) -> bool {
     #[cfg(target_os = "macos")]
     {
         home_dir()
-            .map(|h| same_dir(&norm, &normalize_path_lexical(&h.join("Applications/Hide-Go.app"))))
+            .map(|h| same_path(&norm, &normalize_path_lexical(&h.join("Applications/Hide-Go.app"))))
             .unwrap_or(false)
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
@@ -769,7 +769,7 @@ fn is_allowed_shortcut_path(p: &Path) -> bool {
             home.join(".local/share/icons/hicolor/128x128/apps/hide-go.png"),
             home.join(".config/autostart/hide-go-daemon.desktop"),
         ];
-        allowed.iter().any(|a| same_dir(&norm, &normalize_path_lexical(a)))
+        allowed.iter().any(|a| same_path(&norm, &normalize_path_lexical(a)))
     }
 }
 
@@ -945,20 +945,6 @@ pub fn configured_proxy_port(config_path: Option<&Path>) -> u16 {
         .unwrap_or_else(|| HideConfig::default().proxy_port)
 }
 
-fn same_file(a: &Path, b: &Path) -> bool {
-    let norm = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let na = norm(a);
-    let nb = norm(b);
-    #[cfg(windows)]
-    {
-        na.to_string_lossy().eq_ignore_ascii_case(&nb.to_string_lossy())
-    }
-    #[cfg(not(windows))]
-    {
-        na == nb
-    }
-}
-
 pub fn perform_install(opts: &InstallOptions, payloads: &EmbeddedPayloads<'_>) -> InstallOutcome {
     perform_install_with(opts, payloads, &RealSystemOps, HideConfig::default_path().as_deref())
 }
@@ -1052,7 +1038,7 @@ pub fn perform_install_with(
         .and_then(|_| atomic_write_bytes(&icon_png, payloads.icon_png, false))
         .and_then(|_| {
             let self_exe = std::env::current_exe().map_err(|e| format!("定位当前安装器路径失败: {e}"))?;
-            if !same_file(&self_exe, &uninstall_dest) {
+            if !same_path(&self_exe, &uninstall_dest) {
                 atomic_copy_file(&self_exe, &uninstall_dest, true)
                     .map_err(|e| format!("写入卸载程序 {} 失败: {e}", uninstall_dest.display()))?;
             }
@@ -1298,7 +1284,7 @@ pub fn perform_uninstall_with(
         std::fs::read_to_string(&mp)
             .ok()
             .and_then(|raw| serde_json::from_str::<InstallManifest>(&raw).ok())
-            .filter(|m| !m.install_dir.trim().is_empty() && same_dir(Path::new(&m.install_dir), &install_dir))
+            .filter(|m| !m.install_dir.trim().is_empty() && same_path(Path::new(&m.install_dir), &install_dir))
     } else {
         None
     };
@@ -1345,7 +1331,7 @@ pub fn perform_uninstall_with(
     let mut file_errors = Vec::new();
     let running_from_install_dir = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|parent| same_dir(parent, &install_dir)))
+        .and_then(|exe| exe.parent().map(|parent| same_path(parent, &install_dir)))
         .unwrap_or(false);
     let mut pending_cleanup_dir = None;
 
@@ -1522,7 +1508,7 @@ pub fn schedule_self_cleanup(install_dir: &Path) {
     let valid = std::fs::read_to_string(&mp)
         .ok()
         .and_then(|raw| serde_json::from_str::<InstallManifest>(&raw).ok())
-        .is_some_and(|m| !m.install_dir.trim().is_empty() && same_dir(Path::new(&m.install_dir), install_dir));
+        .is_some_and(|m| !m.install_dir.trim().is_empty() && same_path(Path::new(&m.install_dir), install_dir));
     if !valid {
         return;
     }
@@ -1855,11 +1841,11 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn same_dir_is_case_insensitive_on_windows() {
+    fn same_path_is_case_insensitive_on_windows() {
         let tmp = TempDir::new();
         let upper = tmp.path().to_string_lossy().to_uppercase();
         let lower = tmp.path().to_string_lossy().to_lowercase();
-        assert!(same_dir(Path::new(&upper), Path::new(&lower)));
+        assert!(same_path(Path::new(&upper), Path::new(&lower)));
     }
 
     #[test]

@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { ArrowsClockwise, ArrowRight, CheckCircle, DownloadSimple, LinkBreak, LinkSimple, Play, ShieldCheck, Terminal } from '@phosphor-icons/react';
 import { useStore } from '../store';
 import { api } from '../lib/api';
 import { Badge, Button, Callout, CopyButton, Segmented, Skeleton, cx, useToast } from '../components/ui';
 import { formatCount, proxyBase } from '../lib/format';
-import type { CaStatus, HarnessProfile } from '../types';
+import type { CaStatus, HarnessKind, HarnessProfile } from '../types';
 import { useSimulate } from './SimulateDialog';
 
 type Shell = 'bash' | 'powershell';
@@ -510,6 +510,24 @@ export function Integrations() {
     await Promise.all([refreshHarnesses(), refreshCaStatus()]);
   }, [refreshHarnesses, refreshCaStatus]);
 
+  const liveCounts = useMemo(() => {
+    const counts = new Map<HarnessKind, number>();
+    for (const l of logs) {
+      if (!l.simulated) counts.set(l.harness, (counts.get(l.harness) ?? 0) + 1);
+    }
+    return counts;
+  }, [logs]);
+
+  const { installedCount, configuredCount } = useMemo(() => {
+    let installed = 0;
+    let configured = 0;
+    for (const h of harnesses) {
+      if (h.installed) installed += 1;
+      if (h.configured) configured += 1;
+    }
+    return { installedCount: installed, configuredCount: configured };
+  }, [harnesses]);
+
   if (!selected || !config) {
     return (
       <div className="grid h-full min-h-0 grid-cols-[280px_minmax(0,1fr)]" aria-busy="true">
@@ -526,10 +544,6 @@ export function Integrations() {
       </div>
     );
   }
-
-  const liveCount = (kind: HarnessProfile['kind']) => logs.filter((l) => l.harness === kind && !l.simulated).length;
-  const installedCount = harnesses.filter((h) => h.installed).length;
-  const configuredCount = harnesses.filter((h) => h.configured).length;
 
   const handleScan = async () => {
     setScanning(true);
@@ -696,7 +710,7 @@ export function Integrations() {
           key={selected.kind}
           profile={selected}
           port={config.proxyPort}
-          liveCount={liveCount(selected.kind)}
+          liveCount={liveCounts.get(selected.kind) ?? 0}
           shell={shell}
           caStatus={caStatus}
           caBusy={caBusy}
