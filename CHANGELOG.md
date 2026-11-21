@@ -2,6 +2,13 @@
 
 All notable changes to Hide-Go are documented in this file.
 
+## [0.2.2] - 2026-11-21
+
+### Changed
+- Split `Hide-Go-Setup` into compressed platform archives (`.zip` on Windows, `.tar.gz` on macOS and Linux) with separate `payload/` binaries verified via `payload-manifest.json` SHA-256 digests instead of embedding `hide-go-desktop` and `hide-go-daemon` inside a single executable
+- Publish Setup archives only on GitHub Releases rather than attaching separate standalone desktop binaries
+- Strip symbols and enable thin LTO in release builds (`[profile.release]`), and drop unused `cdylib`/`staticlib` outputs from `hide-go-desktop`
+
 ## [0.2.1] - 2026-11-21
 
 ### Added
