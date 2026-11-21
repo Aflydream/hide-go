@@ -81,13 +81,7 @@ jobs:
       - name: Build shared runtime libraries and launchers
         run: cargo build --release --locked -p hide-chrome -p hide-engine -p hide-go-desktop -p hide-daemon -p hide-setup --target ${{ matrix.target }}
       - name: Package setup archive and checksum
-        run: |
-          node scripts/package-setup.mjs \
-            --target "${{ matrix.target }}" \
-            --os "${{ matrix.pkg_os }}" \
-            --package-dir "${{ matrix.package_dir }}" \
-            --archive "${{ matrix.archive_name }}" \
-            --format "${{ matrix.archive_format }}"
+        run: node scripts/package-setup.mjs --target "${{ matrix.target }}" --os "${{ matrix.pkg_os }}" --package-dir "${{ matrix.package_dir }}" --archive "${{ matrix.archive_name }}" --format "${{ matrix.archive_format }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.package_dir }}
