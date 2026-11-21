@@ -2,6 +2,19 @@
 
 All notable changes to Hide-Go are documented in this file.
 
+## [0.2.3] - 2026-11-21
+
+### Added
+- Separate Desktop shortcut and Start Menu / Applications menu toggles in `Hide-Go-Setup`, along with `--no-desktop-shortcut` and `--no-start-menu` CLI flags
+
+### Changed
+- Split the application into shared dynamic libraries (`hide_engine` and `hide_chrome`), thin native launcher binaries, and an external `resources/` directory (`ui/`, `setup/`, `locales/`, `icons/`) instead of standalone executables
+- Pack desktop binaries and UI assets into a SHA-256 verified `data/app.tar.gz` archive inside the Setup package, reducing the Windows installer archive to ~5.8 MB
+- Record installed paths in `install-manifest.json` so uninstall removes shared libraries and empty `resources/` directories without touching unrelated files
+
+### Fixed
+- Display the Hide-Go icon on the Windows taskbar and Alt+Tab switcher instead of the default system window icon, and write explicit `,0` icon indices for `.lnk` shortcuts
+
 ## [0.2.2] - 2026-11-21
 
 ### Changed
