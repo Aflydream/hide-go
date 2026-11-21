@@ -2,6 +2,18 @@
 
 All notable changes to Hide-Go are documented in this file.
 
+## [0.2.1] - 2026-11-21
+
+### Added
+- Bilingual interface support (`zh-CN` and `en`) backed by externalized locale files (`src/locales/*.json`) across the desktop console and `hide-go-setup` installer/uninstaller
+- Automatic OS system language detection on Windows, macOS, and Linux, defaulting to English for non-Chinese locales
+- Console **Settings** view for switching language (`system`, `zh-CN`, `en`), choosing light/dark appearance, and viewing gateway version, listen address, and config path
+- Installer language selector and localized native window/folder-picker titles, persisting the chosen `language` to `config.json` for the desktop app
+
+### Changed
+- Memoized frontend log/harness aggregations and added timer and unmount cleanup across polling hooks, toasts, and copy buttons
+- Deduplicated canonical path comparisons in `hide-setup` into a shared `same_path` helper
+
 ## [0.2.0] - 2026-11-20
 
 ### Added

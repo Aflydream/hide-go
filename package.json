@@ -1,7 +1,7 @@
 {
   "name": "hide-go",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Hide-Go desktop console UI",
   "type": "module",
   "scripts": {
