@@ -70,9 +70,28 @@ export interface HideConfig {
 
 export type HostRiskKind = 'telemetry' | 'upload-storage' | 'ai-api' | 'general';
 
+export type RequestPurpose =
+  | 'chat-inference'
+  | 'tool-result-sync'
+  | 'inline-completion'
+  | 'token-count'
+  | 'codebase-indexing'
+  | 'file-upload'
+  | 'telemetry'
+  | 'feature-flags'
+  | 'crash-report'
+  | 'model-catalog'
+  | 'auth-account'
+  | 'realtime-sync'
+  | 'update-extension'
+  | 'other-api';
+
 export type AuditSignalKind =
   | 'telemetry-endpoint'
   | 'telemetry-payload'
+  | 'telemetry-header'
+  | 'feature-flag-tracking'
+  | 'crash-diagnostics'
   | 'archive-upload'
   | 'bulk-codebase-upload'
   | 'large-outbound-payload'
@@ -95,6 +114,7 @@ export interface HarnessAuditSummary {
   outboundBytes: number;
   telemetryHosts: string[];
   uploadHosts: string[];
+  purposeCounts?: Partial<Record<RequestPurpose, number>>;
 }
 
 export interface ObservedConnectHost {
@@ -103,6 +123,7 @@ export interface ObservedConnectHost {
   mitm: boolean;
   tlsFailed: boolean;
   riskKind?: HostRiskKind;
+  purpose?: RequestPurpose;
   count: number;
   lastSeenAt: string;
 }
@@ -130,6 +151,8 @@ export interface TrafficSummary {
   timestamp: string;
   harness: HarnessKind;
   category: TrafficCategory;
+  purpose?: RequestPurpose;
+  purposeDetail?: string;
   method: string;
   endpoint: string;
   appliedMode: PrivacyMode;
@@ -151,6 +174,8 @@ export interface TrafficAuditRecord {
   timestamp: string;
   harness: HarnessKind;
   category: TrafficCategory;
+  purpose?: RequestPurpose;
+  purposeDetail?: string;
   method: string;
   endpoint: string;
   upstreamVendor: string;

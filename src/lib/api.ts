@@ -89,14 +89,50 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (await res.json()) as T;
 }
 
+export const NOT_MODIFIED = Symbol('NOT_MODIFIED');
+
+const etagCache = new Map<string, string>();
+
+async function conditionalRequest<T>(path: string): Promise<T | typeof NOT_MODIFIED> {
+  const headers = new Headers();
+  if (token) headers.set('X-Hide-Go-Token', token);
+  const prevEtag = etagCache.get(path);
+  if (prevEtag) headers.set('If-None-Match', prevEtag);
+  let res: Response;
+  try {
+    res = await fetch(path, { headers, credentials: 'omit', cache: 'no-store' });
+  } catch {
+    throw new ApiError(0, translate(getActiveLocale(), 'api.unreachable'));
+  }
+  if (res.status === 304) return NOT_MODIFIED;
+  if (!res.ok) {
+    let message = `HTTP ${res.status}`;
+    try {
+      const body = await res.json();
+      message = body.message ?? body.error ?? message;
+    } catch {
+      /* non-JSON error body */
+    }
+    if (res.status === 401) message = translate(getActiveLocale(), 'api.invalidToken');
+    throw new ApiError(res.status, message);
+  }
+  const nextEtag = res.headers.get('ETag');
+  if (nextEtag) etagCache.set(path, nextEtag);
+  return (await res.json()) as T;
+}
+
 export const api = {
   hasToken: () => token.length > 0,
   status: () => request<GatewayStatus>('/api/status'),
   config: () => request<HideConfig>('/api/config'),
   saveConfig: (cfg: HideConfig) => request<HideConfig>('/api/config', { method: 'POST', body: JSON.stringify(cfg) }),
   logs: () => request<TrafficSummary[]>('/api/logs'),
+  logsIfChanged: () => conditionalRequest<TrafficSummary[]>('/api/logs'),
   log: (id: string) => request<TrafficAuditRecord>(`/api/logs/${encodeURIComponent(id)}`),
-  clearLogs: () => request<void>('/api/logs', { method: 'DELETE' }),
+  clearLogs: async () => {
+    etagCache.delete('/api/logs');
+    await request<void>('/api/logs', { method: 'DELETE' });
+  },
   harnesses: () => request<HarnessProfile[]>('/api/harnesses'),
   connectHarness: (kind: HarnessKind) =>
     request<HarnessActionResult>(`/api/harnesses/${encodeURIComponent(kind)}/connect`, { method: 'POST' }),
@@ -112,7 +148,11 @@ export const api = {
   },
   getMitmHosts: () => request<MitmHostsResponse>('/api/mitm/hosts'),
   vault: () => request<VaultEntry[]>('/api/vault'),
-  clearVault: () => request<void>('/api/vault', { method: 'DELETE' }),
+  vaultIfChanged: () => conditionalRequest<VaultEntry[]>('/api/vault'),
+  clearVault: async () => {
+    etagCache.delete('/api/vault');
+    await request<void>('/api/vault', { method: 'DELETE' });
+  },
   simulate: (harness: HarnessKind, category: TrafficCategory, customPayload?: string) =>
     request<TrafficAuditRecord>('/api/simulate', {
       method: 'POST',

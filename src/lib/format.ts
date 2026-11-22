@@ -1,7 +1,33 @@
-import type { AuditSignalKind, CoverTheme, FindingKind, HarnessKind, PrivacyMode, Severity, ToolCallSecretPolicy, TrafficCategory } from '../types';
+import type {
+  AuditSignalKind,
+  CoverTheme,
+  FindingKind,
+  HarnessKind,
+  PrivacyMode,
+  RequestPurpose,
+  Severity,
+  ToolCallSecretPolicy,
+  TrafficCategory,
+} from '../types';
 import { LOCALE_META, translate, type Locale, type MessageKey } from './i18n';
 
 export const HARNESS_ORDER: HarnessKind[] = ['claude-code', 'codex', 'antigravity', 'zcode', 'qoder', 'cursor', 'grok-build'];
+export const PURPOSE_ORDER: RequestPurpose[] = [
+  'chat-inference',
+  'tool-result-sync',
+  'inline-completion',
+  'token-count',
+  'codebase-indexing',
+  'file-upload',
+  'telemetry',
+  'feature-flags',
+  'crash-report',
+  'model-catalog',
+  'auth-account',
+  'realtime-sync',
+  'update-extension',
+  'other-api',
+];
 export const COVER_THEMES: CoverTheme[] = ['botanical-garden', 'library-catalog', 'bakery-recipe'];
 export const SEVERITY_RANK: Record<Severity, number> = { critical: 4, high: 3, medium: 2, low: 1 };
 
@@ -115,6 +141,9 @@ export function getSeverityLabel(severity: Severity, locale: Locale): string {
 const AUDIT_SIGNAL_KEYS: Record<AuditSignalKind, MessageKey> = {
   'telemetry-endpoint': 'auditSignal.telemetryEndpoint',
   'telemetry-payload': 'auditSignal.telemetryPayload',
+  'telemetry-header': 'auditSignal.telemetryHeader',
+  'feature-flag-tracking': 'auditSignal.featureFlagTracking',
+  'crash-diagnostics': 'auditSignal.crashDiagnostics',
   'archive-upload': 'auditSignal.archiveUpload',
   'bulk-codebase-upload': 'auditSignal.bulkCodebaseUpload',
   'large-outbound-payload': 'auditSignal.largeOutboundPayload',
@@ -123,6 +152,51 @@ const AUDIT_SIGNAL_KEYS: Record<AuditSignalKind, MessageKey> = {
 
 export function getAuditSignalLabel(kind: AuditSignalKind, locale: Locale): string {
   return AUDIT_SIGNAL_KEYS[kind] ? translate(locale, AUDIT_SIGNAL_KEYS[kind]) : kind;
+}
+
+const PURPOSE_KEYS: Record<RequestPurpose, MessageKey> = {
+  'chat-inference': 'purpose.chat-inference',
+  'tool-result-sync': 'purpose.tool-result-sync',
+  'inline-completion': 'purpose.inline-completion',
+  'token-count': 'purpose.token-count',
+  'codebase-indexing': 'purpose.codebase-indexing',
+  'file-upload': 'purpose.file-upload',
+  telemetry: 'purpose.telemetry',
+  'feature-flags': 'purpose.feature-flags',
+  'crash-report': 'purpose.crash-report',
+  'model-catalog': 'purpose.model-catalog',
+  'auth-account': 'purpose.auth-account',
+  'realtime-sync': 'purpose.realtime-sync',
+  'update-extension': 'purpose.update-extension',
+  'other-api': 'purpose.other-api',
+};
+
+export function getPurposeLabel(purpose: RequestPurpose | undefined, locale: Locale, fallbackCategory?: TrafficCategory): string {
+  if (purpose && PURPOSE_KEYS[purpose]) {
+    return translate(locale, PURPOSE_KEYS[purpose]);
+  }
+  return fallbackCategory ? getCategoryLabel(fallbackCategory, locale) : translate(locale, 'purpose.other-api');
+}
+
+export function getPurposeTone(purpose: RequestPurpose | undefined): 'brand' | 'warn' | 'danger' | 'info' | 'neutral' {
+  switch (purpose) {
+    case 'telemetry':
+    case 'crash-report':
+    case 'codebase-indexing':
+    case 'file-upload':
+      return 'warn';
+    case 'feature-flags':
+    case 'realtime-sync':
+    case 'token-count':
+    case 'model-catalog':
+      return 'info';
+    case 'chat-inference':
+    case 'tool-result-sync':
+    case 'inline-completion':
+      return 'brand';
+    default:
+      return 'neutral';
+  }
 }
 
 /** Human description of what the gateway did with a request. */
@@ -210,12 +284,16 @@ export function prettyJson(text: string): string {
 }
 
 /**
- * Assemble clean human-readable text from an SSE response stream (OpenAI Chat / Responses,
- * Anthropic Messages, Gemini, and Google Cloud Code wrapped `response.candidates`).
- * Returns `null` when the payload is not an SSE stream with extractable text deltas.
+ * Assemble clean human-readable text from a streaming SSE or NDJSON/JSONL response
+ * (OpenAI Chat / Responses, Anthropic Messages, Gemini / Google Cloud Code, and Ollama).
+ * Returns `null` when the payload is not a stream with extractable text deltas.
  */
 export function extractSseReadableText(text: string): string | null {
-  if (!text || (!text.includes('data: {') && !text.includes('data:{'))) {
+  if (!text) return null;
+  const isSse = text.includes('data: {') || text.includes('data:{');
+  const trimmed = text.trim();
+  const isNdjson = !isSse && trimmed.startsWith('{') && trimmed.includes('\n{');
+  if (!isSse && !isNdjson) {
     return null;
   }
   const thoughts: string[] = [];
@@ -224,12 +302,28 @@ export function extractSseReadableText(text: string): string | null {
 
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!line.startsWith('data:')) continue;
-    const payload = line.slice(5).trim();
-    if (!payload || payload === '[DONE]' || !payload.startsWith('{')) continue;
+    if (!line) continue;
+    let payload: string;
+    if (isSse) {
+      if (!line.startsWith('data:')) continue;
+      payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]' || !payload.startsWith('{')) continue;
+    } else {
+      if (!line.startsWith('{')) continue;
+      payload = line;
+    }
     try {
       const obj = JSON.parse(payload) as Record<string, unknown>;
       parsedEvents += 1;
+
+      // Ollama NDJSON (`/api/chat` and `/api/generate`)
+      if (isNdjson) {
+        const msg = obj.message && typeof obj.message === 'object' ? (obj.message as Record<string, unknown>) : null;
+        if (typeof msg?.thinking === 'string' && msg.thinking.length > 0) thoughts.push(msg.thinking);
+        if (typeof msg?.content === 'string' && msg.content.length > 0) reply.push(msg.content);
+        if (typeof obj.response === 'string' && obj.response.length > 0) reply.push(obj.response);
+        continue;
+      }
 
       // OpenAI Chat Completions
       const choices = obj.choices;
@@ -298,6 +392,154 @@ export function extractSseReadableText(text: string): string | null {
     return `[Thinking]\n${thoughtStr}\n\n${replyStr}`;
   }
   return replyStr || `[Thinking]\n${thoughtStr}`;
+}
+
+function formatRoleLabel(role: unknown): string {
+  const r = typeof role === 'string' ? role.toLowerCase() : 'message';
+  if (r === 'user') return 'User';
+  if (r === 'assistant' || r === 'model') return 'Assistant';
+  if (r === 'system' || r === 'developer') return 'System';
+  if (r === 'tool' || r === 'function') return 'Tool';
+  return r.charAt(0).toUpperCase() + r.slice(1);
+}
+
+function collectContentBlocks(content: unknown): string[] {
+  if (typeof content === 'string') return content ? [content] : [];
+  if (!Array.isArray(content)) return [];
+  const out: string[] = [];
+  for (const item of content) {
+    if (typeof item === 'string') {
+      if (item) out.push(item);
+      continue;
+    }
+    if (!item || typeof item !== 'object') continue;
+    const b = item as Record<string, unknown>;
+    const bType = typeof b.type === 'string' ? b.type : '';
+    if (bType === 'thinking' && typeof b.thinking === 'string') {
+      out.push(`[Thinking]\n${b.thinking}`);
+    } else if (typeof b.text === 'string' && b.text) {
+      out.push(b.thought === true ? `[Thinking]\n${b.text}` : b.text);
+    } else if (bType === 'tool_use') {
+      const name = typeof b.name === 'string' ? b.name : 'tool';
+      out.push(`[Tool Call: ${name}]\n${JSON.stringify(b.input ?? {}, null, 2)}`);
+    } else if (bType === 'tool_result') {
+      const inner = typeof b.content === 'string' ? b.content : collectContentBlocks(b.content).join('\n');
+      if (inner) out.push(`[Tool Result]\n${inner}`);
+    } else if (b.functionCall && typeof b.functionCall === 'object') {
+      const fc = b.functionCall as Record<string, unknown>;
+      const name = typeof fc.name === 'string' ? fc.name : 'function';
+      out.push(`[Tool Call: ${name}]\n${JSON.stringify(fc.args ?? {}, null, 2)}`);
+    } else if (b.functionResponse && typeof b.functionResponse === 'object') {
+      const fr = b.functionResponse as Record<string, unknown>;
+      const name = typeof fr.name === 'string' ? fr.name : 'function';
+      out.push(`[Tool Result: ${name}]\n${JSON.stringify(fr.response ?? {}, null, 2)}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Extract readable multi-turn conversation text from an LLM JSON request payload
+ * (OpenAI Chat / Responses, Anthropic Messages, Gemini, and Google Cloud Code).
+ * Places conversation turns first and any long system instruction at the end so prompts are
+ * immediately visible while keeping every token available for highlighting.
+ */
+export function extractRequestReadableText(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{')) return null;
+  let obj: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    obj = parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+
+  const turns: string[] = [];
+  const systemBlocks: string[] = [];
+
+  const innerReq = obj.request && typeof obj.request === 'object' ? (obj.request as Record<string, unknown>) : obj;
+
+  // Gemini / Cloud Code (`contents` + `systemInstruction`)
+  const sysInstr = innerReq.systemInstruction as Record<string, unknown> | undefined;
+  if (sysInstr && typeof sysInstr === 'object' && Array.isArray(sysInstr.parts)) {
+    const sysParts = collectContentBlocks(sysInstr.parts);
+    if (sysParts.length) systemBlocks.push(sysParts.join('\n'));
+  }
+  if (Array.isArray(innerReq.contents)) {
+    for (const entry of innerReq.contents) {
+      if (!entry || typeof entry !== 'object') continue;
+      const e = entry as Record<string, unknown>;
+      const body = collectContentBlocks(e.parts).join('\n\n');
+      if (body) turns.push(`[${formatRoleLabel(e.role)}]\n${body}`);
+    }
+  }
+
+  // Anthropic `system` / OpenAI Responses `instructions`
+  if (typeof obj.instructions === 'string' && obj.instructions.trim()) {
+    systemBlocks.push(obj.instructions);
+  }
+  if (typeof obj.system === 'string' && obj.system.trim()) {
+    systemBlocks.push(obj.system);
+  } else if (Array.isArray(obj.system)) {
+    const sysParts = collectContentBlocks(obj.system);
+    if (sysParts.length) systemBlocks.push(sysParts.join('\n'));
+  }
+
+  // OpenAI Chat / Anthropic Messages (`messages`)
+  if (Array.isArray(obj.messages)) {
+    for (const entry of obj.messages) {
+      if (!entry || typeof entry !== 'object') continue;
+      const e = entry as Record<string, unknown>;
+      const parts = collectContentBlocks(e.content);
+      if (Array.isArray(e.tool_calls)) {
+        for (const tc of e.tool_calls) {
+          const fn = (tc as Record<string, unknown>)?.function as Record<string, unknown> | undefined;
+          if (fn && typeof fn.name === 'string') {
+            parts.push(`[Tool Call: ${fn.name}]\n${typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? {})}`);
+          }
+        }
+      }
+      const body = parts.join('\n\n');
+      if (!body) continue;
+      if (e.role === 'system' || e.role === 'developer') {
+        systemBlocks.push(body);
+      } else {
+        turns.push(`[${formatRoleLabel(e.role)}]\n${body}`);
+      }
+    }
+  }
+
+  // OpenAI Responses API (`input`)
+  if (turns.length === 0 && obj.input !== undefined) {
+    if (typeof obj.input === 'string' && obj.input.trim()) {
+      turns.push(`[User]\n${obj.input}`);
+    } else if (Array.isArray(obj.input)) {
+      for (const item of obj.input) {
+        if (typeof item === 'string' && item.trim()) {
+          turns.push(`[User]\n${item}`);
+          continue;
+        }
+        if (!item || typeof item !== 'object') continue;
+        const it = item as Record<string, unknown>;
+        if (it.type === 'function_call' && typeof it.name === 'string') {
+          turns.push(`[Tool Call: ${it.name}]\n${typeof it.arguments === 'string' ? it.arguments : JSON.stringify(it.arguments ?? {})}`);
+        } else if (it.type === 'function_call_output' && typeof it.output === 'string') {
+          turns.push(`[Tool Result]\n${it.output}`);
+        } else {
+          const body = collectContentBlocks(it.content).join('\n\n');
+          if (body) turns.push(`[${formatRoleLabel(it.role)}]\n${body}`);
+        }
+      }
+    }
+  }
+
+  if (turns.length === 0) return null;
+  if (systemBlocks.length > 0) {
+    turns.push(`[System]\n${systemBlocks.join('\n\n')}`);
+  }
+  return turns.join('\n\n---\n\n');
 }
 
 export function proxyBase(port: number): string {

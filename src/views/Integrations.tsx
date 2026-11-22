@@ -3,7 +3,7 @@ import { ArrowsClockwise, ArrowRight, CheckCircle, DownloadSimple, LinkBreak, Li
 import { useStore } from '../store';
 import { api } from '../lib/api';
 import { Badge, Button, Callout, CopyButton, Segmented, Skeleton, Switch, cx, inputClass, useToast } from '../components/ui';
-import { formatCount, proxyBase } from '../lib/format';
+import { formatCount, getPurposeLabel, getPurposeTone, proxyBase } from '../lib/format';
 import { localizeHarnessIntegrationNote, localizeHarnessTargets, translate, useI18n, type Locale } from '../lib/i18n';
 import type { CaStatus, HarnessKind, HarnessProfile, MitmHostsResponse } from '../types';
 import { useSimulate } from './SimulateDialog';
@@ -71,7 +71,7 @@ function CaTrustCard({
   onAddMitmHost: (host: string) => void;
   onRemoveMitmHost: (host: string) => void;
 }) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const [hostInput, setHostInput] = useState('');
   const extraHosts = mitmHosts?.mitmExtraHosts ?? [];
   const observedHosts = mitmHosts?.observedHosts ?? [];
@@ -267,10 +267,15 @@ function CaTrustCard({
                           className="inline-flex items-center gap-1.5 rounded border border-line bg-surface px-2 py-0.5 text-2xs"
                         >
                           <code className="font-mono text-fg-muted">{item.host}</code>
-                          {item.riskKind === 'telemetry' && (
+                          {item.purpose && item.purpose !== 'other-api' && item.purpose !== 'chat-inference' && (
+                            <Badge tone={getPurposeTone(item.purpose)}>
+                              {getPurposeLabel(item.purpose, locale)}
+                            </Badge>
+                          )}
+                          {item.riskKind === 'telemetry' && !item.purpose && (
                             <Badge tone="warn">{t('integrations.observedTelemetryBadge')}</Badge>
                           )}
-                          {item.riskKind === 'upload-storage' && (
+                          {item.riskKind === 'upload-storage' && !item.purpose && (
                             <Badge tone="warn">{t('integrations.observedUploadBadge')}</Badge>
                           )}
                           {item.tlsFailed ? (

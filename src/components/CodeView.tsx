@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDown, BracketsCurly, TextAlignLeft } from '@phosphor-icons/react';
+import { ArrowDown, BracketsCurly, ChatText, TextAlignLeft } from '@phosphor-icons/react';
 import { CopyButton, IconButton, cx } from './ui';
-import { extractSseReadableText, formatBytes, formatCount, prettyJson } from '../lib/format';
+import { extractRequestReadableText, extractSseReadableText, formatBytes, formatCount, prettyJson } from '../lib/format';
 import { useI18n } from '../lib/i18n';
 
 /** Shapes produced by the gateway, highlighted even when the vault was cleared since. */
@@ -74,6 +74,7 @@ export const CodeView = memo(function CodeView({
   matcher,
   mark = 'token',
   emptyText,
+  focusTerm,
   className,
 }: {
   title: string;
@@ -83,19 +84,23 @@ export const CodeView = memo(function CodeView({
   matcher: RegExp | null;
   mark?: MarkKind;
   emptyText?: string;
+  focusTerm?: { term: string; seq: number } | null;
   className?: string;
 }) {
   const { locale, t } = useI18n();
   const [pretty, setPretty] = useState(true);
   const [sseReadable, setSseReadable] = useState(true);
+  const [dialogueView, setDialogueView] = useState(false);
   const [matchCursor, setMatchCursor] = useState(-1);
   const preRef = useRef<HTMLPreElement>(null);
 
   const sseText = useMemo(() => extractSseReadableText(text), [text]);
+  const requestText = useMemo(() => (sseText === null ? extractRequestReadableText(text) : null), [sseText, text]);
   const display = useMemo(() => {
     if (sseText !== null && sseReadable) return sseText;
+    if (requestText !== null && dialogueView) return requestText;
     return pretty ? prettyJson(text) : text;
-  }, [sseText, sseReadable, pretty, text]);
+  }, [sseText, sseReadable, requestText, dialogueView, pretty, text]);
   const { nodes, hits } = useMemo(() => highlight(display, matcher, mark === 'token' ? 'mark-token' : 'mark-secret'), [display, matcher, mark]);
   const isJson = sseText === null && (display !== text || /^\s*[[{]/.test(text));
   const resolvedEmpty = emptyText ?? t('common.noContent');
@@ -103,6 +108,25 @@ export const CodeView = memo(function CodeView({
   useEffect(() => {
     setMatchCursor(-1);
   }, [display]);
+
+  useEffect(() => {
+    if (!focusTerm?.term) return;
+    const pre = preRef.current;
+    if (!pre) return;
+    const marks = Array.from(pre.querySelectorAll<HTMLElement>('mark'));
+    if (!marks.length) return;
+    for (const m of marks) {
+      m.classList.remove('ring-2', 'ring-focus');
+    }
+    const needle = focusTerm.term;
+    const idx = marks.findIndex((m) => m.textContent === needle || m.textContent?.includes(needle));
+    if (idx >= 0) {
+      const target = marks[idx]!;
+      target.classList.add('ring-2', 'ring-focus');
+      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      setMatchCursor(idx);
+    }
+  }, [focusTerm, display]);
 
   const jumpNextMatch = useCallback(() => {
     const pre = preRef.current;
@@ -153,7 +177,15 @@ export const CodeView = memo(function CodeView({
               onClick={() => setSseReadable((v) => !v)}
             />
           )}
-          {isJson && (
+          {requestText !== null && (
+            <IconButton
+              label={dialogueView ? t('codeView.jsonView') : t('codeView.dialogueView')}
+              pressed={dialogueView}
+              icon={<ChatText size={14} />}
+              onClick={() => setDialogueView((v) => !v)}
+            />
+          )}
+          {isJson && !dialogueView && (
             <IconButton
               label={pretty ? t('codeView.showRaw') : t('codeView.prettyJson')}
               pressed={pretty}

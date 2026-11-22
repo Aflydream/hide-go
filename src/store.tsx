@@ -95,11 +95,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
 
   const status = usePoll(api.status, 2500);
-  const logs = usePoll(api.logs, route === 'overview' || route === 'traffic' ? 2500 : 10000);
+  const logs = usePoll(api.logsIfChanged, route === 'overview' || route === 'traffic' ? 2500 : 10000);
   const needsHarnesses = route === 'integrations' || route === 'overview';
   const harnesses = usePoll(api.harnesses, route === 'integrations' ? 8000 : 15000, needsHarnesses);
   const needsVault = route === 'vault' || route === 'traffic';
-  const vault = usePoll(api.vault, 5000, needsVault);
+  const vault = usePoll(api.vaultIfChanged, 5000, needsVault);
 
   // Config is loaded once and after each save; it is not polled, so edits are never overwritten.
   useEffect(() => {

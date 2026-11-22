@@ -31,9 +31,15 @@ function explainRegexError(message: string, locale: Locale): string {
   return translate(locale, 'rules.errCompile', { message });
 }
 
-/** What the vendor sees in place of a match, mirroring the gateway's naming. */
+/** What the vendor sees in place of a match, mirroring the gateway's keyed naming. */
 function replacementPreview(hint: string) {
-  return `${hint.trim() || 'CustomConcept'}_01`;
+  const trimmed = hint.trim();
+  if (!trimmed) return 'ref_a1b2c3d4e5';
+  const dot = trimmed.indexOf('.');
+  if (dot > 0 && dot < trimmed.length - 1) {
+    return `${trimmed.slice(0, dot)}-a1b2c3d4.${trimmed.slice(dot + 1)}`;
+  }
+  return `${trimmed}_a1b2c3d4`;
 }
 
 function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: Draft) => void; onDone: () => void }) {
@@ -82,7 +88,8 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
   const nameError = submitted && !draft.name.trim() ? t('rules.errNameRequired') : null;
   const trimmedHint = draft.replacementHint.trim();
   const hintError =
-    trimmedHint && !/^[A-Za-z0-9_-]{1,48}$/.test(trimmedHint)
+    trimmedHint &&
+    (!/^[A-Za-z0-9_-](?:[A-Za-z0-9._-]{0,46}[A-Za-z0-9_-])?$/.test(trimmedHint) || trimmedHint.includes('..'))
       ? t('rules.errHintInvalid')
       : null;
   const patternError =

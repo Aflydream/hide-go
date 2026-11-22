@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
+import { NOT_MODIFIED } from './api';
 
 /**
- * Poll an async source. Pauses while the window is hidden, never overlaps requests and
- * keeps the last good value when a refresh fails.
+ * Poll an async source. Pauses while the window is hidden, never overlaps requests, skips state
+ * updates on `NOT_MODIFIED` (HTTP 304), and keeps the last good value when a refresh fails.
  */
-export function usePoll<T>(fetcher: () => Promise<T>, intervalMs: number, enabled = true) {
+export function usePoll<T>(fetcher: () => Promise<T | typeof NOT_MODIFIED>, intervalMs: number, enabled = true) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const [loading, setLoading] = useState(true);
-  const inFlight = useRef<Promise<T> | null>(null);
+  const inFlight = useRef<Promise<T | typeof NOT_MODIFIED> | null>(null);
   const mountedRef = useRef(true);
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
@@ -27,7 +28,9 @@ export function usePoll<T>(fetcher: () => Promise<T>, intervalMs: number, enable
       try {
         const next = await fetcherRef.current();
         if (mountedRef.current) {
-          setData(next);
+          if (next !== NOT_MODIFIED) {
+            setData(next);
+          }
           setError(null);
         }
         return next;

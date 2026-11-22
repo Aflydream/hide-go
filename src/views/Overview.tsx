@@ -7,11 +7,11 @@ import {
   describeAction,
   formatCount,
   formatLatency,
-  getCategoryLabel,
   getCoverThemeLabel,
   getHarnessLabel,
   getModeLabel,
   getPolicyLabel,
+  getPurposeLabel,
   proxyBase,
 } from '../lib/format';
 import { useI18n } from '../lib/i18n';
@@ -258,7 +258,7 @@ export function Overview() {
                 <li key={kind} className="bg-surface">
                   <button
                     type="button"
-                    onClick={() => navigate('integrations', { tool: kind })}
+                    onClick={() => navigate(count > 0 || hasRisk ? 'traffic' : 'integrations', { tool: kind })}
                     className="block w-full cursor-pointer px-4 py-3 text-left transition-colors hover:bg-surface-2"
                   >
                     <div className="flex items-center gap-2">
@@ -271,7 +271,7 @@ export function Overview() {
                     <p className="tabular mt-1 font-mono text-lg font-semibold text-fg">{count}</p>
                     <p className="truncate text-2xs text-fg-subtle">
                       {latest
-                        ? `${latest.timestamp.slice(0, 8)} · ${getCategoryLabel(latest.category, locale)}`
+                        ? `${latest.timestamp.slice(0, 8)} · ${getPurposeLabel(latest.purpose, locale, latest.category)}`
                         : profile
                           ? t('overview.activityNoTraffic')
                           : t('common.none')}
