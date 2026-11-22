@@ -372,6 +372,12 @@ pub struct TrafficAuditRecord {
     pub timestamp: String,
     pub harness: HarnessKind,
     pub category: TrafficCategory,
+    /// Exact functional purpose classification for this request.
+    #[serde(default)]
+    pub purpose: crate::audit::RequestPurpose,
+    /// Concise detail describing why this request received its purpose classification.
+    #[serde(default)]
+    pub purpose_detail: String,
     pub method: String,
     pub endpoint: String,
     pub upstream_vendor: String,
@@ -413,6 +419,12 @@ pub struct TrafficAuditSummary {
     pub timestamp: String,
     pub harness: HarnessKind,
     pub category: TrafficCategory,
+    /// Exact functional purpose classification for this request.
+    #[serde(default)]
+    pub purpose: crate::audit::RequestPurpose,
+    /// Concise detail describing why this request received its purpose classification.
+    #[serde(default)]
+    pub purpose_detail: String,
     pub method: String,
     pub endpoint: String,
     pub applied_mode: PrivacyMode,
@@ -443,6 +455,8 @@ impl From<&TrafficAuditRecord> for TrafficAuditSummary {
             timestamp: r.timestamp.clone(),
             harness: r.harness,
             category: r.category,
+            purpose: r.purpose,
+            purpose_detail: r.purpose_detail.clone(),
             method: r.method.clone(),
             endpoint: r.endpoint.clone(),
             applied_mode: r.applied_mode,

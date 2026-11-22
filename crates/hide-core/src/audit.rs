@@ -1,12 +1,17 @@
-//! Traffic audit heuristics for telemetry endpoints and bulk outbound data uploads.
+//! Traffic audit heuristics and exact request purpose classification.
 //!
-//! Runs across every mode (including `audit-only`) to flag silent telemetry beacons,
-//! archive/multipart packaging uploads, codebase indexing syncs, oversized outbound
-//! payloads, and sensitive values carried inside non-interactive uploads.
+//! Runs across every mode (including `audit-only`) to:
+//! 1. Detect silent telemetry, analytics, feature-flag tracking, crash diagnostics,
+//!    archive/multipart uploads, codebase indexing syncs, oversized outbound payloads,
+//!    and sensitive values inside non-interactive uploads across Host, Path/RPC,
+//!    Headers, Payload, and raw `CONNECT` tunnels.
+//! 2. Classify every request into a precise `RequestPurpose` with a concise explanation
+//!    so operators know the exact role of every outbound connection.
 
 use crate::config::{HarnessKind, TrafficCategory};
 use crate::connect::is_builtin_ai_mitm_host;
 use crate::harness::is_inference_endpoint;
+use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,12 +33,56 @@ pub enum HostRiskKind {
     General,
 }
 
-/// Individual audit finding attached to a `TrafficRecord`.
+/// Exact functional role of an outbound request or tunnel.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RequestPurpose {
+    /// Active interactive chat or agent model inference.
+    ChatInference,
+    /// Model inference turn sending back local tool/command/file execution output.
+    ToolResultSync,
+    /// Fill-in-the-middle / Tab / inline code autocomplete inference.
+    InlineCompletion,
+    /// Token counting or context window budget estimation.
+    TokenCount,
+    /// Repository indexing, embeddings, Merkle sync, or batch codebase upload.
+    CodebaseIndexing,
+    /// Explicit file, archive, multipart, or object-storage upload.
+    FileUpload,
+    /// Telemetry, analytics, metrics, OTel traces/logs, or usage event reporting.
+    Telemetry,
+    /// Feature gates, A/B experiments, or remote experiment evaluation.
+    FeatureFlags,
+    /// Crash dumps, error diagnostics, or feedback/bug reporting.
+    CrashReport,
+    /// Model catalog discovery, quota lookup, onboarding, or client config sync.
+    ModelCatalog,
+    /// Authentication, OAuth, session refresh, billing, or account status.
+    AuthAccount,
+    /// WebChannel, session tunnels, WebSockets, keepalive, or health checks.
+    RealtimeSync,
+    /// Software update checks, release metadata, or extension marketplace queries.
+    UpdateExtension,
+    /// Other non-inference API or general network request.
+    #[default]
+    OtherApi,
+}
+
+impl RequestPurpose {
+    pub fn is_telemetry_like(self) -> bool {
+        matches!(self, Self::Telemetry | Self::FeatureFlags | Self::CrashReport)
+    }
+}
+
+/// Individual audit finding attached to a `TrafficAuditRecord`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuditSignalKind {
     TelemetryEndpoint,
     TelemetryPayload,
+    TelemetryHeader,
+    FeatureFlagTracking,
+    CrashDiagnostics,
     ArchiveUpload,
     BulkCodebaseUpload,
     LargeOutboundPayload,
@@ -56,8 +105,9 @@ pub struct AuditSignal {
     pub detail: String,
 }
 
-/// Per-harness rollup surfaced in `DashboardStats` so users can immediately see whether
-/// each connected tool is sending telemetry or bulk-uploading workspace data.
+/// Per-harness rollup surfaced in `GET /api/status` so users can immediately see whether
+/// each connected tool is sending telemetry, bulk-uploading workspace data, and the
+/// exact breakdown of request purposes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessAuditSummary {
@@ -71,40 +121,118 @@ pub struct HarnessAuditSummary {
     pub telemetry_hosts: Vec<String>,
     #[serde(default)]
     pub upload_hosts: Vec<String>,
+    #[serde(default)]
+    pub purpose_counts: BTreeMap<RequestPurpose, u64>,
 }
 
-const TELEMETRY_EXACT_OR_SUFFIX_HOSTS: &[&str] = &[
-    "play.googleapis.com",
-    "firebaselogging-pa.googleapis.com",
-    "firebaselogging.googleapis.com",
-    "clientmetrics-pa.googleapis.com",
-    "crashlyticsreports-pa.googleapis.com",
-    "app-measurement.com",
-    "telemetry.anthropic.com",
+const FEATURE_FLAG_HOSTS: &[&str] = &[
     "statsig.anthropic.com",
+    "statsig.openai.com",
     "statsigapi.net",
     "events.statsigapi.net",
     "featuregates.org",
-    "api.segment.io",
-    "cdn.segment.com",
-    "api.amplitude.com",
-    "api2.amplitude.com",
-    "us.i.posthog.com",
-    "eu.i.posthog.com",
-    "app.posthog.com",
-    "dc.services.visualstudio.com",
-    "vortex.data.microsoft.com",
-    "mobile.events.data.microsoft.com",
     "ab.chatgpt.com",
-    "t.cursor.sh",
-    "metrics.cursor.sh",
+    "launchdarkly.com",
+    "events.launchdarkly.com",
+    "clientstream.launchdarkly.com",
+    "app.launchdarkly.com",
+    "split.io",
+    "events.split.io",
+    "sdk.split.io",
+    "growthbook.io",
+    "optimizely.com",
+    "logx.optimizely.com",
+];
+
+const CRASH_DIAGNOSTIC_HOSTS: &[&str] = &[
     "sentry.io",
     "ingest.sentry.io",
     "ingest.us.sentry.io",
     "ingest.de.sentry.io",
-    "logs.datadoghq.com",
+    "crashlyticsreports-pa.googleapis.com",
+    "clouderrorreporting.googleapis.com",
+    "bugsnag.com",
+    "notify.bugsnag.com",
+    "sessions.bugsnag.com",
+    "rollbar.com",
+    "backtrace.io",
+    "raygun.com",
+];
+
+const TELEMETRY_EXACT_OR_SUFFIX_HOSTS: &[&str] = &[
+    // Google / Antigravity / Firebase / Clearcut
+    "play.googleapis.com",
+    "firebaselogging-pa.googleapis.com",
+    "firebaselogging.googleapis.com",
+    "clientmetrics-pa.googleapis.com",
+    "cloudtrace.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com",
+    "telemetry.googleapis.com",
+    "app-measurement.com",
+    "google-analytics.com",
+    "analytics.google.com",
+    // Anthropic / Claude Code
+    "telemetry.anthropic.com",
+    // OpenAI / Codex
+    "telemetry.openai.com",
+    "otel.openai.com",
+    "logs.openai.com",
+    // Cursor
+    "t.cursor.sh",
+    "metrics.cursor.sh",
+    "telemetry.cursor.sh",
+    "analytics.cursor.sh",
+    // Qoder / Alibaba Cloud
+    "arms-retcode.aliyuncs.com",
+    "log.aliyuncs.com",
+    "sls.aliyuncs.com",
+    "retcode.alicdn.com",
+    "gm.mmstat.com",
+    "s-gm.mmstat.com",
+    "fourier.alibaba.com",
+    "umeng.com",
+    // xAI / Grok Build & ZCode
+    "telemetry.x.ai",
+    "metrics.x.ai",
+    "events.x.ai",
+    "telemetry.zcode.ai",
+    "metrics.zcode.ai",
+    "telemetry.z.ai",
+    // General analytics / APM / OTel / Microsoft VSCode telemetry
+    "api.segment.io",
+    "cdn.segment.com",
+    "segment.io",
+    "api.amplitude.com",
+    "api2.amplitude.com",
+    "amplitude.com",
+    "posthog.com",
+    "us.i.posthog.com",
+    "eu.i.posthog.com",
+    "app.posthog.com",
+    "mixpanel.com",
+    "api-js.mixpanel.com",
+    "api.mixpanel.com",
+    "dc.services.visualstudio.com",
+    "in.applicationinsights.azure.com",
+    "livediagnostics.monitor.azure.com",
+    "vortex.data.microsoft.com",
+    "events.data.microsoft.com",
+    "datadoghq.com",
+    "datadoghq.eu",
     "browser-intake-datadoghq.com",
     "http-intake.logs.datadoghq.com",
+    "api.honeycomb.io",
+    "bam.nr-data.net",
+    "log-api.newrelic.com",
+    "otlp.nr-data.net",
+    "heapanalytics.com",
+    "fullstory.com",
+    "pendo.io",
+    "clarity.ms",
+    "plausible.io",
+    "rudderstack.com",
+    "snowplowanalytics.com",
 ];
 
 const TELEMETRY_HOST_PREFIXES: &[&str] = &[
@@ -115,6 +243,13 @@ const TELEMETRY_HOST_PREFIXES: &[&str] = &[
     "logging.",
     "crash.",
     "otlp.",
+    "otel.",
+    "statsig.",
+    "sentry.",
+    "beacon.",
+    "diag.",
+    "diagnostics.",
+    "traces.",
 ];
 
 const UPLOAD_STORAGE_EXACT_OR_SUFFIX_HOSTS: &[&str] = &[
@@ -127,21 +262,83 @@ const UPLOAD_STORAGE_EXACT_OR_SUFFIX_HOSTS: &[&str] = &[
     "r2.cloudflarestorage.com",
 ];
 
-const TELEMETRY_PATH_SEGMENTS: &[&str] = &[
+const AUTH_HOSTS: &[&str] = &[
+    "oauth2.googleapis.com",
+    "accounts.google.com",
+    "auth.openai.com",
+    "auth0.openai.com",
+    "auth.cursor.sh",
+    "login.cursor.sh",
+    "auth.qoder.sh",
+    "login.qoder.sh",
+    "auth.qoder.com",
+    "login.qoder.com",
+    "auth.qoder.com.cn",
+    "login.qoder.com.cn",
+    "accounts.x.ai",
+];
+
+const UPDATE_HOSTS: &[&str] = &[
+    "update.googleapis.com",
+    "clients2.google.com",
+    "marketplace.visualstudio.com",
+    "marketplace.cursorapi.com",
+    "downloads.cursor.com",
+    "open-vsx.org",
+];
+
+const TELEMETRY_PATH_WORDS: &[&str] = &[
     "telemetry",
-    "event_logging",
     "analytics",
     "metrics",
-    "events",
+    "metric",
     "traces",
-    "logs",
+    "trace",
     "rgstr",
     "logevent",
-    "batch_log",
+    "logevents",
+    "batchlog",
     "clientmetrics",
-    "featuregates",
-    "statsig",
     "clearcut",
+    "otlp",
+    "otel",
+    "beacon",
+    "beacons",
+    "snowplow",
+    "posthog",
+    "mixpanel",
+    "amplitude",
+    "datadog",
+    "rum",
+];
+
+const FEATURE_FLAG_PATH_WORDS: &[&str] = &[
+    "statsig",
+    "featuregates",
+    "featuregate",
+    "featureflags",
+    "featureflag",
+    "experiments",
+    "experiment",
+    "abtest",
+    "remoteconfig",
+    "launchdarkly",
+];
+
+const CRASH_PATH_WORDS: &[&str] = &[
+    "crash",
+    "crashes",
+    "crashlytics",
+    "minidump",
+    "errorreporting",
+    "errorreport",
+    "sentry",
+    "bugsnag",
+    "rollbar",
+    "bugreport",
+    "feedback",
+    "diagnostic",
+    "diagnostics",
 ];
 
 const BULK_UPLOAD_PATH_KEYWORDS: &[&str] = &[
@@ -152,24 +349,75 @@ const BULK_UPLOAD_PATH_KEYWORDS: &[&str] = &[
     "indexing",
     "index-sync",
     "repo-service",
+    "repositoryservice",
     "uploadfiles",
     "upload_files",
     "synccodebase",
     "sync_codebase",
     "workspace_upload",
+    "workspace/sync",
     "archive",
     "bundle",
 ];
 
+/// Header names whose presence indicates a telemetry / crash / feature-flag SDK request,
+/// even when the body is compressed, binary protobuf, or empty.
+const TELEMETRY_HEADER_EXACT: &[&str] = &[
+    "x-sentry-auth",
+    "sentry-trace",
+    "dd-api-key",
+    "dd-evp-origin",
+    "dd-evp-origin-version",
+    "statsig-api-key",
+    "statsig-client-time",
+    "statsig-sdk-type",
+    "statsig-sdk-version",
+    "x-honeycomb-team",
+    "x-honeycomb-dataset",
+    "x-datadog-trace-id",
+    "x-datadog-origin",
+    "x-segment-anonymous-id",
+    "x-amplitude-device-id",
+    "x-launchdarkly-event-schema",
+    "x-launchdarkly-wrapper",
+];
+
+const TELEMETRY_HEADER_PREFIXES: &[&str] = &[
+    "x-telemetry-",
+    "x-client-telemetry",
+    "x-anthropic-telemetry",
+    "x-otlp-",
+    "x-posthog-",
+    "x-mixpanel-",
+    "x-amplitude-",
+    "x-statsig-",
+];
+
+/// High-confidence structural telemetry markers (1 hit on a non-inference endpoint is enough).
+const STRONG_TELEMETRY_PAYLOAD_MARKERS: &[&str] = &[
+    "\"resourcespans\"",
+    "\"resourcemetrics\"",
+    "\"resourcelogs\"",
+    "\"scopespan\"",
+    "\"scopespans\"",
+    "\"scopemetrics\"",
+    "\"statsigmetadata\"",
+    "\"telemetry.sdk.name\"",
+    "\"clientmetrics\"",
+    "\"client_metrics\"",
+    "\"eventbatch\"",
+    "\"event_batch\"",
+    "\"crashreport\"",
+    "\"crash_report\"",
+    "\"logsource\"",
+];
+
+/// General telemetry / device-fingerprint payload markers (2+ hits on a non-inference endpoint).
 const TELEMETRY_PAYLOAD_MARKERS: &[&str] = &[
     "\"machineid\"",
     "\"machine_id\"",
     "\"deviceid\"",
     "\"device_id\"",
-    "\"clientmetrics\"",
-    "\"client_metrics\"",
-    "\"eventbatch\"",
-    "\"event_batch\"",
     "\"logevent\"",
     "\"log_event\"",
     "\"osversion\"",
@@ -178,9 +426,23 @@ const TELEMETRY_PAYLOAD_MARKERS: &[&str] = &[
     "\"statsig\"",
     "\"sentry\"",
     "\"anonymousid\"",
+    "\"anonymous_id\"",
     "\"distinct_id\"",
+    "\"distinctid\"",
     "\"appversion\"",
     "\"app_version\"",
+    "\"event_name\"",
+    "\"eventname\"",
+    "\"event_type\"",
+    "\"eventtype\"",
+    "\"exposures\"",
+    "\"breadcrumbs\"",
+    "\"featuregates\"",
+    "\"feature_gates\"",
+    "\"dynamicconfigs\"",
+    "\"sessionduration\"",
+    "\"requesttimems\"",
+    "\"sourceextension\"",
 ];
 
 const BULK_FILE_TREE_MARKERS: &[&str] = &[
@@ -205,15 +467,65 @@ fn host_matches_exact_or_sub(host: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 
+fn is_feature_flag_host(host: &str) -> bool {
+    FEATURE_FLAG_HOSTS.iter().any(|d| host_matches_exact_or_sub(host, d)) || host.starts_with("statsig.")
+}
+
+fn is_crash_diagnostic_host(host: &str) -> bool {
+    CRASH_DIAGNOSTIC_HOSTS
+        .iter()
+        .any(|d| host_matches_exact_or_sub(host, d))
+        || host.starts_with("crash.")
+        || host.starts_with("sentry.")
+}
+
+/// Split a URL path / RPC action into lowercase words, splitting both on punctuation
+/// (`/`, `?`, `:`, `.`, `-`, `_`) AND on camelCase / PascalCase boundaries
+/// (e.g. `recordCodeAssistMetrics` -> `["record", "code", "assist", "metrics"]`).
+pub fn tokenize_path_words(path: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut prev_lower_or_digit = false;
+    let mut prev_upper = false;
+
+    let mut iter = path.chars().peekable();
+    while let Some(ch) = iter.next() {
+        if !ch.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            prev_lower_or_digit = false;
+            prev_upper = false;
+            continue;
+        }
+        let is_upper = ch.is_ascii_uppercase();
+        let next_is_lower = iter.peek().is_some_and(|n| n.is_ascii_lowercase());
+        if is_upper
+            && ((prev_lower_or_digit && !current.is_empty()) || (prev_upper && next_is_lower && current.len() > 1))
+        {
+            words.push(std::mem::take(&mut current));
+        }
+        current.push(ch.to_ascii_lowercase());
+        prev_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+        prev_upper = is_upper;
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
 /// Classify a destination host into telemetry, upload storage, AI API, or general traffic.
 pub fn classify_host_risk(raw_host: &str) -> HostRiskKind {
     let host = normalize_host(raw_host);
     if host.is_empty() {
         return HostRiskKind::General;
     }
-    if TELEMETRY_EXACT_OR_SUFFIX_HOSTS
-        .iter()
-        .any(|d| host_matches_exact_or_sub(&host, d))
+    if is_feature_flag_host(&host)
+        || is_crash_diagnostic_host(&host)
+        || TELEMETRY_EXACT_OR_SUFFIX_HOSTS
+            .iter()
+            .any(|d| host_matches_exact_or_sub(&host, d))
         || TELEMETRY_HOST_PREFIXES.iter().any(|p| host.starts_with(p))
     {
         return HostRiskKind::Telemetry;
@@ -231,6 +543,58 @@ pub fn classify_host_risk(raw_host: &str) -> HostRiskKind {
         return HostRiskKind::AiApi;
     }
     HostRiskKind::General
+}
+
+/// Classify a host's primary functional purpose (used for `CONNECT` passthrough tunnels
+/// and the Observed Hosts inspector in Integrations).
+pub fn classify_host_purpose(raw_host: &str) -> RequestPurpose {
+    let host = normalize_host(raw_host);
+    if host.is_empty() {
+        return RequestPurpose::OtherApi;
+    }
+    if is_crash_diagnostic_host(&host) {
+        return RequestPurpose::CrashReport;
+    }
+    if is_feature_flag_host(&host) {
+        return RequestPurpose::FeatureFlags;
+    }
+    if TELEMETRY_EXACT_OR_SUFFIX_HOSTS
+        .iter()
+        .any(|d| host_matches_exact_or_sub(&host, d))
+        || TELEMETRY_HOST_PREFIXES.iter().any(|p| host.starts_with(p))
+    {
+        return RequestPurpose::Telemetry;
+    }
+    if host == "jetski-webchannel.googleapis.com" || host.contains("webchannel.") || host.starts_with("ws.") {
+        return RequestPurpose::RealtimeSync;
+    }
+    if host == "repo42.cursor.sh" || host == "repo1.qoder.sh" || host == "repo.qoder.com.cn" {
+        return RequestPurpose::CodebaseIndexing;
+    }
+    if classify_host_risk(&host) == HostRiskKind::UploadStorage {
+        return RequestPurpose::FileUpload;
+    }
+    if AUTH_HOSTS.iter().any(|d| host_matches_exact_or_sub(&host, d))
+        || host.starts_with("auth.")
+        || host.starts_with("login.")
+        || host.starts_with("oauth.")
+        || host.starts_with("accounts.")
+        || host.starts_with("sso.")
+    {
+        return RequestPurpose::AuthAccount;
+    }
+    if UPDATE_HOSTS.iter().any(|d| host_matches_exact_or_sub(&host, d))
+        || host.starts_with("update.")
+        || host.starts_with("updates.")
+        || host.starts_with("releases.")
+        || host.starts_with("marketplace.")
+    {
+        return RequestPurpose::UpdateExtension;
+    }
+    if is_builtin_ai_mitm_host(&host) {
+        return RequestPurpose::ChatInference;
+    }
+    RequestPurpose::OtherApi
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -284,24 +648,114 @@ fn count_distinct_local_paths(text: &str) -> usize {
     seen.len()
 }
 
-fn has_telemetry_path(path_lower: &str) -> bool {
-    path_lower
-        .split(['/', '?', ':', '.'])
-        .filter(|s| !s.is_empty())
-        .any(|seg| TELEMETRY_PATH_SEGMENTS.contains(&seg))
-        || path_lower.contains("event_logging")
-        || path_lower.contains("logevent")
-        || path_lower.contains("telemetryservice")
-        || path_lower.contains("recordtelemetry")
+fn words_contain(words: &[String], targets: &[&str]) -> bool {
+    words.iter().any(|w| targets.contains(&w.as_str()))
 }
 
-/// Inspect an HTTP / HTTPS MITM / Protobuf request for telemetry and bulk data upload signals.
+fn words_have_pair(words: &[String], a: &[&str], b: &[&str]) -> bool {
+    words_contain(words, a) && words_contain(words, b)
+}
+
+/// True when the URL path / RPC method represents a telemetry, metrics, or event-logging endpoint.
+pub fn has_telemetry_path(path: &str) -> bool {
+    let path_lower = path.to_ascii_lowercase();
+    if is_inference_endpoint(&path_lower) {
+        return false;
+    }
+    let words = tokenize_path_words(path);
+    words_contain(&words, TELEMETRY_PATH_WORDS)
+        || words_have_pair(
+            &words,
+            &["event", "events", "log", "logs", "logging", "usage", "stats", "audit"],
+            &[
+                "log", "logs", "logging", "batch", "record", "report", "submit", "send", "ingest", "collect", "track",
+            ],
+        )
+        || path_lower.contains("event_logging")
+        || path_lower.contains("/v1/logs")
+        || path_lower.contains("/v1/metrics")
+        || path_lower.contains("/v1/traces")
+        || path_lower.contains("/v1/events")
+        || path_lower.contains("/ces/")
+        || path_lower.contains("/g/collect")
+        || path_lower.contains("/2/httpapi")
+        || path_lower.ends_with("/capture")
+        || path_lower.ends_with("/capture/")
+        || path_lower.ends_with("/track")
+        || path_lower.ends_with("/identify")
+}
+
+/// True when the URL path / RPC method represents a feature-flag or A/B experiment endpoint.
+pub fn has_feature_flag_path(path: &str, host: Option<&str>) -> bool {
+    let path_lower = path.to_ascii_lowercase();
+    if is_inference_endpoint(&path_lower) {
+        return false;
+    }
+    let words = tokenize_path_words(path);
+    if words_contain(&words, FEATURE_FLAG_PATH_WORDS)
+        || words_have_pair(
+            &words,
+            &["feature", "ab", "remote"],
+            &["flag", "flags", "gate", "gates", "test", "config"],
+        )
+    {
+        return true;
+    }
+    if path_lower.ends_with("/v1/initialize") || path_lower.contains("/v1/initialize?") {
+        if let Some(h) = host.map(normalize_host) {
+            return is_feature_flag_host(&h) || h.contains("anthropic") || h.contains("openai") || h.contains("cursor");
+        }
+    }
+    false
+}
+
+/// True when the URL path / RPC method represents a crash, error, or diagnostic report endpoint.
+pub fn has_crash_diagnostic_path(path: &str, host: Option<&str>) -> bool {
+    let path_lower = path.to_ascii_lowercase();
+    if is_inference_endpoint(&path_lower) {
+        return false;
+    }
+    let words = tokenize_path_words(path);
+    if words_contain(&words, CRASH_PATH_WORDS)
+        || words_have_pair(
+            &words,
+            &["error", "exception", "bug", "issue"],
+            &["report", "reports", "reporting", "log", "submit"],
+        )
+    {
+        return true;
+    }
+    if (path_lower.contains("/envelope") || path_lower.contains("/store"))
+        && host.is_some_and(|h| is_crash_diagnostic_host(&normalize_host(h)))
+    {
+        return true;
+    }
+    false
+}
+
+fn find_telemetry_headers(headers: &HeaderMap) -> Vec<String> {
+    let mut hits = Vec::new();
+    for name in headers.keys() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if (TELEMETRY_HEADER_EXACT.contains(&lower.as_str())
+            || TELEMETRY_HEADER_PREFIXES.iter().any(|p| lower.starts_with(p)))
+            && !hits.contains(&lower)
+        {
+            hits.push(lower);
+        }
+    }
+    hits
+}
+
+/// Inspect an HTTP / HTTPS MITM / Protobuf request for telemetry, feature-flag, crash,
+/// and bulk data upload signals.
 #[allow(clippy::too_many_arguments)]
 pub fn inspect_http_audit_signals(
     host: Option<&str>,
     path: &str,
     content_type: Option<&str>,
     content_encoding: Option<&str>,
+    headers: Option<&HeaderMap>,
     raw_bytes: &[u8],
     body_text: Option<&str>,
     category: TrafficCategory,
@@ -320,16 +774,72 @@ pub fn inspect_http_audit_signals(
     let mut telemetry_hit = false;
     let mut bulk_hit = false;
 
-    // 1. Telemetry endpoint (host or URL path)
-    if category == TrafficCategory::Telemetry || host_risk == HostRiskKind::Telemetry || has_telemetry_path(&path_lower)
+    // 1. Crash / diagnostic reporting
+    let host_crash = host_norm.as_deref().is_some_and(is_crash_diagnostic_host);
+    let path_crash = has_crash_diagnostic_path(path, host_norm.as_deref());
+    if host_crash || path_crash {
+        telemetry_hit = true;
+        let target = if host_crash {
+            host_norm.as_deref().unwrap_or(path)
+        } else {
+            path
+        };
+        signals.push(AuditSignal {
+            kind: AuditSignalKind::CrashDiagnostics,
+            severity: AuditSeverity::Warn,
+            detail: format!("Crash/diagnostic endpoint: {target}"),
+        });
+    }
+
+    // 2. Feature flag / A/B experiment tracking
+    let host_ff = host_norm.as_deref().is_some_and(is_feature_flag_host);
+    let path_ff = has_feature_flag_path(path, host_norm.as_deref());
+    if host_ff || path_ff {
+        telemetry_hit = true;
+        let target = if host_ff {
+            host_norm.as_deref().unwrap_or(path)
+        } else {
+            path
+        };
+        signals.push(AuditSignal {
+            kind: AuditSignalKind::FeatureFlagTracking,
+            severity: AuditSeverity::Info,
+            detail: format!("Feature flag / experiment endpoint: {target}"),
+        });
+    }
+
+    // 3. Telemetry endpoint (host or URL path / camelCase RPC action)
+    let path_tel = has_telemetry_path(path);
+    if category == TrafficCategory::Telemetry
+        || (host_risk == HostRiskKind::Telemetry && !host_crash && !host_ff)
+        || path_tel
     {
         telemetry_hit = true;
-        let target = host_norm.as_deref().unwrap_or(path);
+        let target = if path_tel {
+            path
+        } else {
+            host_norm.as_deref().unwrap_or(path)
+        };
         signals.push(AuditSignal {
             kind: AuditSignalKind::TelemetryEndpoint,
             severity: AuditSeverity::Warn,
             detail: format!("Telemetry endpoint: {target}"),
         });
+    }
+
+    // 4. Telemetry SDK headers (on non-inference endpoints, or dedicated Sentry/Statsig/Datadog headers)
+    if !inference {
+        if let Some(hdrs) = headers {
+            let tel_headers = find_telemetry_headers(hdrs);
+            if !tel_headers.is_empty() {
+                telemetry_hit = true;
+                signals.push(AuditSignal {
+                    kind: AuditSignalKind::TelemetryHeader,
+                    severity: AuditSeverity::Warn,
+                    detail: format!("Telemetry header(s): {}", tel_headers.join(", ")),
+                });
+            }
+        }
     }
 
     // Prepare bounded lowercase sample for payload heuristics (zero cost on empty bodies).
@@ -348,25 +858,30 @@ pub fn inspect_http_audit_signals(
         None
     };
 
-    // 2. Telemetry payload markers on non-inference endpoints
+    // 5. Telemetry payload markers on non-inference endpoints
     if !inference {
         if let Some(sample) = scan_sample_owned.as_deref() {
+            let strong_hits = STRONG_TELEMETRY_PAYLOAD_MARKERS
+                .iter()
+                .filter(|m| sample.contains(**m))
+                .count();
             let marker_hits = TELEMETRY_PAYLOAD_MARKERS
                 .iter()
                 .filter(|m| sample.contains(**m))
                 .count();
-            if marker_hits >= 2 {
+            if strong_hits >= 1 || marker_hits >= 2 {
                 telemetry_hit = true;
+                let total = strong_hits + marker_hits;
                 signals.push(AuditSignal {
                     kind: AuditSignalKind::TelemetryPayload,
                     severity: AuditSeverity::Warn,
-                    detail: format!("Telemetry/device-fingerprint payload ({marker_hits} markers)"),
+                    detail: format!("Telemetry/device-fingerprint payload ({total} markers)"),
                 });
             }
         }
     }
 
-    // 3. Archive / multipart packaging upload
+    // 6. Archive / multipart packaging upload
     let archive_ct = [
         "application/zip",
         "application/x-tar",
@@ -422,7 +937,7 @@ pub fn inspect_http_audit_signals(
         });
     }
 
-    // 4. Bulk codebase / multi-file sync upload
+    // 7. Bulk codebase / multi-file sync upload
     let path_bulk_hit = !inference && BULK_UPLOAD_PATH_KEYWORDS.iter().any(|k| path_lower.contains(k));
     let storage_upload = host_risk == HostRiskKind::UploadStorage && raw_bytes.len() >= 1024;
     let file_tree_markers = if !inference {
@@ -477,7 +992,7 @@ pub fn inspect_http_audit_signals(
         });
     }
 
-    // 5. Large outbound payload
+    // 8. Large outbound payload
     if (!inference && raw_bytes.len() >= LARGE_NON_INFERENCE_BYTES) || raw_bytes.len() >= LARGE_ANY_REQUEST_BYTES {
         signals.push(AuditSignal {
             kind: AuditSignalKind::LargeOutboundPayload,
@@ -486,7 +1001,7 @@ pub fn inspect_http_audit_signals(
         });
     }
 
-    // 6. Sensitive data carried inside telemetry or bulk upload
+    // 9. Sensitive data carried inside telemetry or bulk upload
     if findings_count > 0 && (telemetry_hit || bulk_hit) {
         signals.push(AuditSignal {
             kind: AuditSignalKind::SensitiveDataExfil,
@@ -498,21 +1013,379 @@ pub fn inspect_http_audit_signals(
     signals
 }
 
-/// Inspect a raw TCP passthrough `CONNECT` tunnel once its outbound byte count is known.
+fn last_rpc_or_path_action(path: &str) -> &str {
+    let without_query = path.split('?').next().unwrap_or(path);
+    if let Some((_, rpc)) = without_query.rsplit_once(':') {
+        if !rpc.is_empty() && !rpc.contains('/') {
+            return rpc;
+        }
+    }
+    without_query
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(without_query)
+}
+
+/// Classify any HTTP / MITM / Protobuf / WebSocket request into its exact `RequestPurpose`
+/// and a concise human-readable detail explaining why it matched.
+#[allow(clippy::too_many_arguments)]
+pub fn classify_request_purpose(
+    method: &str,
+    host: Option<&str>,
+    path: &str,
+    content_type: Option<&str>,
+    body_text: Option<&str>,
+    category: TrafficCategory,
+    signals: &[AuditSignal],
+) -> (RequestPurpose, String) {
+    let path_lower = path.to_ascii_lowercase();
+    let host_norm = host.map(normalize_host);
+    let ct_lower = content_type.unwrap_or_default().to_ascii_lowercase();
+    let words = tokenize_path_words(path);
+    let action = last_rpc_or_path_action(path);
+
+    // 1. WebSocket / explicit realtime transports
+    if method.eq_ignore_ascii_case("WS") {
+        return (
+            RequestPurpose::RealtimeSync,
+            format!("WebSocket channel ({})", host_norm.as_deref().unwrap_or(path)),
+        );
+    }
+
+    // 2. Token counting (must precede generic inference check)
+    if path_lower.contains("/count_tokens")
+        || path_lower.contains(":counttokens")
+        || path_lower.contains("/tokenize")
+        || words_have_pair(&words, &["count"], &["token", "tokens"])
+    {
+        return (RequestPurpose::TokenCount, format!("Token count ({action})"));
+    }
+
+    // 3. Inline / Tab / FIM code completion
+    if path_lower.contains("/fim/")
+        || path_lower.contains("streamcpp")
+        || path_lower.contains("cppservice")
+        || path_lower.contains("inlinecompletion")
+        || path_lower.contains("tab_completion")
+        || path_lower.contains("autocomplete")
+        || path_lower.contains("completecode")
+        || words_have_pair(
+            &words,
+            &["inline", "tab", "fim"],
+            &["completion", "completions", "complete", "predict"],
+        )
+    {
+        return (
+            RequestPurpose::InlineCompletion,
+            format!("Inline code completion ({action})"),
+        );
+    }
+
+    // 4. Model inference (Chat / Agent vs Tool execution result sync)
+    let is_chat_rpc = is_inference_endpoint(&path_lower)
+        || path_lower.contains("aiservice/streamchat")
+        || path_lower.contains("streamunifiedchat")
+        || path_lower.contains("chatservice/")
+        || path_lower.contains(":generatecode");
+    if is_chat_rpc {
+        let has_tool_output = category == TrafficCategory::ToolExecutionSync
+            || body_text.is_some_and(|b| {
+                b.contains("\"tool_result\"")
+                    || b.contains("\"function_call_output\"")
+                    || b.contains("\"functionResponse\"")
+                    || b.contains("\"role\":\"tool\"")
+                    || b.contains("\"role\": \"tool\"")
+            });
+        if has_tool_output {
+            return (
+                RequestPurpose::ToolResultSync,
+                format!("Tool execution result sync ({action})"),
+            );
+        }
+        return (RequestPurpose::ChatInference, format!("Model inference ({action})"));
+    }
+
+    // 5. Crash / diagnostic reporting
+    if signals.iter().any(|s| s.kind == AuditSignalKind::CrashDiagnostics)
+        || host_norm.as_deref().is_some_and(is_crash_diagnostic_host)
+        || has_crash_diagnostic_path(path, host_norm.as_deref())
+    {
+        let detail = signals
+            .iter()
+            .find(|s| s.kind == AuditSignalKind::CrashDiagnostics)
+            .map(|s| s.detail.clone())
+            .unwrap_or_else(|| format!("Crash/diagnostic report ({action})"));
+        return (RequestPurpose::CrashReport, detail);
+    }
+
+    // 6. Feature flags / A/B experiments
+    if signals.iter().any(|s| s.kind == AuditSignalKind::FeatureFlagTracking)
+        || host_norm.as_deref().is_some_and(is_feature_flag_host)
+        || has_feature_flag_path(path, host_norm.as_deref())
+    {
+        let detail = signals
+            .iter()
+            .find(|s| s.kind == AuditSignalKind::FeatureFlagTracking)
+            .map(|s| s.detail.clone())
+            .unwrap_or_else(|| format!("Feature flag / experiment ({action})"));
+        return (RequestPurpose::FeatureFlags, detail);
+    }
+
+    // 7. Telemetry / analytics / metrics / event logging
+    if category == TrafficCategory::Telemetry
+        || signals.iter().any(|s| {
+            matches!(
+                s.kind,
+                AuditSignalKind::TelemetryEndpoint
+                    | AuditSignalKind::TelemetryPayload
+                    | AuditSignalKind::TelemetryHeader
+            )
+        })
+        || has_telemetry_path(path)
+    {
+        let detail = signals
+            .iter()
+            .find(|s| {
+                matches!(
+                    s.kind,
+                    AuditSignalKind::TelemetryEndpoint
+                        | AuditSignalKind::TelemetryHeader
+                        | AuditSignalKind::TelemetryPayload
+                )
+            })
+            .map(|s| s.detail.clone())
+            .unwrap_or_else(|| format!("Telemetry reporting ({action})"));
+        return (RequestPurpose::Telemetry, detail);
+    }
+
+    // 8. Codebase indexing / embeddings / Merkle sync (check before generic FileUpload for repo sync hosts)
+    let is_indexing_path = category == TrafficCategory::CodebaseIndexing
+        || words_contain(
+            &words,
+            &[
+                "embeddings",
+                "embedding",
+                "merkle",
+                "indexing",
+                "codebase",
+                "vector",
+                "vectors",
+                "repositoryservice",
+                "reposervice",
+            ],
+        )
+        || path_lower.contains("upload-chunks")
+        || path_lower.contains("index-sync")
+        || path_lower.contains("codebase_sync")
+        || path_lower.contains("workspace/sync");
+    if is_indexing_path {
+        return (
+            RequestPurpose::CodebaseIndexing,
+            format!("Codebase indexing / embeddings ({action})"),
+        );
+    }
+
+    // 9. Explicit file / archive / multipart upload
+    let is_upload_path = path_lower.contains("/v1/files")
+        || path_lower.contains("/v1/uploads")
+        || path_lower.contains("/attachments")
+        || words_contain(&words, &["upload", "uploads", "archive", "bundle"]);
+    if signals.iter().any(|s| s.kind == AuditSignalKind::ArchiveUpload)
+        || (is_upload_path && !method.eq_ignore_ascii_case("GET"))
+        || ct_lower.contains("multipart/form-data")
+        || (host_norm.as_deref().map(classify_host_risk) == Some(HostRiskKind::UploadStorage)
+            && !method.eq_ignore_ascii_case("GET"))
+    {
+        let detail = signals
+            .iter()
+            .find(|s| s.kind == AuditSignalKind::ArchiveUpload)
+            .map(|s| s.detail.clone())
+            .unwrap_or_else(|| format!("File/archive upload ({action})"));
+        return (RequestPurpose::FileUpload, detail);
+    }
+    if signals.iter().any(|s| s.kind == AuditSignalKind::BulkCodebaseUpload) {
+        let detail = signals
+            .iter()
+            .find(|s| s.kind == AuditSignalKind::BulkCodebaseUpload)
+            .map(|s| s.detail.clone())
+            .unwrap_or_else(|| format!("Bulk workspace upload ({action})"));
+        return (RequestPurpose::CodebaseIndexing, detail);
+    }
+
+    // 10. Realtime channel / session tunnel / heartbeat / health check
+    if host_norm
+        .as_deref()
+        .is_some_and(|h| h == "jetski-webchannel.googleapis.com" || h.contains("webchannel."))
+        || path_lower.contains("/v1/tunnels")
+        || path_lower.contains("webchannel")
+        || path_lower.contains("/realtime")
+        || words_contain(
+            &words,
+            &[
+                "tunnel",
+                "tunnels",
+                "channel",
+                "channels",
+                "subscribe",
+                "heartbeat",
+                "keepalive",
+                "ping",
+                "health",
+                "healthz",
+                "healthservice",
+                "liveness",
+                "readiness",
+            ],
+        )
+    {
+        return (
+            RequestPurpose::RealtimeSync,
+            format!("Realtime channel / keepalive ({action})"),
+        );
+    }
+
+    // 11. Authentication / account / session / billing
+    if host_norm
+        .as_deref()
+        .is_some_and(|h| classify_host_purpose(h) == RequestPurpose::AuthAccount)
+        || words_contain(
+            &words,
+            &[
+                "oauth",
+                "oauth2",
+                "login",
+                "logout",
+                "signin",
+                "signout",
+                "auth",
+                "authservice",
+                "userinfo",
+                "whoami",
+                "session",
+                "sessions",
+                "billing",
+                "subscription",
+                "subscriptions",
+                "license",
+                "entitlement",
+                "entitlements",
+                "credits",
+                "verify",
+            ],
+        )
+    {
+        return (
+            RequestPurpose::AuthAccount,
+            format!("Auth / account / billing ({action})"),
+        );
+    }
+
+    // 12. Model catalog / quota / client onboarding / settings
+    if path_lower.contains("/v1/models")
+        || path_lower.contains("loadcodeassist")
+        || path_lower.contains("onboarduser")
+        || path_lower.contains("fetchavailablemodels")
+        || path_lower.contains("retrieveuserquota")
+        || path_lower.contains("getuserstatus")
+        || words_contain(
+            &words,
+            &[
+                "models",
+                "quota",
+                "quotas",
+                "capabilities",
+                "onboard",
+                "onboarding",
+                "dashboardservice",
+                "settings",
+                "preferences",
+                "config",
+                "configuration",
+            ],
+        )
+    {
+        return (
+            RequestPurpose::ModelCatalog,
+            format!("Model catalog / quota / config ({action})"),
+        );
+    }
+
+    // 13. Updates / releases / extensions marketplace
+    if host_norm
+        .as_deref()
+        .is_some_and(|h| classify_host_purpose(h) == RequestPurpose::UpdateExtension)
+        || words_contain(
+            &words,
+            &[
+                "update",
+                "updates",
+                "upgrade",
+                "releases",
+                "release",
+                "marketplace",
+                "extensions",
+                "extension",
+                "plugins",
+                "vsix",
+                "changelog",
+                "version",
+            ],
+        )
+    {
+        return (
+            RequestPurpose::UpdateExtension,
+            format!("Update / extension check ({action})"),
+        );
+    }
+
+    // 14. Fallback: explicit non-inference API call
+    let target = if !action.is_empty() && action != "/" {
+        action
+    } else {
+        host_norm.as_deref().unwrap_or(path)
+    };
+    (
+        RequestPurpose::OtherApi,
+        format!("{} {}", method.to_uppercase(), target),
+    )
+}
+
+/// Inspect a raw TCP passthrough `CONNECT` tunnel for telemetry, feature-flag, crash,
+/// and bulk-upload risk signals.
 pub fn inspect_connect_tunnel_audit(host: &str, bytes_sent: u64) -> Vec<AuditSignal> {
     let mut signals = Vec::new();
-    let risk = classify_host_risk(host);
-    if risk == HostRiskKind::Telemetry {
+    let norm = normalize_host(host);
+    let risk = classify_host_risk(&norm);
+    let purpose = classify_host_purpose(&norm);
+    let sent_label = if bytes_sent > 0 {
+        format!(", sent {}", format_bytes(bytes_sent))
+    } else {
+        String::new()
+    };
+
+    if purpose == RequestPurpose::CrashReport {
+        signals.push(AuditSignal {
+            kind: AuditSignalKind::CrashDiagnostics,
+            severity: AuditSeverity::Warn,
+            detail: format!("Crash/diagnostic host tunnel ({norm}{sent_label})"),
+        });
+    } else if purpose == RequestPurpose::FeatureFlags {
+        signals.push(AuditSignal {
+            kind: AuditSignalKind::FeatureFlagTracking,
+            severity: AuditSeverity::Info,
+            detail: format!("Feature-flag/experiment host tunnel ({norm}{sent_label})"),
+        });
+    } else if risk == HostRiskKind::Telemetry {
         signals.push(AuditSignal {
             kind: AuditSignalKind::TelemetryEndpoint,
             severity: AuditSeverity::Warn,
-            detail: format!("Telemetry host tunnel ({host}, sent {})", format_bytes(bytes_sent)),
+            detail: format!("Telemetry host tunnel ({norm}{sent_label})"),
         });
     } else if risk == HostRiskKind::UploadStorage && bytes_sent >= PASSTHROUGH_UPLOAD_STORAGE_THRESHOLD {
         signals.push(AuditSignal {
             kind: AuditSignalKind::BulkCodebaseUpload,
             severity: AuditSeverity::Warn,
-            detail: format!("Upload-storage tunnel ({host}, sent {})", format_bytes(bytes_sent)),
+            detail: format!("Upload-storage tunnel ({norm}{sent_label})"),
         });
     }
     if bytes_sent >= PASSTHROUGH_LARGE_UPLOAD_THRESHOLD && risk != HostRiskKind::General {
@@ -529,7 +1402,11 @@ pub fn has_telemetry_signal(signals: &[AuditSignal]) -> bool {
     signals.iter().any(|s| {
         matches!(
             s.kind,
-            AuditSignalKind::TelemetryEndpoint | AuditSignalKind::TelemetryPayload
+            AuditSignalKind::TelemetryEndpoint
+                | AuditSignalKind::TelemetryPayload
+                | AuditSignalKind::TelemetryHeader
+                | AuditSignalKind::FeatureFlagTracking
+                | AuditSignalKind::CrashDiagnostics
         )
     })
 }
@@ -566,6 +1443,7 @@ pub fn summarize_harness_audit<'a>(
         outbound_bytes: u64,
         telemetry_hosts: BTreeSet<String>,
         upload_hosts: BTreeSet<String>,
+        purpose_counts: BTreeMap<RequestPurpose, u64>,
     }
 
     let mut by_harness: BTreeMap<String, (HarnessKind, Acc)> = BTreeMap::new();
@@ -583,14 +1461,23 @@ pub fn summarize_harness_audit<'a>(
                     outbound_bytes: 0,
                     telemetry_hosts: BTreeSet::new(),
                     upload_hosts: BTreeSet::new(),
+                    purpose_counts: BTreeMap::new(),
                 },
             )
         });
         entry.1.total_requests += 1;
         entry.1.outbound_bytes = entry.1.outbound_bytes.saturating_add(rec.request_bytes as u64);
+        *entry.1.purpose_counts.entry(rec.purpose).or_insert(0) += 1;
 
-        let is_tel = rec.category == TrafficCategory::Telemetry || has_telemetry_signal(&rec.audit_signals);
-        let is_bulk = rec.category == TrafficCategory::CodebaseIndexing || has_bulk_upload_signal(&rec.audit_signals);
+        let is_tel = rec.category == TrafficCategory::Telemetry
+            || rec.purpose.is_telemetry_like()
+            || has_telemetry_signal(&rec.audit_signals);
+        let is_bulk = rec.category == TrafficCategory::CodebaseIndexing
+            || matches!(
+                rec.purpose,
+                RequestPurpose::CodebaseIndexing | RequestPurpose::FileUpload
+            )
+            || has_bulk_upload_signal(&rec.audit_signals);
         let is_exfil = has_sensitive_exfil_signal(&rec.audit_signals);
 
         let host_opt = extract_host_from_endpoint(&rec.endpoint);
@@ -624,6 +1511,7 @@ pub fn summarize_harness_audit<'a>(
             outbound_bytes: acc.outbound_bytes,
             telemetry_hosts: acc.telemetry_hosts.into_iter().take(8).collect(),
             upload_hosts: acc.upload_hosts.into_iter().take(8).collect(),
+            purpose_counts: acc.purpose_counts,
         })
         .collect();
     list.sort_by_key(|item| {
@@ -655,21 +1543,195 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_telemetry_and_upload_storage_hosts() {
+    fn classifies_telemetry_feature_flag_crash_and_upload_hosts() {
         assert_eq!(classify_host_risk("play.googleapis.com"), HostRiskKind::Telemetry);
+        assert_eq!(classify_host_purpose("play.googleapis.com"), RequestPurpose::Telemetry);
+
+        assert_eq!(classify_host_risk("statsig.anthropic.com"), HostRiskKind::Telemetry);
         assert_eq!(
-            classify_host_risk("firebaselogging-pa.googleapis.com"),
-            HostRiskKind::Telemetry
+            classify_host_purpose("statsig.anthropic.com"),
+            RequestPurpose::FeatureFlags
         );
-        assert_eq!(classify_host_risk("o12345.ingest.sentry.io"), HostRiskKind::Telemetry);
+
         assert_eq!(classify_host_risk("ab.chatgpt.com"), HostRiskKind::Telemetry);
-        assert_eq!(classify_host_risk("telemetry.example.com"), HostRiskKind::Telemetry);
+        assert_eq!(classify_host_purpose("ab.chatgpt.com"), RequestPurpose::FeatureFlags);
+
+        assert_eq!(classify_host_risk("o12345.ingest.sentry.io"), HostRiskKind::Telemetry);
+        assert_eq!(
+            classify_host_purpose("o12345.ingest.sentry.io"),
+            RequestPurpose::CrashReport
+        );
+        assert_eq!(
+            classify_host_purpose("crashlyticsreports-pa.googleapis.com"),
+            RequestPurpose::CrashReport
+        );
+
+        assert_eq!(classify_host_risk("arms-retcode.aliyuncs.com"), HostRiskKind::Telemetry);
+        assert_eq!(classify_host_risk("events.launchdarkly.com"), HostRiskKind::Telemetry);
+        assert_eq!(
+            classify_host_purpose("jetski-webchannel.googleapis.com"),
+            RequestPurpose::RealtimeSync
+        );
         assert_eq!(classify_host_risk("repo42.cursor.sh"), HostRiskKind::UploadStorage);
+        assert_eq!(
+            classify_host_purpose("repo42.cursor.sh"),
+            RequestPurpose::CodebaseIndexing
+        );
         assert_eq!(
             classify_host_risk("my-bucket.s3.us-east-1.amazonaws.com"),
             HostRiskKind::UploadStorage
         );
+        assert_eq!(
+            classify_host_purpose("oauth2.googleapis.com"),
+            RequestPurpose::AuthAccount
+        );
         assert_eq!(classify_host_risk("github.com"), HostRiskKind::General);
+    }
+
+    #[test]
+    fn detects_camelcase_rpc_telemetry_and_telemetry_headers() {
+        let signals = inspect_http_audit_signals(
+            Some("daily-cloudcode-pa.googleapis.com"),
+            "/v1internal:recordCodeAssistMetrics",
+            Some("application/json"),
+            None,
+            None,
+            b"{}",
+            Some("{}"),
+            TrafficCategory::InteractivePrompt,
+            0,
+        );
+        assert!(signals.iter().any(|s| s.kind == AuditSignalKind::TelemetryEndpoint));
+        let (purpose, _) = classify_request_purpose(
+            "POST",
+            Some("daily-cloudcode-pa.googleapis.com"),
+            "/v1internal:recordCodeAssistMetrics",
+            Some("application/json"),
+            Some("{}"),
+            TrafficCategory::InteractivePrompt,
+            &signals,
+        );
+        assert_eq!(purpose, RequestPurpose::Telemetry);
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("x-sentry-auth", "Sentry sentry_version=7".parse().unwrap());
+        let hdr_signals = inspect_http_audit_signals(
+            Some("custom-collector.example.com"),
+            "/api/42/envelope/",
+            Some("application/x-sentry-envelope"),
+            None,
+            Some(&hdrs),
+            b"{}",
+            Some("{}"),
+            TrafficCategory::InteractivePrompt,
+            0,
+        );
+        assert!(hdr_signals.iter().any(|s| s.kind == AuditSignalKind::TelemetryHeader));
+    }
+
+    #[test]
+    fn classifies_exact_request_purposes_without_mislabeling_non_inference() {
+        let cases = [
+            (
+                "GET",
+                Some("api.openai.com"),
+                "/v1/tunnels/tunnel_ext2_6adc",
+                None,
+                TrafficCategory::InteractivePrompt,
+                RequestPurpose::RealtimeSync,
+            ),
+            (
+                "POST",
+                Some("jetski-webchannel.googleapis.com"),
+                "/webchannel/channel",
+                None,
+                TrafficCategory::InteractivePrompt,
+                RequestPurpose::RealtimeSync,
+            ),
+            (
+                "POST",
+                Some("daily-cloudcode-pa.googleapis.com"),
+                "/v1internal:loadCodeAssist",
+                None,
+                TrafficCategory::InteractivePrompt,
+                RequestPurpose::ModelCatalog,
+            ),
+            (
+                "POST",
+                Some("daily-cloudcode-pa.googleapis.com"),
+                "/v1internal:streamGenerateContent",
+                Some(r#"{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}}"#),
+                TrafficCategory::InteractivePrompt,
+                RequestPurpose::ChatInference,
+            ),
+            (
+                "POST",
+                Some("daily-cloudcode-pa.googleapis.com"),
+                "/v1internal:streamGenerateContent",
+                Some(
+                    r#"{"request":{"contents":[{"role":"user","parts":[{"functionResponse":{"name":"read_file"}}]}]}}"#,
+                ),
+                TrafficCategory::ToolExecutionSync,
+                RequestPurpose::ToolResultSync,
+            ),
+            (
+                "POST",
+                Some("api.anthropic.com"),
+                "/v1/messages/count_tokens",
+                None,
+                TrafficCategory::InteractivePrompt,
+                RequestPurpose::TokenCount,
+            ),
+            (
+                "POST",
+                Some("api2.cursor.sh"),
+                "/aiserver.v1.AiService/StreamCpp",
+                None,
+                TrafficCategory::InteractivePrompt,
+                RequestPurpose::InlineCompletion,
+            ),
+            (
+                "POST",
+                Some("api.anthropic.com"),
+                "/api/event_logging/batch",
+                None,
+                TrafficCategory::Telemetry,
+                RequestPurpose::Telemetry,
+            ),
+            (
+                "GET",
+                Some("api.openai.com"),
+                "/v1/models",
+                None,
+                TrafficCategory::InteractivePrompt,
+                RequestPurpose::ModelCatalog,
+            ),
+            (
+                "POST",
+                Some("api.openai.com"),
+                "/v1/files",
+                None,
+                TrafficCategory::InteractivePrompt,
+                RequestPurpose::FileUpload,
+            ),
+        ];
+
+        for (method, host, path, body, cat, expected) in cases {
+            let signals = inspect_http_audit_signals(
+                host,
+                path,
+                Some("application/json"),
+                None,
+                None,
+                body.unwrap_or("").as_bytes(),
+                body,
+                cat,
+                0,
+            );
+            let (purpose, _) =
+                classify_request_purpose(method, host, path, Some("application/json"), body, cat, &signals);
+            assert_eq!(purpose, expected, "failed for {method} {host:?} {path}");
+        }
     }
 
     #[test]
@@ -679,6 +1741,7 @@ mod tests {
             Some("repo42.cursor.sh"),
             "/upload-chunks",
             Some("application/octet-stream"),
+            None,
             None,
             zip_payload,
             None,
@@ -698,6 +1761,7 @@ mod tests {
             "/v1/chat/completions",
             Some("application/json"),
             None,
+            None,
             body.as_bytes(),
             Some(body),
             TrafficCategory::InteractivePrompt,
@@ -709,6 +1773,7 @@ mod tests {
             Some("events.statsigapi.net"),
             "/v1/rgstr",
             Some("application/json"),
+            None,
             None,
             body.as_bytes(),
             Some(body),
@@ -730,6 +1795,7 @@ mod tests {
             Some("api2.cursor.sh"),
             "/workspace/sync",
             Some("application/json"),
+            None,
             None,
             body.as_bytes(),
             Some(body),

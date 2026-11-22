@@ -1224,6 +1224,12 @@ impl PrivacyVault {
         self.inner.read().token_to_real.values().filter(|e| !e.alias).count()
     }
 
+    /// Monotonic `(generation, tick)` counter for lightweight change detection (e.g. HTTP ETag).
+    pub fn revision(&self) -> (u64, u64) {
+        let guard = self.inner.read();
+        (guard.generation, guard.tick)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.inner.read().token_to_real.is_empty()
     }

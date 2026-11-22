@@ -46,6 +46,11 @@ impl StreamRestorer {
         }
     }
 
+    /// Placeholders restored so far.
+    pub fn restored(&self) -> usize {
+        self.total_restored
+    }
+
     /// Placeholders that were left in place because they stand for credentials.
     pub fn withheld(&self) -> usize {
         self.withheld

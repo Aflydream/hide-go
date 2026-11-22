@@ -403,7 +403,9 @@ pub fn detect_harness_and_category(path: &str, user_agent: Option<&str>, body: &
     let category = if is_inference_endpoint(&path_lower) {
         if body.contains("\"tool_result\"")
             || body.contains("\"function_call_output\"")
+            || body.contains("\"functionResponse\"")
             || body.contains("\"role\":\"tool\"")
+            || body.contains("\"role\": \"tool\"")
         {
             TrafficCategory::ToolExecutionSync
         } else {
@@ -419,6 +421,8 @@ pub fn detect_harness_and_category(path: &str, user_agent: Option<&str>, body: &
         "logs",
         "rgstr",
     ]) || path_lower.contains("event_logging")
+        || crate::audit::has_telemetry_path(path)
+        || crate::audit::has_crash_diagnostic_path(path, None)
     {
         TrafficCategory::Telemetry
     } else if has_segment(&[
@@ -431,6 +435,7 @@ pub fn detect_harness_and_category(path: &str, user_agent: Option<&str>, body: &
         "merkle",
         "vector",
         "repo-service",
+        "repositoryservice",
         "upload-chunks",
     ]) || path_lower.contains("codebase_sync")
     {

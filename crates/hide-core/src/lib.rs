@@ -8,6 +8,7 @@ pub mod connect;
 pub mod desensitizer;
 pub mod harness;
 pub mod harness_detect;
+pub mod ndjson_restorer;
 pub mod protobuf;
 pub mod protocol;
 pub mod proxy;

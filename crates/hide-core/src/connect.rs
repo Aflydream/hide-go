@@ -676,6 +676,17 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
         let audit_state = state.clone();
         let audit_host = host.clone();
         let started_at = std::time::Instant::now();
+        let active_record_id = if crate::audit::classify_host_risk(&audit_host) == crate::audit::HostRiskKind::Telemetry
+        {
+            let init_signals = crate::audit::inspect_connect_tunnel_audit(&audit_host, 0);
+            if !init_signals.is_empty() {
+                Some(audit_state.record_passthrough_tunnel_audit(&audit_host, port, 0, 0, 0, init_signals))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         tokio::spawn(async move {
             let _permit = permit;
             match on_upgrade.await {
@@ -683,32 +694,43 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
                     let mut client_io = TokioIo::new(upgraded);
                     match tokio::io::copy_bidirectional(&mut client_io, &mut upstream).await {
                         Ok((to_upstream, to_client)) => {
+                            let elapsed = started_at.elapsed().as_millis() as u64;
                             let signals = crate::audit::inspect_connect_tunnel_audit(&audit_host, to_upstream);
-                            if !signals.is_empty() {
+                            if let Some(id) = active_record_id.as_deref() {
+                                audit_state.update_passthrough_tunnel_audit(
+                                    id,
+                                    &audit_host,
+                                    port,
+                                    to_upstream,
+                                    to_client,
+                                    elapsed,
+                                    signals,
+                                );
+                            } else if !signals.is_empty() {
                                 audit_state.record_passthrough_tunnel_audit(
                                     &audit_host,
                                     port,
                                     to_upstream,
                                     to_client,
-                                    started_at.elapsed().as_millis() as u64,
+                                    elapsed,
                                     signals,
                                 );
                             }
                         }
                         Err(err) => {
                             tracing::debug!("TCP passthrough closed for {audit_host}:{port}: {err}");
-                            if crate::audit::classify_host_risk(&audit_host) == crate::audit::HostRiskKind::Telemetry {
+                            if let Some(id) = active_record_id.as_deref() {
+                                let elapsed = started_at.elapsed().as_millis() as u64;
                                 let signals = crate::audit::inspect_connect_tunnel_audit(&audit_host, 0);
-                                if !signals.is_empty() {
-                                    audit_state.record_passthrough_tunnel_audit(
-                                        &audit_host,
-                                        port,
-                                        0,
-                                        0,
-                                        started_at.elapsed().as_millis() as u64,
-                                        signals,
-                                    );
-                                }
+                                audit_state.update_passthrough_tunnel_audit(
+                                    id,
+                                    &audit_host,
+                                    port,
+                                    0,
+                                    0,
+                                    elapsed,
+                                    signals,
+                                );
                             }
                         }
                     }
@@ -984,6 +1006,9 @@ async fn handle_mitm_websocket_upgrade(
         });
     }
 
+    let ws_record_id = state.record_websocket_upgrade(&host, port, path_and_query, status_code.as_u16());
+    let ws_state = state.clone();
+    let ws_started = std::time::Instant::now();
     let on_upgrade = hyper::upgrade::on(req);
     tokio::spawn(async move {
         if let Ok(upgraded) = on_upgrade.await {
@@ -994,7 +1019,15 @@ async fn handle_mitm_websocket_upgrade(
             if !buffered.is_empty() && client_io.write_all(&buffered).await.is_err() {
                 return;
             }
-            let _ = tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await;
+            if let Ok((to_upstream, to_client)) = tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await
+            {
+                ws_state.update_websocket_bytes(
+                    &ws_record_id,
+                    to_upstream,
+                    to_client.saturating_add(buffered.len() as u64),
+                    ws_started.elapsed().as_millis() as u64,
+                );
+            }
         }
     });
 

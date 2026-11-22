@@ -14,6 +14,7 @@ use crate::harness::{detect_harness_and_category, is_inference_endpoint, Harness
 use crate::harness_detect::{
     connect_all_detected, connect_harness, detect_all_harness_profiles, disconnect_harness, parse_harness_slug,
 };
+use crate::ndjson_restorer::NdjsonRestorer;
 use crate::protobuf::{
     detect_protobuf_framing, restore_unary_protobuf, transform_protobuf_outbound, GrpcStreamDesensitizer,
     GrpcStreamRestorer, OutboundStreamMetrics, ProtobufFraming,
@@ -212,6 +213,7 @@ pub struct ObservedConnectHost {
     pub mitm: bool,
     pub tls_failed: bool,
     pub risk_kind: crate::audit::HostRiskKind,
+    pub purpose: crate::audit::RequestPurpose,
     pub count: u64,
     pub last_seen_at: String,
     #[serde(skip)]
@@ -241,6 +243,7 @@ pub struct GatewayState {
     pub vault: PrivacyVault,
     pub ca: Arc<CaManager>,
     pub audit_logs: Arc<RwLock<VecDeque<TrafficAuditRecord>>>,
+    pub audit_logs_seq: Arc<AtomicU64>,
     pub harness_stats: Arc<RwLock<HashMap<HarnessKind, (u64, String)>>>,
     pub observed_connect_hosts: Arc<RwLock<HashMap<String, ObservedConnectHost>>>,
     pub observed_connect_seq: Arc<AtomicU64>,
@@ -359,6 +362,7 @@ impl GatewayState {
             vault: PrivacyVault::new(),
             ca: default_ca_manager(),
             audit_logs: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_AUDIT_LOGS))),
+            audit_logs_seq: Arc::new(AtomicU64::new(1)),
             harness_stats: Arc::new(RwLock::new(HashMap::new())),
             observed_connect_hosts: Arc::new(RwLock::new(HashMap::new())),
             observed_connect_seq: Arc::new(AtomicU64::new(1)),
@@ -484,6 +488,7 @@ impl GatewayState {
         while logs.len() > MAX_AUDIT_LOGS {
             logs.pop_back();
         }
+        self.audit_logs_seq.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn get_records(&self) -> Vec<TrafficAuditRecord> {
@@ -500,6 +505,7 @@ impl GatewayState {
 
     pub fn clear_records(&self) {
         self.audit_logs.write().clear();
+        self.audit_logs_seq.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a `CONNECT host:port` destination in memory (hostname/port metadata only).
@@ -528,6 +534,7 @@ impl GatewayState {
             key,
             ObservedConnectHost {
                 risk_kind: crate::audit::classify_host_risk(&norm_host),
+                purpose: crate::audit::classify_host_purpose(&norm_host),
                 host: norm_host,
                 port,
                 mitm,
@@ -576,6 +583,7 @@ impl GatewayState {
 
     /// Surface a raw TCP passthrough `CONNECT` tunnel when telemetry or bulk upload signals
     /// are detected (so audit-only mode reports background telemetry and upload storage activity).
+    /// Returns the created record ID so long-lived tunnels can update byte counts on close.
     pub fn record_passthrough_tunnel_audit(
         &self,
         host: &str,
@@ -584,7 +592,7 @@ impl GatewayState {
         bytes_received: u64,
         latency_ms: u64,
         audit_signals: Vec<crate::audit::AuditSignal>,
-    ) {
+    ) -> String {
         let harness = detect_harness_for_host(host).unwrap_or(HarnessKind::Generic);
         let cfg = self.get_config();
         let endpoint = if port == 443 {
@@ -598,12 +606,17 @@ impl GatewayState {
         } else {
             TrafficCategory::CodebaseIndexing
         };
+        let purpose = crate::audit::classify_host_purpose(host);
         let summary = audit_signals
             .iter()
             .map(|s| s.detail.as_str())
             .collect::<Vec<_>>()
             .join("; ");
-        let req_note = format!("[encrypted CONNECT passthrough to {host}:{port} — {bytes_sent} B sent]");
+        let req_note = if bytes_sent == 0 && bytes_received == 0 && latency_ms == 0 {
+            format!("[encrypted CONNECT tunnel active to {host}:{port}]")
+        } else {
+            format!("[encrypted CONNECT passthrough to {host}:{port} — {bytes_sent} B sent]")
+        };
         let resp_note = format!("[encrypted tunnel summary: {summary}; {bytes_received} B received]");
         let mut rec = build_record(RecordInput {
             harness,
@@ -628,11 +641,107 @@ impl GatewayState {
             withheld_count: 0,
             upstream_vendor: Some(host.to_string()),
         });
+        let id = rec.id.clone();
+        rec.purpose = purpose;
+        rec.purpose_detail = summary;
         rec.request_bytes = bytes_sent.min(usize::MAX as u64) as usize;
         rec.response_bytes = bytes_received.min(usize::MAX as u64) as usize;
         rec.latency_ms = latency_ms.max(1);
         rec.audit_signals = audit_signals;
         self.push_record(rec);
+        id
+    }
+
+    /// Update an active passthrough tunnel audit entry with final byte totals and duration on close.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_passthrough_tunnel_audit(
+        &self,
+        id: &str,
+        host: &str,
+        port: u16,
+        bytes_sent: u64,
+        bytes_received: u64,
+        latency_ms: u64,
+        audit_signals: Vec<crate::audit::AuditSignal>,
+    ) {
+        let mut logs = self.audit_logs.write();
+        if let Some(rec) = logs.iter_mut().find(|r| r.id == id) {
+            let summary = audit_signals
+                .iter()
+                .map(|s| s.detail.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let req_note = format!("[encrypted CONNECT passthrough to {host}:{port} — {bytes_sent} B sent]");
+            let resp_note = format!("[encrypted tunnel summary: {summary}; {bytes_received} B received]");
+            rec.request_bytes = bytes_sent.min(usize::MAX as u64) as usize;
+            rec.response_bytes = bytes_received.min(usize::MAX as u64) as usize;
+            rec.latency_ms = latency_ms.max(1);
+            rec.local_request_payload = req_note.clone();
+            rec.vendor_visible_payload = req_note;
+            rec.vendor_raw_response = resp_note.clone();
+            rec.local_restored_response = resp_note;
+            if !summary.is_empty() {
+                rec.purpose_detail = summary;
+            }
+            if !audit_signals.is_empty() {
+                rec.audit_signals = audit_signals;
+            }
+            self.audit_logs_seq.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a MITM WebSocket upgrade so realtime channels are visible and classified in Traffic.
+    pub fn record_websocket_upgrade(&self, host: &str, port: u16, path: &str, status: u16) -> String {
+        let harness = detect_harness_for_host(host).unwrap_or(HarnessKind::Generic);
+        let cfg = self.get_config();
+        let authority = if port == 443 {
+            host.to_string()
+        } else {
+            format!("{host}:{port}")
+        };
+        let endpoint = format!("wss://{authority}{path}");
+        let req_note = format!("[WebSocket upgrade to {endpoint}]");
+        let resp_note = format!("[WebSocket connected (HTTP {status})]");
+        let mut rec = build_record(RecordInput {
+            harness,
+            category: TrafficCategory::InteractivePrompt,
+            method: "WS".to_string(),
+            endpoint,
+            mode: cfg.mode,
+            action_taken: "passed".to_string(),
+            status,
+            start: Instant::now(),
+            simulated: false,
+            local_request: &req_note,
+            vendor_request: &req_note,
+            vendor_response: &resp_note,
+            local_response: &resp_note,
+            findings: Vec::new(),
+            restored_count: 0,
+            withheld_count: 0,
+            upstream_vendor: Some(host.to_string()),
+        });
+        let id = rec.id.clone();
+        rec.purpose = crate::audit::RequestPurpose::RealtimeSync;
+        rec.purpose_detail = format!("WebSocket channel ({host})");
+        rec.request_bytes = 0;
+        rec.response_bytes = 0;
+        self.push_record(rec);
+        id
+    }
+
+    /// Update a recorded WebSocket connection with final transferred bytes on close.
+    pub fn update_websocket_bytes(&self, id: &str, bytes_sent: u64, bytes_received: u64, latency_ms: u64) {
+        let mut logs = self.audit_logs.write();
+        if let Some(rec) = logs.iter_mut().find(|r| r.id == id) {
+            rec.request_bytes = bytes_sent.min(usize::MAX as u64) as usize;
+            rec.response_bytes = bytes_received.min(usize::MAX as u64) as usize;
+            rec.latency_ms = latency_ms.max(1);
+            rec.local_restored_response =
+                format!("[WebSocket closed — {bytes_sent} B sent, {bytes_received} B received]");
+            rec.vendor_raw_response = rec.local_restored_response.clone();
+            self.audit_logs_seq.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn get_config(&self) -> HideConfig {
@@ -931,10 +1040,11 @@ pub fn transform_outbound_scoped(
 }
 
 /// Telemetry is answered locally when the user asked for it to be blocked, in any
-/// protecting mode. Inference endpoints are never classified as telemetry.
+/// protecting mode. Inference endpoints and feature-flag bootstrap calls are never answered locally.
 fn should_block_telemetry(category: TrafficCategory, path: &str, cfg: &HideConfig) -> bool {
     category == TrafficCategory::Telemetry
         && !is_inference_endpoint(path)
+        && !crate::audit::has_feature_flag_path(path, None)
         && match cfg.mode {
             PrivacyMode::AuditOnly => false,
             PrivacyMode::AutoDesensitize => cfg.block_silent_telemetry,
@@ -1035,10 +1145,27 @@ fn build_record(i: RecordInput) -> TrafficAuditRecord {
             &i.endpoint,
             None,
             None,
+            None,
             i.local_request.as_bytes(),
             Some(i.local_request),
             i.category,
             finding_total,
+        )
+    };
+    let (purpose, purpose_detail) = if i.action_taken == "tls-handshake-failed" {
+        (
+            crate::audit::RequestPurpose::OtherApi,
+            "TLS handshake rejected".to_string(),
+        )
+    } else {
+        crate::audit::classify_request_purpose(
+            &i.method,
+            inferred_host.as_deref(),
+            &i.endpoint,
+            None,
+            Some(i.local_request),
+            i.category,
+            &audit_signals,
         )
     };
     TrafficAuditRecord {
@@ -1046,6 +1173,8 @@ fn build_record(i: RecordInput) -> TrafficAuditRecord {
         timestamp: Local::now().format("%H:%M:%S%.3f").to_string(),
         harness: i.harness,
         category: i.category,
+        purpose,
+        purpose_detail,
         method: i.method,
         endpoint: i.endpoint,
         upstream_vendor,
@@ -1612,8 +1741,21 @@ async fn api_validate_rule(Json(probe): Json<RuleProbe>) -> Response {
     }
 }
 
-async fn api_get_logs(State(state): State<GatewayState>) -> Json<Vec<TrafficAuditSummary>> {
-    Json(state.get_summaries())
+fn if_none_match_hit(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|raw| raw.split(',').any(|part| part.trim() == etag))
+}
+
+async fn api_get_logs(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    let seq = state.audit_logs_seq.load(Ordering::Relaxed);
+    let etag = format!("W/\"logs-{seq}\"");
+    if if_none_match_hit(&headers, &etag) {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
+    }
+    let body = Json(state.get_summaries());
+    ([(header::ETAG, etag)], body).into_response()
 }
 
 async fn api_get_log(State(state): State<GatewayState>, Path(id): Path<String>) -> Response {
@@ -1714,8 +1856,14 @@ async fn api_disconnect_harness(State(state): State<GatewayState>, Path(kind): P
     }
 }
 
-async fn api_get_vault(State(state): State<GatewayState>) -> Json<Vec<VaultEntry>> {
-    Json(state.get_vault_entries())
+async fn api_get_vault(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    let (gen, tick) = state.vault.revision();
+    let etag = format!("W/\"vault-{gen}-{tick}\"");
+    if if_none_match_hit(&headers, &etag) {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
+    }
+    let body = Json(state.get_vault_entries());
+    ([(header::ETAG, etag)], body).into_response()
 }
 
 async fn api_clear_vault(State(state): State<GatewayState>) -> StatusCode {
@@ -1844,9 +1992,14 @@ fn is_binary_response_content_type(ct: Option<&str>) -> bool {
 
 fn detect_harness_for_host(host: &str) -> Option<HarnessKind> {
     let h = host.trim().to_ascii_lowercase();
-    if h == "api.anthropic.com" || h == "statsig.anthropic.com" || h == "telemetry.anthropic.com" {
+    if h == "api.anthropic.com" || h.ends_with(".anthropic.com") {
         Some(HarnessKind::ClaudeCode)
-    } else if h == "api.openai.com" || h == "chatgpt.com" || h == "ab.chatgpt.com" || h.ends_with(".openai.azure.com") {
+    } else if h == "api.openai.com"
+        || h.ends_with(".openai.com")
+        || h == "chatgpt.com"
+        || h == "ab.chatgpt.com"
+        || h.ends_with(".openai.azure.com")
+    {
         Some(HarnessKind::Codex)
     } else if h == "generativelanguage.googleapis.com"
         || h == "cloudcode-pa.googleapis.com"
@@ -1878,9 +2031,14 @@ fn detect_harness_for_host(host: &str) -> Option<HarnessKind> {
         || h.starts_with("dashscope")
     {
         Some(HarnessKind::Qoder)
-    } else if h == "api.x.ai" || h == "cli-chat-proxy.grok.com" {
+    } else if h == "api.x.ai" || h.ends_with(".x.ai") || h == "cli-chat-proxy.grok.com" || h.ends_with(".grok.com") {
         Some(HarnessKind::GrokBuild)
-    } else if h == "api.zcode.ai" || h == "open.bigmodel.cn" || h == "api.z.ai" {
+    } else if h == "api.zcode.ai"
+        || h.ends_with(".zcode.ai")
+        || h == "open.bigmodel.cn"
+        || h == "api.z.ai"
+        || h.ends_with(".z.ai")
+    {
         Some(HarnessKind::Zcode)
     } else {
         None
@@ -2315,6 +2473,41 @@ pub(crate) async fn handle_forward_http_request(
         );
     }
     if !mitm_inspect {
+        let start = Instant::now();
+        let req_len = body.len();
+        let req_ct = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let req_ce = headers
+            .get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body_text = std::str::from_utf8(&body).ok().map(str::to_string);
+        let path_only = target_url.path().to_string();
+        let (harness, category, upstream_vendor) = resolve_proxy_harness_and_scope(&path_only, &headers, &body, &host);
+        let audit_signals = crate::audit::inspect_http_audit_signals(
+            Some(&host),
+            &path_only,
+            req_ct.as_deref(),
+            req_ce.as_deref(),
+            Some(&headers),
+            body.as_ref(),
+            body_text.as_deref(),
+            category,
+            0,
+        );
+        let (purpose, purpose_detail) = crate::audit::classify_request_purpose(
+            method.as_str(),
+            Some(&host),
+            &path_only,
+            req_ct.as_deref(),
+            body_text.as_deref(),
+            category,
+            &audit_signals,
+        );
+        let should_log_audit = !audit_signals.is_empty();
+        let endpoint_label = format!("{}://{}{}", target_url.scheme(), host, path_only);
         let idle_timeout = cfg.effective_upstream_idle_timeout();
         let is_loopback = allow_loopback && is_loopback_host_str(&host);
         let (client, fallback) = state.resolve_http_clients(&host, is_loopback, false);
@@ -2322,7 +2515,7 @@ pub(crate) async fn handle_forward_http_request(
         return match send_upstream_with_fallback(
             &client,
             fallback.as_ref(),
-            method,
+            method.clone(),
             target_url,
             fwd_headers,
             body,
@@ -2332,6 +2525,42 @@ pub(crate) async fn handle_forward_http_request(
         {
             Ok(Ok(resp)) => {
                 let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                if should_log_audit {
+                    let is_tel = crate::audit::has_telemetry_signal(&audit_signals);
+                    let req_preview = body_text.as_deref().unwrap_or("[binary plain-HTTP proxy request]");
+                    let mut rec = build_record(RecordInput {
+                        harness,
+                        category: if is_tel {
+                            TrafficCategory::Telemetry
+                        } else {
+                            TrafficCategory::CodebaseIndexing
+                        },
+                        method: method.to_string(),
+                        endpoint: endpoint_label,
+                        mode: cfg.mode,
+                        action_taken: if is_tel {
+                            "telemetry-audited".to_string()
+                        } else {
+                            "upload-audited".to_string()
+                        },
+                        status: status.as_u16(),
+                        start,
+                        simulated: false,
+                        local_request: req_preview,
+                        vendor_request: req_preview,
+                        vendor_response: "",
+                        local_response: "",
+                        findings: Vec::new(),
+                        restored_count: 0,
+                        withheld_count: 0,
+                        upstream_vendor,
+                    });
+                    rec.request_bytes = req_len;
+                    rec.audit_signals = audit_signals;
+                    rec.purpose = purpose;
+                    rec.purpose_detail = purpose_detail;
+                    state.push_record(rec);
+                }
                 let resp_headers = upstream_binary_response_headers(resp.headers(), true);
                 let mut out = Response::new(Body::from_stream(stream_with_idle_timeout(
                     resp.bytes_stream(),
@@ -2648,9 +2877,32 @@ async fn execute_proxy_forward(
         .await;
     }
 
-    // Truly opaque binary uploads (octet-stream / multipart) stream cleanly untouched.
+    // Truly opaque binary uploads (octet-stream / multipart) stream cleanly untouched,
+    // while running full archive/multipart/telemetry audit inspection on the real bytes.
     if is_binary_rpc_content_type(req_ct) {
         let req_len = body.len();
+        let req_ce = headers.get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok());
+        let bin_host = target_url.host_str().map(str::to_string);
+        let bin_signals = crate::audit::inspect_http_audit_signals(
+            bin_host.as_deref(),
+            &telemetry_path,
+            req_ct,
+            req_ce,
+            Some(&headers),
+            body.as_ref(),
+            None,
+            category,
+            0,
+        );
+        let (bin_purpose, bin_purpose_detail) = crate::audit::classify_request_purpose(
+            method.as_str(),
+            bin_host.as_deref(),
+            &telemetry_path,
+            req_ct,
+            None,
+            category,
+            &bin_signals,
+        );
         let req_note = format!(
             "[binary RPC payload ({}, {} bytes) — passed through untouched]",
             req_ct.unwrap_or("binary"),
@@ -2698,6 +2950,9 @@ async fn execute_proxy_forward(
                     upstream_vendor,
                 });
                 rec.request_bytes = req_len;
+                rec.audit_signals = bin_signals;
+                rec.purpose = bin_purpose;
+                rec.purpose_detail = bin_purpose_detail;
                 state.push_record(rec);
                 let mut out = Response::new(Body::from_stream(stream_with_idle_timeout(
                     resp.bytes_stream(),
@@ -2733,6 +2988,9 @@ async fn execute_proxy_forward(
                     upstream_vendor,
                 });
                 rec.request_bytes = req_len;
+                rec.audit_signals = bin_signals;
+                rec.purpose = bin_purpose;
+                rec.purpose_detail = bin_purpose_detail;
                 state.push_record(rec);
                 json_error(StatusCode::BAD_GATEWAY, reason, err.to_string())
             }
@@ -2758,6 +3016,9 @@ async fn execute_proxy_forward(
                     upstream_vendor,
                 });
                 rec.request_bytes = req_len;
+                rec.audit_signals = bin_signals;
+                rec.purpose = bin_purpose;
+                rec.purpose_detail = bin_purpose_detail;
                 state.push_record(rec);
                 json_error(
                     StatusCode::BAD_GATEWAY,
@@ -2896,10 +3157,20 @@ async fn execute_proxy_forward(
         &telemetry_path,
         req_content_type.as_deref(),
         request_encoding,
+        Some(&headers),
         body.as_ref(),
         inspectable_text,
         category,
         finding_total,
+    );
+    let (http_purpose, http_purpose_detail) = crate::audit::classify_request_purpose(
+        method.as_str(),
+        req_host.as_deref(),
+        &telemetry_path,
+        req_content_type.as_deref(),
+        inspectable_text,
+        category,
+        &http_audit_signals,
     );
     let record_base =
         |status: u16, vendor_response: &str, local_response: &str, restored: usize, withheld: usize, action: String| {
@@ -2924,6 +3195,8 @@ async fn execute_proxy_forward(
             });
             rec.request_bytes = raw_request_len;
             rec.audit_signals = http_audit_signals.clone();
+            rec.purpose = http_purpose;
+            rec.purpose_detail = http_purpose_detail.clone();
             rec
         };
 
@@ -3038,13 +3311,31 @@ async fn execute_proxy_forward(
         ));
         return json_error(StatusCode::BAD_GATEWAY, "unsupported_upstream_encoding", msg);
     }
-    let is_event_stream = resp_ct
+    let resp_mime = resp_ct
         .as_deref()
-        .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
+        .and_then(|ct| ct.split(';').next())
+        .map(|m| m.trim().to_ascii_lowercase());
+    let is_event_stream = resp_mime.as_deref() == Some("text/event-stream");
+    let is_ndjson_stream = matches!(
+        resp_mime.as_deref(),
+        Some("application/x-ndjson" | "application/jsonl" | "application/stream+json")
+    );
 
-    if is_event_stream {
+    if is_event_stream || is_ndjson_stream {
         let restorer = (cfg.mode != PrivacyMode::AuditOnly).then(|| {
-            SseRestorer::with_policy_scoped(state.vault.clone(), vault_scope.clone(), cfg.tool_call_secret_policy)
+            if is_event_stream {
+                TextStreamRestorer::Sse(SseRestorer::with_policy_scoped(
+                    state.vault.clone(),
+                    vault_scope.clone(),
+                    cfg.tool_call_secret_policy,
+                ))
+            } else {
+                TextStreamRestorer::Ndjson(Box::new(NdjsonRestorer::with_policy_scoped(
+                    state.vault.clone(),
+                    vault_scope.clone(),
+                    cfg.tool_call_secret_policy,
+                )))
+            }
         });
         let stream_state = ProxyStreamState {
             inner: Box::pin(upstream_resp.bytes_stream()),
@@ -3305,10 +3596,20 @@ async fn execute_protobuf_forward(state: &GatewayState, input: ProtobufForwardIn
         &endpoint_label,
         Some(&req_ct_str),
         headers.get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()),
+        Some(&headers),
         body.as_ref(),
         Some(&local_req_preview),
         category,
         pb_finding_total,
+    );
+    let (pb_purpose, pb_purpose_detail) = crate::audit::classify_request_purpose(
+        method.as_str(),
+        pb_host.as_deref(),
+        &endpoint_label,
+        Some(&req_ct_str),
+        Some(&local_req_preview),
+        category,
+        &pb_audit_signals,
     );
 
     let make_record =
@@ -3334,6 +3635,8 @@ async fn execute_protobuf_forward(state: &GatewayState, input: ProtobufForwardIn
             });
             rec.request_bytes = raw_req_len;
             rec.audit_signals = pb_audit_signals.clone();
+            rec.purpose = pb_purpose;
+            rec.purpose_detail = pb_purpose_detail.clone();
             rec
         };
 
@@ -3754,6 +4057,7 @@ impl GrpcProxyStreamState {
                 &record.endpoint,
                 Some(req_ct),
                 None,
+                None,
                 record.local_request_payload.as_bytes(),
                 Some(&record.local_request_payload),
                 record.category,
@@ -3770,6 +4074,17 @@ impl GrpcProxyStreamState {
                     detail: format!("Large streaming RPC payload ({} bytes)", m.request_bytes),
                 });
             }
+            let (purpose, purpose_detail) = crate::audit::classify_request_purpose(
+                &record.method,
+                host.as_deref(),
+                &record.endpoint,
+                Some(req_ct),
+                Some(&record.local_request_payload),
+                record.category,
+                &signals,
+            );
+            record.purpose = purpose;
+            record.purpose_detail = purpose_detail;
             record.audit_signals = signals;
         }
         let fallback_note = format!("[{}, {} bytes]", self.resp_ct, record.response_bytes);
@@ -3871,10 +4186,45 @@ async fn read_limited_upstream_text(
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+enum TextStreamRestorer {
+    Sse(SseRestorer),
+    Ndjson(Box<NdjsonRestorer>),
+}
+
+impl TextStreamRestorer {
+    fn push_bytes(&mut self, bytes: &[u8]) -> std::io::Result<String> {
+        match self {
+            Self::Sse(r) => r.push_bytes(bytes),
+            Self::Ndjson(r) => r.push_bytes(bytes),
+        }
+    }
+
+    fn finish(&mut self) -> std::io::Result<(String, usize)> {
+        match self {
+            Self::Sse(r) => r.finish(),
+            Self::Ndjson(r) => r.finish(),
+        }
+    }
+
+    fn restored(&self) -> usize {
+        match self {
+            Self::Sse(r) => r.restored(),
+            Self::Ndjson(r) => r.restored(),
+        }
+    }
+
+    fn withheld(&self) -> usize {
+        match self {
+            Self::Sse(r) => r.withheld(),
+            Self::Ndjson(r) => r.withheld(),
+        }
+    }
+}
+
 struct ProxyStreamState<S> {
     inner: std::pin::Pin<Box<S>>,
     idle_timeout: Duration,
-    restorer: Option<SseRestorer>,
+    restorer: Option<TextStreamRestorer>,
     vendor_raw_acc: Vec<u8>,
     restored_acc: Vec<u8>,
     unterminated_sse_bytes: usize,
@@ -5230,6 +5580,131 @@ mod tests {
             }
         }
         assert_eq!(assembled, "sk-wuehbfybhsbchj4564sceuajnchskr done");
+        let records = state.get_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].restored_count, 1);
+    }
+
+    #[tokio::test]
+    async fn logs_and_vault_support_conditional_etag_304() {
+        let state = GatewayState::with_admin_token(HideConfig::default(), TEST_TOKEN);
+        let gateway = serve(build_router(state.clone())).await;
+
+        let r1 = client()
+            .get(format!("{gateway}/api/logs"))
+            .header("x-hide-go-token", TEST_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let logs_etag = r1.headers().get(header::ETAG).unwrap().to_str().unwrap().to_string();
+
+        let r2 = client()
+            .get(format!("{gateway}/api/logs"))
+            .header("x-hide-go-token", TEST_TOKEN)
+            .header(header::IF_NONE_MATCH, &logs_etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::NOT_MODIFIED);
+
+        let v1 = client()
+            .get(format!("{gateway}/api/vault"))
+            .header("x-hide-go-token", TEST_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(v1.status(), StatusCode::OK);
+        let vault_etag = v1.headers().get(header::ETAG).unwrap().to_str().unwrap().to_string();
+
+        let v2 = client()
+            .get(format!("{gateway}/api/vault"))
+            .header("x-hide-go-token", TEST_TOKEN)
+            .header(header::IF_NONE_MATCH, &vault_etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(v2.status(), StatusCode::NOT_MODIFIED);
+
+        // Mutate via simulation -> both ETags advance and return 200 OK.
+        state.simulate_traffic(HarnessKind::ClaudeCode, TrafficCategory::InteractivePrompt, None);
+
+        let r3 = client()
+            .get(format!("{gateway}/api/logs"))
+            .header("x-hide-go-token", TEST_TOKEN)
+            .header(header::IF_NONE_MATCH, &logs_etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r3.status(), StatusCode::OK);
+        assert_ne!(r3.headers().get(header::ETAG).unwrap().to_str().unwrap(), logs_etag);
+
+        let v3 = client()
+            .get(format!("{gateway}/api/vault"))
+            .header("x-hide-go-token", TEST_TOKEN)
+            .header(header::IF_NONE_MATCH, &vault_etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(v3.status(), StatusCode::OK);
+        assert_ne!(v3.headers().get(header::ETAG).unwrap().to_str().unwrap(), vault_etag);
+    }
+
+    #[tokio::test]
+    async fn ndjson_streaming_response_restores_split_tokens() {
+        let mut cfg = HideConfig::default();
+        cfg.mode = PrivacyMode::AutoDesensitize;
+        let state = GatewayState::with_admin_token(cfg, TEST_TOKEN).with_loopback_for_tests(true);
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().fallback(|body: Bytes| async move {
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            let prompt = v["messages"][0]["content"].as_str().unwrap_or("");
+            let masked_tok = prompt
+                .split_whitespace()
+                .find(|w| w.starts_with("sk-"))
+                .unwrap_or("")
+                .to_string();
+            let mid = masked_tok.len() / 2;
+            let (left, right) = masked_tok.split_at(mid);
+            let f1 = serde_json::json!({"model":"qwen","message":{"role":"assistant","content":left},"done":false});
+            let f2 = serde_json::json!({"model":"qwen","message":{"role":"assistant","content":right},"done":false});
+            let f3 = serde_json::json!({"model":"qwen","message":{"role":"assistant","content":" ok"},"done":true});
+            let payload = format!("{f1}\n{f2}\n{f3}\n");
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/x-ndjson")],
+                payload,
+            )
+        });
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let gateway = serve(build_router(state.clone())).await;
+        let req_body = serde_json::json!({
+            "model": "qwen",
+            "messages": [{"role": "user", "content": "echo sk-ndjson1234567890abcdef123456"}]
+        })
+        .to_string();
+        let resp = client()
+            .post(format!("{gateway}/codex/api/chat"))
+            .header("x-hide-go-token", TEST_TOKEN)
+            .header("x-hide-go-upstream", format!("http://{upstream_addr}"))
+            .header("content-type", "application/json")
+            .body(req_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ndjson = resp.text().await.unwrap();
+        let mut assembled = String::new();
+        for line in ndjson.lines() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            assembled.push_str(v["message"]["content"].as_str().unwrap_or(""));
+        }
+        assert_eq!(assembled, "sk-ndjson1234567890abcdef123456 ok");
         let records = state.get_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].restored_count, 1);
