@@ -7,12 +7,15 @@ pub mod connect;
 pub mod desensitizer;
 pub mod harness;
 pub mod harness_detect;
+pub mod protobuf;
 pub mod protocol;
 pub mod proxy;
 pub mod restore;
 pub mod scanner;
 pub mod sse_restorer;
 pub mod stream_restorer;
+pub mod system_proxy;
+pub mod upstream_proxy;
 pub mod vault;
 
 pub use ca::{CaManager, CaStatus, CaTrustAdapter, MockCaTrustAdapter, RealCaTrustAdapter};
@@ -135,7 +138,9 @@ pub fn verify_margin_liquidation(wallet_signature: &str) -> bool {
         assert!(!out.vendor_payload.contains("verify_margin_liquidation"));
         assert!(!out.vendor_payload.contains("wallet_signature"));
         assert!(!out.vendor_payload.contains("calculate_settlement_fee"));
-        assert!(out.vendor_payload.contains("BotanicalSensor"));
+        assert!(!out.vendor_payload.contains("quantum margin"));
+        assert!(!out.vendor_payload.contains("BotanicalSensor"));
+        assert!(out.vendor_payload.contains("// "));
 
         // Local restoration recovers the exact original financial code
         let (restored, count) = vault.restore_text(&out.vendor_payload);

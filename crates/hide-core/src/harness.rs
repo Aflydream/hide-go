@@ -109,15 +109,15 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
                 "长会话状态持久化在云端存储中保留原始项目符号".to_string(),
             ],
             env_setup_bash: format!(
-                "export OPENAI_BASE_URL=\"{}/codex/v1\"\nexport HTTPS_PROXY=\"{}\"\nexport NO_PROXY=\"localhost,127.0.0.1,::1\"\ncodex",
-                base, base
+                "export OPENAI_BASE_URL=\"{}/codex/v1\"\nexport NO_PROXY=\"localhost,127.0.0.1,::1\"\ncodex",
+                base
             ),
             env_setup_powershell: format!(
-                "$env:OPENAI_BASE_URL=\"{}/codex/v1\"\n$env:HTTPS_PROXY=\"{}\"\n$env:NO_PROXY=\"localhost,127.0.0.1,::1\"\ncodex",
-                base, base
+                "$env:OPENAI_BASE_URL=\"{}/codex/v1\"\n$env:NO_PROXY=\"localhost,127.0.0.1,::1\"\ncodex",
+                base
             ),
             integration_note: Some(
-                "修改 ~/.codex/config.toml 中当前激活的 provider base_url（保留已有上游配置），并通过 ~/.hide-go/env.ps1 或 Shell 配置文件注入 OPENAI_BASE_URL、HTTPS_PROXY 与 CODEX_CA_CERTIFICATE。"
+                "通过 Base URL 反向代理接入（无需安装根证书）：修改 ~/.codex/config.toml 中当前生效的 [model_providers.*].base_url（或顶层 openai_base_url）与 OPENAI_BASE_URL，并保留已有上游地址（含本地中转网关）进行链式转发。"
                     .to_string(),
             ),
             detected_active: false,
@@ -126,10 +126,10 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
             configured: false,
             configured_via: None,
             auto_connect_mode: AutoConnectMode::ConfigFile,
-            requires_ca_trust: true,
+            requires_ca_trust: false,
             auto_connect_targets: vec![
-                "~/.codex/config.toml ([model_providers].base_url)".to_string(),
-                "~/.hide-go/env.ps1 / Shell 配置文件 (OPENAI_BASE_URL, HTTPS_PROXY, CODEX_CA_CERTIFICATE, SSL_CERT_FILE)".to_string(),
+                "~/.codex/config.toml ([model_providers.*].base_url / openai_base_url)".to_string(),
+                "~/.hide-go/env.ps1 / Shell 配置文件 (OPENAI_BASE_URL)".to_string(),
             ],
             traffic_count: 0,
             last_seen_at: None,
@@ -140,24 +140,24 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
             vendor_name: "Google DeepMind / Multi-Model Gateway".to_string(),
             default_upstream: "https://generativelanguage.googleapis.com".to_string(),
             local_proxy_route: "/antigravity".to_string(),
-            protocol_family: "Google Gemini / Multi-Agent Stream Protocol".to_string(),
-            description: "全自主多步规划 Agent 环境，具备深度仓库检索、跨文件重构与后台子智能体协同能力。"
+            protocol_family: "Gemini / CloudCode gRPC · Protobuf · REST API".to_string(),
+            description: "全自主多步规划 Agent 环境，支持 gRPC/Protobuf 与 Gemini REST 流式推理及子智能体工具调用。"
                 .to_string(),
             risk_summary: vec![
                 "子智能体并发调研时可能批量上传数十个核心业务源码文件".to_string(),
                 "系统提示词中包含宿主机用户名、工作区目录结构与 Git 远端地址".to_string(),
-                "长上下文窗口一次性聚合大量私有架构设计与内部接口定义".to_string(),
+                "长上下文与流式 gRPC/Protobuf 帧中可能携带原始密钥、内网地址与项目路径".to_string(),
             ],
             env_setup_bash: format!(
-                "export HTTPS_PROXY=\"{}\"\nexport HTTP_PROXY=\"{}\"\nexport NO_PROXY=\"localhost,127.0.0.1,::1\"\nagy",
+                "export HTTPS_PROXY=\"{}\"\nexport NO_PROXY=\"localhost,127.0.0.1,::1\"\nexport GOOGLE_GEMINI_BASE_URL=\"{}/antigravity\"",
                 base, base
             ),
             env_setup_powershell: format!(
-                "$env:HTTPS_PROXY=\"{}\"\n$env:HTTP_PROXY=\"{}\"\n$env:NO_PROXY=\"localhost,127.0.0.1,::1\"\nagy",
+                "$env:HTTPS_PROXY=\"{}\"\n$env:NO_PROXY=\"localhost,127.0.0.1,::1\"\n$env:GOOGLE_GEMINI_BASE_URL=\"{}/antigravity\"",
                 base, base
             ),
             integration_note: Some(
-                "配置 Antigravity IDE 的 User/settings.json 代理项及终端环境变量（HTTPS_PROXY / NODE_EXTRA_CA_CERTS）；二进制 Connect RPC 流量原样透传。"
+                "自动启用可逆系统代理链（自动串接现有代理，退出或断开时原样恢复）并同步写入 Antigravity User/settings.json 与终端环境变量，支持 gRPC/Protobuf 及 REST 流量实时脱敏与还原；拦截 HTTPS AI 域名需信任本地根证书。"
                     .to_string(),
             ),
             detected_active: false,
@@ -168,8 +168,9 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
             auto_connect_mode: AutoConnectMode::ConfigFile,
             requires_ca_trust: true,
             auto_connect_targets: vec![
-                "Antigravity IDE/User/settings.json (http.proxy, http.proxySupport, terminal.integrated.env.*)".to_string(),
-                "~/.hide-go/env.ps1 / Shell 配置文件 (HTTPS_PROXY, HTTP_PROXY, NO_PROXY, NODE_EXTRA_CA_CERTS)".to_string(),
+                "系统代理链（运行期接管，退出自动还原）".to_string(),
+                "Antigravity User/settings.json (http.proxy, terminal.integrated.env.*)".to_string(),
+                "~/.hide-go/env.ps1 / Shell 配置文件 (HTTPS_PROXY, NODE_EXTRA_CA_CERTS, SSL_CERT_FILE)".to_string(),
             ],
             traffic_count: 0,
             last_seen_at: None,

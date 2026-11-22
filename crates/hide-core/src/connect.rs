@@ -11,9 +11,12 @@
 
 use crate::ca::validate_leaf_host;
 use crate::config::HideConfig;
+use crate::protobuf::detect_protobuf_framing;
 use crate::proxy::{
-    build_router, handle_forward_http_request, handle_mitm_http_request, GatewayState, MAX_REQUEST_BODY,
+    build_router, handle_forward_http_request, handle_mitm_http_request, handle_mitm_streaming_rpc_request,
+    GatewayState, MAX_REQUEST_BODY,
 };
+use crate::upstream_proxy::{connect_via_http_proxy, detect_upstream_proxy_for_host};
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
@@ -47,8 +50,10 @@ const EXACT_AI_MITM_HOSTS: &[&str] = &[
     "api.openai.com",
     "generativelanguage.googleapis.com",
     "cloudcode-pa.googleapis.com",
+    "cloudaicompanion.googleapis.com",
     "daily-cloudcode-pa.sandbox.googleapis.com",
     "autopush-cloudcode-pa.sandbox.googleapis.com",
+    "antigravity-pa.googleapis.com",
     "aiplatform.googleapis.com",
     "api2.cursor.sh",
     "api3.cursor.sh",
@@ -83,6 +88,12 @@ const NEVER_MITM_EXACT_HOSTS: &[&str] = &[
     "storage.googleapis.com",
     "auth.qoder.sh",
     "login.qoder.sh",
+    "auth.qoder.com",
+    "login.qoder.com",
+    "auth.qoder.com.cn",
+    "login.qoder.com.cn",
+    "auth.cursor.sh",
+    "login.cursor.sh",
     "chatgpt.com",
 ];
 
@@ -117,12 +128,34 @@ fn is_builtin_ai_wildcard(host: &str) -> bool {
             return true;
         }
     }
-    // `*.cursorapi.com`
-    if match_host_pattern(host, "*.cursorapi.com") {
+    // `*-cloudcode-pa.googleapis.com`, `*-cloudcode-pa.sandbox.googleapis.com`,
+    // `*-antigravity-pa.googleapis.com`, `*-antigravity-pa.sandbox.googleapis.com`
+    for suffix in [
+        "-generativelanguage.googleapis.com",
+        "-cloudaicompanion.googleapis.com",
+        "-cloudcode-pa.googleapis.com",
+        "-cloudcode-pa.sandbox.googleapis.com",
+        "-antigravity-pa.googleapis.com",
+        "-antigravity-pa.sandbox.googleapis.com",
+    ] {
+        if let Some(prefix) = host.strip_suffix(suffix) {
+            if !prefix.is_empty() && !prefix.contains('.') {
+                return true;
+            }
+        }
+    }
+    if match_host_pattern(host, "*.cloudcode-pa.googleapis.com") {
         return true;
     }
-    // `*.qoder.sh` (auth/login already guarded out by NEVER_MITM_EXACT_HOSTS)
-    if match_host_pattern(host, "*.qoder.sh") {
+    // `*.cursorapi.com` / `*.cursor.sh` (auth/login guarded out by NEVER_MITM_EXACT_HOSTS)
+    if match_host_pattern(host, "*.cursorapi.com") || match_host_pattern(host, "*.cursor.sh") {
+        return true;
+    }
+    // `*.qoder.sh` / `*.qoder.com` / `*.qoder.com.cn` (auth/login guarded out by NEVER_MITM_EXACT_HOSTS)
+    if match_host_pattern(host, "*.qoder.sh")
+        || match_host_pattern(host, "*.qoder.com")
+        || match_host_pattern(host, "*.qoder.com.cn")
+    {
         return true;
     }
     // `*.openai.azure.com`
@@ -499,6 +532,94 @@ where
     }
 }
 
+async fn dial_upstream_tcp(
+    host: &str,
+    port: u16,
+    cfg: &HideConfig,
+    allow_loopback_for_tests: bool,
+    err_prefix: &str,
+) -> Result<TcpStream, Box<Response>> {
+    let explicit_loopback = is_allowed_loopback_proxy_target(host, port, cfg);
+    let allow_loopback = allow_loopback_for_tests || explicit_loopback;
+
+    if !allow_loopback_for_tests && !explicit_loopback && !is_loopback_host_str(host) {
+        if let Some(proxy_url) = detect_upstream_proxy_for_host(cfg.proxy_port, Some(host)) {
+            match connect_via_http_proxy(&proxy_url, host, port, CONNECT_UPSTREAM_TIMEOUT).await {
+                Ok(stream) => return Ok(stream),
+                Err(err) => {
+                    tracing::debug!(
+                        "upstream HTTP proxy CONNECT failed for {host}:{port} via {proxy_url} ({err}); falling back to direct"
+                    );
+                }
+            }
+        }
+    }
+
+    let resolved = match tokio::time::timeout(CONNECT_UPSTREAM_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+        Ok(Ok(addrs)) => addrs.collect::<Vec<SocketAddr>>(),
+        Ok(Err(err)) => {
+            return Err(Box::new(connect_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("{err_prefix}_dns_failed"),
+                format!("failed to resolve {host}:{port}: {err}"),
+            )));
+        }
+        Err(_) => {
+            return Err(Box::new(connect_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                &format!("{err_prefix}_dns_timeout"),
+                format!("timed out resolving {host}:{port}"),
+            )));
+        }
+    };
+
+    let filtered: Vec<SocketAddr> = if err_prefix == "websocket" {
+        resolved
+            .into_iter()
+            .filter(|sa| is_allowed_resolved_ip(sa.ip(), port, cfg.proxy_port, allow_loopback))
+            .collect()
+    } else {
+        if resolved.is_empty()
+            || resolved.iter().any(|addr| {
+                if explicit_loopback && !allow_loopback_for_tests {
+                    !is_loopback_ip(addr.ip()) || port == 0 || (cfg.proxy_port != 0 && port == cfg.proxy_port)
+                } else {
+                    !is_allowed_resolved_ip(addr.ip(), port, cfg.proxy_port, allow_loopback)
+                }
+            })
+        {
+            return Err(Box::new(connect_error(
+                StatusCode::FORBIDDEN,
+                "forbidden_connect_target",
+                "CONNECT target resolved to a non-public IP blocked by gateway policy",
+            )));
+        }
+        resolved
+    };
+
+    if filtered.is_empty() {
+        return Err(Box::new(connect_error(
+            StatusCode::FORBIDDEN,
+            "forbidden_target",
+            "target resolved solely to non-public addresses",
+        )));
+    }
+
+    match tokio::time::timeout(CONNECT_UPSTREAM_TIMEOUT, TcpStream::connect(filtered.as_slice())).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(err)) => Err(Box::new(connect_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("{err_prefix}_upstream_failed"),
+            format!("failed to connect to {host}:{port}: {err}"),
+        ))),
+        Err(_) => Err(Box::new(connect_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            &format!("{err_prefix}_upstream_timeout"),
+            format!("timed out connecting to {host}:{port}"),
+        ))),
+    }
+}
+
 async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Response {
     if is_browser_cross_site_proxy_trigger(req.headers()) {
         return connect_error(
@@ -532,64 +653,11 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
     };
 
     if !should_mitm_host(&host, &cfg) {
-        let resolved = match tokio::time::timeout(
-            CONNECT_UPSTREAM_TIMEOUT,
-            tokio::net::lookup_host((host.as_str(), port)),
-        )
-        .await
-        {
-            Ok(Ok(addrs)) => addrs.collect::<Vec<SocketAddr>>(),
-            Ok(Err(err)) => {
-                return connect_error(
-                    StatusCode::BAD_GATEWAY,
-                    "connect_dns_failed",
-                    format!("failed to resolve {host}:{port}: {err}"),
-                );
-            }
-            Err(_) => {
-                return connect_error(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "connect_dns_timeout",
-                    format!("timed out resolving {host}:{port}"),
-                );
-            }
+        state.record_connect_host(&host, port, false, false);
+        let mut upstream = match dial_upstream_tcp(&host, port, &cfg, state.allow_loopback_for_tests, "connect").await {
+            Ok(stream) => stream,
+            Err(err_resp) => return *err_resp,
         };
-        let explicit_loopback = is_allowed_loopback_proxy_target(&host, port, &cfg);
-        let allow_loopback = state.allow_loopback_for_tests || explicit_loopback;
-        if resolved.is_empty()
-            || resolved.iter().any(|addr| {
-                if explicit_loopback && !state.allow_loopback_for_tests {
-                    !is_loopback_ip(addr.ip()) || port == 0 || (cfg.proxy_port != 0 && port == cfg.proxy_port)
-                } else {
-                    !is_allowed_resolved_ip(addr.ip(), port, cfg.proxy_port, allow_loopback)
-                }
-            })
-        {
-            return connect_error(
-                StatusCode::FORBIDDEN,
-                "forbidden_connect_target",
-                "CONNECT target resolved to a non-public IP blocked by gateway policy",
-            );
-        }
-
-        let mut upstream =
-            match tokio::time::timeout(CONNECT_UPSTREAM_TIMEOUT, TcpStream::connect(resolved.as_slice())).await {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(err)) => {
-                    return connect_error(
-                        StatusCode::BAD_GATEWAY,
-                        "connect_upstream_failed",
-                        format!("failed to connect to {host}:{port}: {err}"),
-                    );
-                }
-                Err(_) => {
-                    return connect_error(
-                        StatusCode::GATEWAY_TIMEOUT,
-                        "connect_upstream_timeout",
-                        format!("timed out connecting to {host}:{port}"),
-                    );
-                }
-            };
 
         let on_upgrade = hyper::upgrade::on(req);
         tokio::spawn(async move {
@@ -609,6 +677,7 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
         return Response::new(Body::empty());
     }
 
+    state.record_connect_host(&host, port, true, false);
     if let Err(err) = validate_leaf_host(&host) {
         return connect_error(
             StatusCode::BAD_REQUEST,
@@ -644,10 +713,12 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
                 Ok(Ok(s)) => s,
                 Ok(Err(err)) => {
                     tracing::debug!("TLS handshake failed inside MITM tunnel for {host}:{port}: {err}");
+                    state.record_mitm_tls_failure(&host, port, &err.to_string());
                     return;
                 }
                 Err(_) => {
                     tracing::debug!("TLS handshake timed out inside MITM tunnel for {host}:{port}");
+                    state.record_mitm_tls_failure(&host, port, "TLS handshake timed out");
                     return;
                 }
             };
@@ -662,6 +733,22 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
                     return Ok::<_, Infallible>(handle_mitm_websocket_upgrade(state, host, port, inner_req).await);
                 }
                 let (parts, incoming) = inner_req.into_parts();
+                let req_ct = parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok());
+                if let Some(framing) = detect_protobuf_framing(req_ct).filter(|f| f.is_enveloped()) {
+                    let resp = handle_mitm_streaming_rpc_request(
+                        state,
+                        "https",
+                        &host,
+                        port,
+                        framing,
+                        parts.method,
+                        parts.uri,
+                        parts.headers,
+                        incoming,
+                    )
+                    .await;
+                    return Ok::<_, Infallible>(resp);
+                }
                 let body_bytes = match read_limited_body(incoming).await {
                     Ok(bytes) => bytes,
                     Err(err_resp) => return Ok::<_, Infallible>(*err_resp),
@@ -743,36 +830,9 @@ async fn handle_mitm_websocket_upgrade(
         );
     }
 
-    let resolved: Vec<SocketAddr> =
-        match tokio::time::timeout(CONNECT_UPSTREAM_TIMEOUT, tokio::net::lookup_host((host.as_str(), port))).await {
-            Ok(Ok(addrs)) => addrs
-                .filter(|sa| is_allowed_resolved_ip(sa.ip(), port, cfg.proxy_port, allow_loopback))
-                .collect(),
-            _ => {
-                return connect_error(
-                    StatusCode::BAD_GATEWAY,
-                    "websocket_dns_failed",
-                    format!("failed to resolve WebSocket upstream {host}:{port}"),
-                );
-            }
-        };
-    if resolved.is_empty() {
-        return connect_error(
-            StatusCode::FORBIDDEN,
-            "forbidden_target",
-            "WebSocket target resolved solely to non-public addresses",
-        );
-    }
-
-    let tcp = match tokio::time::timeout(CONNECT_UPSTREAM_TIMEOUT, TcpStream::connect(resolved.as_slice())).await {
-        Ok(Ok(s)) => s,
-        _ => {
-            return connect_error(
-                StatusCode::BAD_GATEWAY,
-                "websocket_connect_failed",
-                format!("failed to connect to WebSocket upstream {host}:{port}"),
-            );
-        }
+    let tcp = match dial_upstream_tcp(&host, port, &cfg, state.allow_loopback_for_tests, "websocket").await {
+        Ok(s) => s,
+        Err(err_resp) => return *err_resp,
     };
 
     let Ok(server_name) = rustls::pki_types::ServerName::try_from(host.clone()) else {
@@ -1260,6 +1320,7 @@ mod tests {
             .add_root_certificate(reqwest::Certificate::from_der(&upstream_ca_der).unwrap())
             .build()
             .unwrap();
+        state.use_system_upstream_proxy = false;
         state.http_client = upstream_client.clone();
         state.local_http_client = upstream_client;
 
@@ -1301,7 +1362,7 @@ mod tests {
             "expected restored API key, got: {restored_text}"
         );
 
-        // Binary Connect+Proto payload over MITM must pass through byte-for-byte
+        // Invalid/opaque Connect+Proto payload fails safe and passes through byte-for-byte
         let bin_payload = vec![0x00, 0x00, 0x00, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o'];
         let bin_resp = client
             .post(format!(
@@ -1317,9 +1378,43 @@ mod tests {
         let logs = captured.lock().await;
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[1].1, bin_payload);
+        drop(logs);
+
+        // Valid Connect+Proto Protobuf message carrying a secret key MUST be desensitized before upstream!
+        let secret_text = "sk-wbefwubfbsrfrsuf baseurl:linuu.do/v1";
+        let mut pb_msg = vec![0x0A, secret_text.len() as u8];
+        pb_msg.extend_from_slice(secret_text.as_bytes());
+        let mut connect_proto_req = vec![0x00];
+        connect_proto_req.extend_from_slice(&(pb_msg.len() as u32).to_be_bytes());
+        connect_proto_req.extend_from_slice(&pb_msg);
+
+        let pb_resp = client
+            .post(format!(
+                "https://{upstream_addr}/google.internal.cloud.code.v1internal.CodeAssist/StreamGenerateContent"
+            ))
+            .header("content-type", "application/connect+proto")
+            .body(connect_proto_req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pb_resp.status(), StatusCode::OK);
+
+        let logs = captured.lock().await;
+        assert_eq!(logs.len(), 3);
+        let upstream_wire = &logs[2].1;
+        assert!(
+            !String::from_utf8_lossy(upstream_wire).contains("sk-wbefwubfbsrfrsuf"),
+            "upstream must never see raw secret key inside Connect+Proto payload"
+        );
+        assert!(
+            String::from_utf8_lossy(upstream_wire).contains("baseurl:linuu.do/v1"),
+            "non-sensitive text must remain intact inside Connect+Proto payload"
+        );
+        drop(logs);
 
         let audits = state.audit_logs.read();
-        assert!(audits.iter().any(|r| r.action_taken == "binary-rpc-passthrough"));
+        assert!(audits.iter().any(|r| r.action_taken == "protobuf-passed"));
+        assert!(audits.iter().any(|r| r.action_taken == "protobuf-desensitized"));
     }
 
     #[tokio::test]
@@ -1568,5 +1663,178 @@ mod tests {
         assert!(is_forbidden_operator_upstream("100.100.100.200", 80, 18787));
         assert!(is_forbidden_operator_upstream("metadata.google.internal", 80, 18787));
         assert!(is_forbidden_operator_upstream("fd00:ec2::254", 80, 18787));
+    }
+
+    #[tokio::test]
+    async fn mitm_full_duplex_bidirectional_grpc_streams_without_deadlock_and_restores_each_turn() {
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+        use tokio::sync::mpsc;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Spawn an HTTPS HTTP/2 upstream that echoes each incoming gRPC data frame immediately
+        // BEFORE the client closes its request stream (true full-duplex bidirectional streaming),
+        // then sends `grpc-status: 0` trailer once client ends its stream.
+        let (upstream_ca_der, upstream_server_cfg) = make_independent_upstream_tls("127.0.0.1");
+        let upstream_seen = Arc::new(TokioMutex::new(Vec::<Vec<u8>>::new()));
+        let seen_clone = upstream_seen.clone();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let acceptor = TlsAcceptor::from(upstream_server_cfg);
+            loop {
+                let Ok((tcp, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let seen = seen_clone.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let seen = seen.clone();
+                        async move {
+                            let mut req_body = req.into_body();
+                            let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(8);
+                            tokio::spawn(async move {
+                                while let Some(Ok(frame)) = req_body.frame().await {
+                                    if let Ok(data) = frame.into_data() {
+                                        if data.is_empty() {
+                                            continue;
+                                        }
+                                        seen.lock().await.push(data.to_vec());
+                                        let _ = tx.send(Ok(Frame::data(data))).await;
+                                    }
+                                }
+                                let mut trailers = HeaderMap::new();
+                                trailers.insert("grpc-status", "0".parse().unwrap());
+                                let _ = tx.send(Ok(Frame::trailers(trailers))).await;
+                            });
+                            let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                                rx.recv().await.map(|item| (item, rx))
+                            });
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("content-type", "application/grpc+proto")
+                                    .body(Body::new(StreamBody::new(stream)))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let mut builder =
+                        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+                    builder.http2().timer(hyper_util::rt::TokioTimer::new());
+                    let _ = builder.serve_connection(TokioIo::new(tls), svc).await;
+                });
+            }
+        });
+
+        let gateway_ca = Arc::new(CaManager::ephemeral(Arc::new(MockCaTrustAdapter::new())).unwrap());
+        let hide_ca_der = gateway_ca.ca_cert_der().to_vec();
+        let mut cfg = HideConfig::default();
+        cfg.mitm_extra_hosts.push("127.0.0.1".to_string());
+        let mut state = GatewayState::new(cfg).with_ca(gateway_ca).with_loopback_for_tests(true);
+        state.local_http_client = reqwest::Client::builder()
+            .no_proxy()
+            .add_root_certificate(reqwest::Certificate::from_der(&upstream_ca_der).unwrap())
+            .build()
+            .unwrap();
+        let gw_addr = spawn_gateway_with_state(state.clone()).await;
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::https(format!("http://{gw_addr}")).unwrap())
+            .add_root_certificate(reqwest::Certificate::from_der(&hide_ca_der).unwrap())
+            .build()
+            .unwrap();
+
+        let make_grpc_frame = |text: &str| -> Bytes {
+            let mut pb = vec![0x0A, text.len() as u8];
+            pb.extend_from_slice(text.as_bytes());
+            let mut env = vec![0x00];
+            env.extend_from_slice(&(pb.len() as u32).to_be_bytes());
+            env.extend_from_slice(&pb);
+            Bytes::from(env)
+        };
+
+        let (req_tx, req_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let req_stream =
+            futures_util::stream::unfold(req_rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
+
+        // Send Turn 1 BEFORE closing request stream!
+        let turn1 = "Turn1 secret sk-wbefwubfbsrfrsuf";
+        let turn2 = "Turn2 secret sk-proj-SecondBidiKey1234567890";
+        req_tx.send(Ok(make_grpc_frame(turn1))).await.unwrap();
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            client
+                .post(format!(
+                    "https://{upstream_addr}/google.internal.cloud.code.v1internal.CodeAssist/BidiStream"
+                ))
+                .header("content-type", "application/grpc+proto")
+                .body(reqwest::Body::wrap_stream(req_stream))
+                .send(),
+        )
+        .await
+        .expect("bidirectional gRPC must receive response headers while request stream is still open")
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let http_resp: axum::http::Response<reqwest::Body> = resp.into();
+        let mut resp_body = http_resp.into_body();
+
+        // Receive Turn 1 echo BEFORE sending Turn 2 (proves zero buffering deadlock!).
+        let frame1 = tokio::time::timeout(Duration::from_secs(5), resp_body.frame())
+            .await
+            .expect("must receive Turn 1 response frame before client sends Turn 2")
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&frame1[5..]).contains(turn1),
+            "Turn 1 must restore original secret: {:?}",
+            String::from_utf8_lossy(&frame1)
+        );
+
+        // Now send Turn 2 with a brand-new secret on the SAME open bidirectional stream, then close!
+        req_tx.send(Ok(make_grpc_frame(turn2))).await.unwrap();
+        drop(req_tx);
+
+        let mut rest_data = Vec::new();
+        let mut trailers = HeaderMap::new();
+        while let Some(frame_res) = tokio::time::timeout(Duration::from_secs(5), resp_body.frame())
+            .await
+            .expect("timed out reading Turn 2 / trailers")
+        {
+            let frame = frame_res.unwrap();
+            match frame.into_data() {
+                Ok(d) => rest_data.extend_from_slice(&d),
+                Err(frame) => {
+                    if let Ok(t) = frame.into_trailers() {
+                        trailers.extend(t);
+                    }
+                }
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&rest_data).contains(turn2),
+            "Turn 2 new secret must be restored dynamically by live vault matcher"
+        );
+        assert_eq!(
+            trailers.get("grpc-status").and_then(|v| v.to_str().ok()),
+            Some("0"),
+            "HTTP/2 grpc-status trailer must survive full-duplex bidirectional stream"
+        );
+
+        let seen = upstream_seen.lock().await;
+        let combined_seen: Vec<u8> = seen.iter().flatten().copied().collect();
+        let seen_str = String::from_utf8_lossy(&combined_seen);
+        assert!(!seen_str.contains("sk-wbefwubfbsrfrsuf"));
+        assert!(!seen_str.contains("sk-proj-SecondBidiKey1234567890"));
     }
 }

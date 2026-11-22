@@ -14,13 +14,19 @@ use crate::harness::{detect_harness_and_category, is_inference_endpoint, Harness
 use crate::harness_detect::{
     connect_all_detected, connect_harness, detect_all_harness_profiles, disconnect_harness, parse_harness_slug,
 };
+use crate::protobuf::{
+    detect_protobuf_framing, restore_unary_protobuf, transform_protobuf_outbound, GrpcStreamDesensitizer,
+    GrpcStreamRestorer, OutboundStreamMetrics, ProtobufFraming,
+};
 use crate::restore::restore_response;
 use crate::scanner::{validate_custom_rules, ProjectScanner};
 use crate::sse_restorer::SseRestorer;
+use crate::system_proxy::{is_system_proxy_active_for_port, sync_system_proxy_runtime};
+use crate::upstream_proxy::detect_upstream_proxy_for_host;
 use crate::vault::{mask_preview, PrivacyVault, VaultEntry};
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path, Request, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{header, HeaderMap, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -29,6 +35,8 @@ use axum::{
 };
 use chrono::Local;
 use futures_util::StreamExt;
+use http_body_util::{BodyExt as _, StreamBody};
+use hyper::body::Frame;
 use parking_lot::RwLock;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde::{Deserialize, Serialize};
@@ -56,6 +64,11 @@ const MAX_CONCURRENT_CONNECT_TUNNELS: usize = 256;
 /// Minimum required length for an operator-supplied `HIDE_GO_ADMIN_TOKEN`.
 pub const MIN_ADMIN_TOKEN_LEN: usize = 24;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const UPSTREAM_PROXY_CACHE_TTL: Duration = Duration::from_secs(3);
+const UPDATE_RELEASE_API_URL: &str = "https://api.github.com/repos/Aflydream/hide-go/releases/latest";
+const UPDATE_RELEASE_FALLBACK_URL: &str = "https://github.com/Aflydream/hide-go/releases/latest";
+const UPDATE_CACHE_TTL: Duration = Duration::from_secs(600);
+const UPDATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct PublicOnlyDnsResolver {
     allow_loopback: bool,
@@ -190,6 +203,35 @@ pub struct GatewayStats {
     pub blocked: AtomicU64,
 }
 
+/// Lightweight metadata for a host observed via `HTTP CONNECT` (hostname/port only, no payload).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedConnectHost {
+    pub host: String,
+    pub port: u16,
+    pub mitm: bool,
+    pub tls_failed: bool,
+    pub count: u64,
+    pub last_seen_at: String,
+    #[serde(skip)]
+    last_seq: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MitmHostsResponse {
+    pub mitm_extra_hosts: Vec<String>,
+    pub mitm_bypass_hosts: Vec<String>,
+    pub system_proxy_chain: bool,
+    pub system_proxy_supported: bool,
+    pub system_proxy_active: bool,
+    pub observed_hosts: Vec<ObservedConnectHost>,
+}
+
+const MAX_OBSERVED_CONNECT_HOSTS: usize = 64;
+
+type UpstreamProxyCache = Arc<RwLock<Option<(Instant, Option<String>, Option<reqwest::Client>)>>>;
+
 /// Shared application state for the Hide-Go gateway
 #[derive(Clone)]
 pub struct GatewayState {
@@ -199,13 +241,19 @@ pub struct GatewayState {
     pub ca: Arc<CaManager>,
     pub audit_logs: Arc<RwLock<VecDeque<TrafficAuditRecord>>>,
     pub harness_stats: Arc<RwLock<HashMap<HarnessKind, (u64, String)>>>,
+    pub observed_connect_hosts: Arc<RwLock<HashMap<String, ObservedConnectHost>>>,
+    pub observed_connect_seq: Arc<AtomicU64>,
     pub stats: Arc<GatewayStats>,
     pub http_client: reqwest::Client,
     pub local_http_client: reqwest::Client,
     pub operator_http_client: reqwest::Client,
+    pub upstream_proxy_cache: UpstreamProxyCache,
+    pub update_http_client: reqwest::Client,
+    pub update_cache: Arc<RwLock<Option<(Instant, UpdateCheckResult)>>>,
     pub admin_token: Arc<String>,
     pub connect_semaphore: Arc<Semaphore>,
     pub allow_loopback_for_tests: bool,
+    pub use_system_upstream_proxy: bool,
     pub started_at: Instant,
 }
 
@@ -252,6 +300,28 @@ fn build_operator_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+fn build_proxied_forward_client(proxy_url: &str) -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(Duration::from_secs(MAX_UPSTREAM_IDLE_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .proxy(reqwest::Proxy::all(proxy_url).ok()?)
+        .build()
+        .ok()
+}
+
+fn build_update_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(UPDATE_REQUEST_TIMEOUT)
+        .timeout(UPDATE_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .no_proxy()
+        .dns_resolver(Arc::new(PublicOnlyDnsResolver { allow_loopback: false }))
+        .build()
+        .unwrap_or_default()
+}
+
 fn default_ca_manager() -> Arc<CaManager> {
     let adapter = Arc::new(RealCaTrustAdapter);
     if let Some(dir) = CaManager::default_ca_dir() {
@@ -289,13 +359,19 @@ impl GatewayState {
             ca: default_ca_manager(),
             audit_logs: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_AUDIT_LOGS))),
             harness_stats: Arc::new(RwLock::new(HashMap::new())),
+            observed_connect_hosts: Arc::new(RwLock::new(HashMap::new())),
+            observed_connect_seq: Arc::new(AtomicU64::new(1)),
             stats: Arc::new(GatewayStats::default()),
             http_client: build_client(false, false),
             local_http_client: build_client(true, true),
             operator_http_client: build_operator_client(),
+            upstream_proxy_cache: Arc::new(RwLock::new(None)),
+            update_http_client: build_update_client(),
+            update_cache: Arc::new(RwLock::new(None)),
             admin_token: Arc::new(admin_token),
             connect_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECT_TUNNELS)),
             allow_loopback_for_tests: false,
+            use_system_upstream_proxy: true,
             started_at: Instant::now(),
         }
     }
@@ -304,7 +380,16 @@ impl GatewayState {
     #[doc(hidden)]
     pub fn with_loopback_for_tests(mut self, allow: bool) -> Self {
         self.allow_loopback_for_tests = allow;
+        self.use_system_upstream_proxy = !allow;
         self.http_client = build_client(false, allow);
+        self
+    }
+
+    /// Replace the outbound `http_client` (disabling host system proxy discovery).
+    #[doc(hidden)]
+    pub fn with_custom_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = client;
+        self.use_system_upstream_proxy = false;
         self
     }
 
@@ -328,6 +413,49 @@ impl GatewayState {
 
     pub fn admin_token(&self) -> &str {
         &self.admin_token
+    }
+
+    fn cached_upstream_proxy_client(&self, proxy_url: &str) -> Option<reqwest::Client> {
+        {
+            let guard = self.upstream_proxy_cache.read();
+            if let Some((captured_at, cached_url, cached_client)) = guard.as_ref() {
+                if captured_at.elapsed() < UPSTREAM_PROXY_CACHE_TTL && cached_url.as_deref() == Some(proxy_url) {
+                    return cached_client.clone();
+                }
+            }
+        }
+        let client = build_proxied_forward_client(proxy_url);
+        *self.upstream_proxy_cache.write() = Some((Instant::now(), Some(proxy_url.to_string()), client.clone()));
+        client
+    }
+
+    /// Resolve the outbound `reqwest::Client` for `target_host`, automatically chaining an active
+    /// environment or Windows system proxy for external hosts while keeping loopback/LAN direct.
+    fn resolve_http_clients(
+        &self,
+        target_host: &str,
+        is_loopback: bool,
+        allow_operator_private: bool,
+    ) -> (reqwest::Client, Option<reqwest::Client>) {
+        let direct = if allow_operator_private {
+            self.operator_http_client.clone()
+        } else if is_loopback {
+            self.local_http_client.clone()
+        } else {
+            self.http_client.clone()
+        };
+
+        if is_loopback || self.allow_loopback_for_tests || !self.use_system_upstream_proxy {
+            return (direct, None);
+        }
+
+        let own_port = self.config.read().proxy_port;
+        if let Some(proxy_url) = detect_upstream_proxy_for_host(own_port, Some(target_host)) {
+            if let Some(proxied) = self.cached_upstream_proxy_client(&proxy_url) {
+                return (proxied, Some(direct));
+            }
+        }
+        (direct, None)
     }
 
     pub fn push_record(&self, record: TrafficAuditRecord) {
@@ -371,6 +499,76 @@ impl GatewayState {
 
     pub fn clear_records(&self) {
         self.audit_logs.write().clear();
+    }
+
+    /// Record a `CONNECT host:port` destination in memory (hostname/port metadata only).
+    pub fn record_connect_host(&self, host: &str, port: u16, mitm: bool, tls_failed: bool) {
+        let key = format!("{}:{port}", host.trim().to_ascii_lowercase());
+        let seq = self.observed_connect_seq.fetch_add(1, Ordering::Relaxed);
+        let now = Local::now().format("%H:%M:%S").to_string();
+        let mut map = self.observed_connect_hosts.write();
+        if let Some(existing) = map.get_mut(&key) {
+            existing.mitm = mitm;
+            existing.tls_failed = existing.tls_failed || tls_failed;
+            if !tls_failed {
+                existing.count = existing.count.saturating_add(1);
+            }
+            existing.last_seen_at = now;
+            existing.last_seq = seq;
+            return;
+        }
+        if map.len() >= MAX_OBSERVED_CONNECT_HOSTS {
+            if let Some(oldest_key) = map.iter().min_by_key(|(_, v)| v.last_seq).map(|(k, _)| k.clone()) {
+                map.remove(&oldest_key);
+            }
+        }
+        map.insert(
+            key,
+            ObservedConnectHost {
+                host: host.trim().to_ascii_lowercase(),
+                port,
+                mitm,
+                tls_failed,
+                count: 1,
+                last_seen_at: now,
+                last_seq: seq,
+            },
+        );
+    }
+
+    /// Surface a failed MITM TLS handshake as a visible audit entry so untrusted CA or
+    /// certificate-pinning issues never fail silently with `0 / 0` logs.
+    pub fn record_mitm_tls_failure(&self, host: &str, port: u16, detail: &str) {
+        self.record_connect_host(host, port, true, true);
+        let harness = detect_harness_for_host(host).unwrap_or(HarnessKind::Generic);
+        let cfg = self.get_config();
+        let endpoint = if port == 443 {
+            format!("https://{host}")
+        } else {
+            format!("https://{host}:{port}")
+        };
+        let hint = format!(
+            "TLS handshake rejected by client for {host}:{port} ({detail}). Trust the local Hide-Go Root CA in Integrations, or add {host} to mitmBypassHosts if the client pins certificates."
+        );
+        self.push_record(build_record(RecordInput {
+            harness,
+            category: TrafficCategory::InteractivePrompt,
+            method: "CONNECT".to_string(),
+            endpoint,
+            mode: cfg.mode,
+            action_taken: "tls-handshake-failed".to_string(),
+            status: 0,
+            start: Instant::now(),
+            simulated: false,
+            local_request: "",
+            vendor_request: "",
+            vendor_response: "",
+            local_response: &hint,
+            findings: Vec::new(),
+            restored_count: 0,
+            withheld_count: 0,
+            upstream_vendor: Some(host.to_string()),
+        }));
     }
 
     pub fn get_config(&self) -> HideConfig {
@@ -798,6 +996,17 @@ pub struct StatusResponse {
     pub active_vault_tokens: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCheckResult {
+    pub current_version: String,
+    pub latest_version: String,
+    pub update_available: bool,
+    pub release_url: String,
+    pub published_at: Option<String>,
+    pub checked_at: String,
+}
+
 /// Build the full Axum Router serving both:
 /// 1. Authenticated, Same-Origin-only Control & Inspection REST API for the Desktop UI (`/api/*`)
 /// 2. Live Reverse Proxy & Harness Gateway endpoints (`/:harness/*path`)
@@ -818,8 +1027,10 @@ pub fn build_router(state: GatewayState) -> Router {
         .route("/ca/status", get(api_ca_status))
         .route("/ca/trust", post(api_ca_trust).delete(api_ca_untrust))
         .route("/ca/cert", get(api_ca_cert))
+        .route("/mitm/hosts", get(api_mitm_hosts))
         .route("/simulate", post(api_simulate))
         .route("/rules/validate", post(api_validate_rule))
+        .route("/updates/check", get(api_check_updates))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin_auth));
 
     Router::new()
@@ -960,44 +1171,45 @@ fn is_hop_by_hop(name: &str, headers: &HeaderMap) -> bool {
     })
 }
 
-fn upstream_request_headers(headers: &HeaderMap, admin_token: &str, strip_content_encoding: bool) -> HeaderMap {
+/// Hop-by-hop and internal proxy headers removed before forwarding.
+fn should_strip_outbound_header(name: &str, headers: &HeaderMap) -> bool {
+    is_hop_by_hop(name, headers)
+        || matches!(
+            name,
+            "host"
+                | "content-length"
+                | "origin"
+                | "referer"
+                | "x-upstream-url"
+                | "x-target-upstream"
+                | "via"
+                | "forwarded"
+                | "x-real-ip"
+        )
+        || name.starts_with("x-hide-go-")
+        || name.starts_with("x-forwarded-")
+        || name.starts_with("sec-fetch-")
+}
+
+fn filter_forwarded_headers(
+    headers: &HeaderMap,
+    admin_token: &str,
+    strip_accept_encoding: bool,
+    strip_content_encoding: bool,
+) -> HeaderMap {
     let mut forwarded = HeaderMap::new();
     for (name, value) in headers {
-        if is_hop_by_hop(name.as_str(), headers)
+        let lower = name.as_str();
+        if should_strip_outbound_header(lower, headers)
+            || (strip_accept_encoding && name == header::ACCEPT_ENCODING)
             || (strip_content_encoding && name == header::CONTENT_ENCODING)
-            || matches!(
-                name.as_str(),
-                "host"
-                    | "content-length"
-                    | "accept-encoding"
-                    | "origin"
-                    | "referer"
-                    | "x-hide-go-upstream"
-                    | "x-upstream-url"
-                    | "x-target-upstream"
-                    | "x-hide-go-token"
-            )
-            || name.as_str().starts_with("sec-fetch-")
         {
             continue;
         }
         if name == header::COOKIE {
             if let Ok(cookies) = value.to_str() {
-                let cookies = cookies
-                    .split(';')
-                    .filter(|cookie| {
-                        cookie
-                            .trim()
-                            .split_once('=')
-                            .is_some_and(|(key, _)| key.trim() != "hide_go_session")
-                    })
-                    .map(str::trim)
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                if let Ok(value) = cookies.parse() {
-                    if !cookies.is_empty() {
-                        forwarded.append(name.clone(), value);
-                    }
+                if let Some(filtered) = filter_hide_go_session_cookie(cookies) {
+                    forwarded.append(name.clone(), filtered);
                 }
             }
             continue;
@@ -1013,6 +1225,11 @@ fn upstream_request_headers(headers: &HeaderMap, admin_token: &str, strip_conten
         }
         forwarded.append(name.clone(), value.clone());
     }
+    forwarded
+}
+
+fn upstream_request_headers(headers: &HeaderMap, admin_token: &str, strip_content_encoding: bool) -> HeaderMap {
+    let mut forwarded = filter_forwarded_headers(headers, admin_token, true, strip_content_encoding);
     forwarded.insert(header::ACCEPT_ENCODING, "identity".parse().unwrap());
     forwarded
 }
@@ -1079,6 +1296,178 @@ async fn api_status(State(state): State<GatewayState>) -> Json<StatusResponse> {
     })
 }
 
+#[derive(Deserialize, Default)]
+struct UpdateCheckQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Deserialize)]
+struct GithubLatestRelease {
+    tag_name: String,
+    #[serde(default)]
+    html_url: String,
+    #[serde(default)]
+    published_at: Option<String>,
+}
+
+fn parse_semver_parts(raw: &str) -> Option<(u64, u64, u64, bool)> {
+    let trimmed = raw.trim().trim_start_matches(['v', 'V']);
+    let without_build = trimmed.split('+').next()?.trim();
+    if without_build.is_empty() {
+        return None;
+    }
+    let (core, is_prerelease) = match without_build.split_once('-') {
+        Some((base, pre)) if !pre.trim().is_empty() => (base, true),
+        Some((base, _)) => (base, false),
+        None => (without_build, false),
+    };
+    let mut nums = core.split('.');
+    let major: u64 = nums.next()?.parse().ok()?;
+    let minor: u64 = nums.next().unwrap_or("0").parse().ok()?;
+    let patch: u64 = nums.next().unwrap_or("0").parse().ok()?;
+    if nums.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch, is_prerelease))
+}
+
+fn is_newer_version(current: &str, latest: &str) -> bool {
+    let Some((cmaj, cmin, cpat, cpre)) = parse_semver_parts(current) else {
+        return false;
+    };
+    let Some((lmaj, lmin, lpat, lpre)) = parse_semver_parts(latest) else {
+        return false;
+    };
+    match (lmaj, lmin, lpat).cmp(&(cmaj, cmin, cpat)) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => cpre && !lpre,
+    }
+}
+
+fn build_proxied_update_client(proxy_url: &str) -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(UPDATE_REQUEST_TIMEOUT)
+        .timeout(UPDATE_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .no_proxy()
+        .proxy(reqwest::Proxy::all(proxy_url).ok()?)
+        .build()
+        .ok()
+}
+
+#[derive(Debug)]
+struct UpdateFetchError {
+    is_transport: bool,
+    message: String,
+}
+
+async fn fetch_latest_release_from(
+    client: &reqwest::Client,
+    url: &str,
+    current_version: &str,
+) -> Result<UpdateCheckResult, UpdateFetchError> {
+    let resp = client
+        .get(url)
+        .header(header::ACCEPT, "application/vnd.github+json")
+        .header(header::USER_AGENT, format!("Hide-Go/{current_version}"))
+        .send()
+        .await
+        .map_err(|e| UpdateFetchError {
+            is_transport: true,
+            message: if e.is_timeout() {
+                "request timed out".to_string()
+            } else if e.is_connect() {
+                "network unreachable".to_string()
+            } else {
+                "network request failed".to_string()
+            },
+        })?;
+
+    if !resp.status().is_success() {
+        return Err(UpdateFetchError {
+            is_transport: false,
+            message: format!("upstream returned HTTP {}", resp.status().as_u16()),
+        });
+    }
+
+    let release: GithubLatestRelease = resp.json().await.map_err(|e| UpdateFetchError {
+        is_transport: false,
+        message: format!("invalid release metadata: {e}"),
+    })?;
+
+    let latest_version = release.tag_name.trim().trim_start_matches(['v', 'V']).to_string();
+    if parse_semver_parts(&latest_version).is_none() {
+        return Err(UpdateFetchError {
+            is_transport: false,
+            message: "invalid release version tag".to_string(),
+        });
+    }
+
+    let candidate_url = release.html_url.trim();
+    let release_url = if candidate_url
+        .to_ascii_lowercase()
+        .starts_with("https://github.com/aflydream/hide-go/")
+    {
+        candidate_url.to_string()
+    } else {
+        UPDATE_RELEASE_FALLBACK_URL.to_string()
+    };
+
+    Ok(UpdateCheckResult {
+        current_version: current_version.trim().trim_start_matches(['v', 'V']).to_string(),
+        update_available: is_newer_version(current_version, &latest_version),
+        latest_version,
+        release_url,
+        published_at: release.published_at,
+        checked_at: Local::now().to_rfc3339(),
+    })
+}
+
+async fn api_check_updates(State(state): State<GatewayState>, Query(query): Query<UpdateCheckQuery>) -> Response {
+    if !query.force {
+        if let Some((captured_at, cached)) = state.update_cache.read().clone() {
+            if captured_at.elapsed() < UPDATE_CACHE_TTL {
+                return Json(cached).into_response();
+            }
+        }
+    }
+
+    let own_port = state.config.read().proxy_port;
+    let res = if let Some(proxied) =
+        detect_upstream_proxy_for_host(own_port, Some("api.github.com")).and_then(|p| build_proxied_update_client(&p))
+    {
+        match fetch_latest_release_from(&proxied, UPDATE_RELEASE_API_URL, env!("CARGO_PKG_VERSION")).await {
+            Ok(ok) => Ok(ok),
+            Err(err) if err.is_transport => {
+                fetch_latest_release_from(
+                    &state.update_http_client,
+                    UPDATE_RELEASE_API_URL,
+                    env!("CARGO_PKG_VERSION"),
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        }
+    } else {
+        fetch_latest_release_from(
+            &state.update_http_client,
+            UPDATE_RELEASE_API_URL,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .await
+    };
+
+    match res {
+        Ok(result) => {
+            *state.update_cache.write() = Some((Instant::now(), result.clone()));
+            Json(result).into_response()
+        }
+        Err(err) => json_error(StatusCode::BAD_GATEWAY, "update_check_failed", err.message),
+    }
+}
+
 async fn api_get_config(State(state): State<GatewayState>) -> Json<HideConfig> {
     Json(state.get_config())
 }
@@ -1088,7 +1477,12 @@ async fn api_update_config(State(state): State<GatewayState>, Json(mut next): Js
         next.harness_upstreams = state.config.read().harness_upstreams.clone();
     }
     match state.try_update_config(next) {
-        Ok(cfg) => Json(cfg).into_response(),
+        Ok(cfg) => {
+            if state.use_system_upstream_proxy && !state.allow_loopback_for_tests {
+                sync_system_proxy_runtime(cfg.system_proxy_chain, cfg.proxy_port);
+            }
+            Json(cfg).into_response()
+        }
         Err(message) => json_error(StatusCode::BAD_REQUEST, "invalid_config", message),
     }
 }
@@ -1151,7 +1545,16 @@ fn refresh_harness_upstreams_from_disk(state: &GatewayState) {
     };
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(disk_cfg) = serde_json::from_str::<HideConfig>(&text) {
-            state.config.write().harness_upstreams = disk_cfg.harness_upstreams;
+            let (sys_proxy_enabled, proxy_port) = {
+                let mut cfg = state.config.write();
+                cfg.harness_upstreams = disk_cfg.harness_upstreams;
+                cfg.allowed_loopback_proxy_targets = disk_cfg.allowed_loopback_proxy_targets;
+                cfg.system_proxy_chain = disk_cfg.system_proxy_chain;
+                (cfg.system_proxy_chain, cfg.proxy_port)
+            };
+            if state.use_system_upstream_proxy && !state.allow_loopback_for_tests {
+                sync_system_proxy_runtime(sys_proxy_enabled, proxy_port);
+            }
         }
     }
 }
@@ -1266,6 +1669,23 @@ async fn api_ca_cert(State(state): State<GatewayState>) -> Response {
         .into_response()
 }
 
+async fn api_mitm_hosts(State(state): State<GatewayState>) -> Json<MitmHostsResponse> {
+    let cfg = state.get_config();
+    let mut observed: Vec<ObservedConnectHost> = state.observed_connect_hosts.read().values().cloned().collect();
+    observed.sort_by_key(|b| std::cmp::Reverse(b.last_seq));
+    let system_proxy_supported = cfg!(windows);
+    let system_proxy_active =
+        system_proxy_supported && !state.allow_loopback_for_tests && is_system_proxy_active_for_port(cfg.proxy_port);
+    Json(MitmHostsResponse {
+        mitm_extra_hosts: cfg.mitm_extra_hosts,
+        mitm_bypass_hosts: cfg.mitm_bypass_hosts,
+        system_proxy_chain: cfg.system_proxy_chain,
+        system_proxy_supported,
+        system_proxy_active,
+        observed_hosts: observed,
+    })
+}
+
 async fn api_simulate(State(state): State<GatewayState>, Json(req): Json<SimulateRequest>) -> Response {
     let result =
         tokio::task::spawn_blocking(move || state.simulate_traffic(req.harness, req.category, req.custom_payload))
@@ -1290,19 +1710,7 @@ fn is_known_harness_prefix(prefix: &str) -> bool {
 pub(crate) fn is_binary_rpc_content_type(ct: Option<&str>) -> bool {
     let Some(ct) = ct else { return false };
     let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-    matches!(
-        mime.as_str(),
-        "application/connect+proto"
-            | "application/proto"
-            | "application/protobuf"
-            | "application/x-protobuf"
-            | "application/grpc"
-            | "application/grpc+proto"
-            | "application/grpc-web"
-            | "application/grpc-web+proto"
-            | "application/octet-stream"
-            | "multipart/form-data"
-    )
+    matches!(mime.as_str(), "application/octet-stream" | "multipart/form-data")
 }
 
 fn is_binary_response_content_type(ct: Option<&str>) -> bool {
@@ -1328,15 +1736,25 @@ fn detect_harness_for_host(host: &str) -> Option<HarnessKind> {
         Some(HarnessKind::Codex)
     } else if h == "generativelanguage.googleapis.com"
         || h == "cloudcode-pa.googleapis.com"
+        || h == "cloudaicompanion.googleapis.com"
         || h == "daily-cloudcode-pa.sandbox.googleapis.com"
         || h == "autopush-cloudcode-pa.sandbox.googleapis.com"
+        || h == "antigravity-pa.googleapis.com"
         || h == "aiplatform.googleapis.com"
         || h.ends_with("-aiplatform.googleapis.com")
+        || h.ends_with("-generativelanguage.googleapis.com")
+        || h.ends_with("-cloudaicompanion.googleapis.com")
+        || h.ends_with("-cloudcode-pa.googleapis.com")
+        || h.ends_with(".cloudcode-pa.googleapis.com")
+        || h.ends_with("-cloudcode-pa.sandbox.googleapis.com")
+        || h.ends_with("-antigravity-pa.googleapis.com")
+        || h.ends_with("-antigravity-pa.sandbox.googleapis.com")
     {
         Some(HarnessKind::Antigravity)
     } else if h.ends_with(".cursor.sh") || h.ends_with(".cursorapi.com") {
         Some(HarnessKind::Cursor)
     } else if h == "api.qoder.com"
+        || h.ends_with(".qoder.com")
         || h.ends_with(".qoder.sh")
         || h.ends_with(".qoder.com.cn")
         || h.starts_with("dashscope")
@@ -1371,44 +1789,7 @@ fn filter_hide_go_session_cookie(raw_cookies: &str) -> Option<axum::http::Header
 }
 
 fn upstream_passthrough_request_headers(headers: &HeaderMap, admin_token: &str) -> HeaderMap {
-    let mut forwarded = HeaderMap::new();
-    for (name, value) in headers {
-        if is_hop_by_hop(name.as_str(), headers)
-            || matches!(
-                name.as_str(),
-                "host"
-                    | "content-length"
-                    | "origin"
-                    | "referer"
-                    | "x-hide-go-upstream"
-                    | "x-upstream-url"
-                    | "x-target-upstream"
-                    | "x-hide-go-token"
-            )
-            || name.as_str().starts_with("sec-fetch-")
-        {
-            continue;
-        }
-        if name == header::COOKIE {
-            if let Ok(cookies) = value.to_str() {
-                if let Some(filtered) = filter_hide_go_session_cookie(cookies) {
-                    forwarded.append(name.clone(), filtered);
-                }
-            }
-            continue;
-        }
-        if name == header::AUTHORIZATION
-            && value.to_str().is_ok_and(|value| {
-                value.split_once(' ').is_some_and(|(scheme, token)| {
-                    scheme.eq_ignore_ascii_case("bearer") && constant_time_eq(token.trim(), admin_token)
-                })
-            })
-        {
-            continue;
-        }
-        forwarded.append(name.clone(), value.clone());
-    }
-    forwarded
+    filter_forwarded_headers(headers, admin_token, false, false)
 }
 
 fn upstream_binary_response_headers(headers: &HeaderMap, preserve_origin_headers: bool) -> HeaderMap {
@@ -1448,6 +1829,240 @@ fn resolve_proxy_harness_and_scope(
         Some(host.to_string())
     };
     (harness, category, scope)
+}
+
+/// Handle a decrypted full-duplex streaming gRPC / ConnectRPC request inside an intercepted TLS
+/// `CONNECT` tunnel without buffering the entire request body upfront.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_mitm_streaming_rpc_request(
+    state: GatewayState,
+    scheme: &str,
+    host: &str,
+    port: u16,
+    framing: ProtobufFraming,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    incoming: hyper::body::Incoming,
+) -> Response {
+    let start = Instant::now();
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let default_port = if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 };
+    let authority = if host.contains(':') {
+        if port == default_port {
+            format!("[{host}]")
+        } else {
+            format!("[{host}]:{port}")
+        }
+    } else if port == default_port {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    };
+    let target_str = format!("{scheme}://{authority}{path_and_query}");
+    let Ok(target_url) = reqwest::Url::parse(&target_str) else {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_upstream", "invalid MITM target URL");
+    };
+    let cfg = state.get_config();
+    let allow_configured_loopback = is_allowed_loopback_proxy_target(host, port, &cfg);
+    let allow_loopback = allow_configured_loopback || state.allow_loopback_for_tests;
+    if is_forbidden_target_host_port(host, port, cfg.proxy_port, allow_loopback) {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "forbidden_target",
+            "upstream target host or port is blocked",
+        );
+    }
+
+    let path_only = uri.path();
+    let (harness, category, upstream_vendor) = resolve_proxy_harness_and_scope(path_only, &headers, &[], host);
+    let vault_scope = upstream_vendor
+        .clone()
+        .or_else(|| target_url.host_str().map(str::to_string));
+    let idle_timeout = cfg.effective_upstream_idle_timeout();
+    let is_loopback = allow_loopback && is_loopback_host_str(host);
+    let (client, _fallback_client) = state.resolve_http_clients(host, is_loopback, false);
+
+    let req_ct_str = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/grpc")
+        .to_string();
+    let frame_enc = headers
+        .get(framing.encoding_header_name())
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    let metrics = Arc::new(parking_lot::Mutex::new(OutboundStreamMetrics::default()));
+    let desensitizer = GrpcStreamDesensitizer::new(
+        framing,
+        frame_enc,
+        category,
+        cfg.clone(),
+        state.vault.clone(),
+        vault_scope.clone(),
+        metrics.clone(),
+    );
+
+    let outbound_stream = futures_util::stream::unfold(
+        (incoming, desensitizer, false),
+        |(mut incoming, mut des, done)| async move {
+            loop {
+                if done {
+                    return None;
+                }
+                match incoming.frame().await {
+                    Some(Ok(frame)) => {
+                        if let Ok(chunk) = frame.into_data() {
+                            if chunk.is_empty() {
+                                continue;
+                            }
+                            let out = des.push_chunk(&chunk);
+                            if !out.is_empty() {
+                                return Some((Ok::<Bytes, std::io::Error>(Bytes::from(out)), (incoming, des, false)));
+                            }
+                        }
+                    }
+                    Some(Err(err)) => {
+                        return Some((
+                            Err(std::io::Error::other(format!("client gRPC stream error: {err}"))),
+                            (incoming, des, true),
+                        ));
+                    }
+                    None => {
+                        let tail = des.finish();
+                        if !tail.is_empty() {
+                            return Some((Ok(Bytes::from(tail)), (incoming, des, true)));
+                        }
+                        return None;
+                    }
+                }
+            }
+        },
+    );
+
+    let fwd_headers = upstream_protobuf_request_headers(&headers, state.admin_token(), framing, false);
+    let endpoint_label = format!("{scheme}://{authority}{path_only}");
+    let upstream_resp = match tokio::time::timeout(
+        idle_timeout,
+        client
+            .request(method.clone(), target_url)
+            .headers(fwd_headers)
+            .body(reqwest::Body::wrap_stream(outbound_stream))
+            .send(),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(err)) => {
+            let reason = if err.is_timeout() {
+                "upstream_timeout"
+            } else {
+                "upstream_connection_failed"
+            };
+            let m = metrics.lock();
+            let action = format!("{}+{reason}", m.action_taken(cfg.mode));
+            let mut rec = build_record(RecordInput {
+                harness,
+                category,
+                method: method.to_string(),
+                endpoint: endpoint_label,
+                mode: cfg.mode,
+                action_taken: action,
+                status: 0,
+                start,
+                simulated: false,
+                local_request: &m.local_preview,
+                vendor_request: &m.vendor_preview,
+                vendor_response: "",
+                local_response: "",
+                findings: m.findings.clone(),
+                restored_count: 0,
+                withheld_count: 0,
+                upstream_vendor,
+            });
+            rec.request_bytes = m.request_bytes;
+            drop(m);
+            state.push_record(rec);
+            return json_error(StatusCode::BAD_GATEWAY, reason, err.to_string());
+        }
+        Err(_) => {
+            let reason = "upstream_timeout";
+            let m = metrics.lock();
+            let action = format!("{}+{reason}", m.action_taken(cfg.mode));
+            let mut rec = build_record(RecordInput {
+                harness,
+                category,
+                method: method.to_string(),
+                endpoint: endpoint_label,
+                mode: cfg.mode,
+                action_taken: action,
+                status: 0,
+                start,
+                simulated: false,
+                local_request: &m.local_preview,
+                vendor_request: &m.vendor_preview,
+                vendor_response: "",
+                local_response: "",
+                findings: m.findings.clone(),
+                restored_count: 0,
+                withheld_count: 0,
+                upstream_vendor,
+            });
+            rec.request_bytes = m.request_bytes;
+            drop(m);
+            state.push_record(rec);
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                reason,
+                format!("upstream did not respond within {}s", idle_timeout.as_secs()),
+            );
+        }
+    };
+
+    let status = StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let resp_ct = upstream_resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let resp_framing = detect_protobuf_framing(resp_ct.as_deref()).unwrap_or(framing);
+
+    let base_record = build_record(RecordInput {
+        harness,
+        category,
+        method: method.to_string(),
+        endpoint: endpoint_label,
+        mode: cfg.mode,
+        action_taken: "protobuf-passed".to_string(),
+        status: status.as_u16(),
+        start,
+        simulated: false,
+        local_request: "",
+        vendor_request: "",
+        vendor_response: "",
+        local_response: "",
+        findings: Vec::new(),
+        restored_count: 0,
+        withheld_count: 0,
+        upstream_vendor,
+    });
+
+    build_protobuf_upstream_response(
+        &state,
+        upstream_resp,
+        resp_framing,
+        status,
+        true,
+        idle_timeout,
+        start,
+        &cfg,
+        vault_scope.as_deref(),
+        base_record,
+        "protobuf-passed".to_string(),
+        Some((metrics, cfg.mode, req_ct_str)),
+    )
+    .await
 }
 
 /// Handle a decrypted HTTP request inside an intercepted TLS `CONNECT` tunnel.
@@ -1506,6 +2121,42 @@ pub(crate) async fn handle_mitm_http_request(
     .await
 }
 
+async fn send_upstream_with_fallback(
+    primary: &reqwest::Client,
+    fallback: Option<&reqwest::Client>,
+    method: Method,
+    target_url: reqwest::Url,
+    headers: HeaderMap,
+    body: Bytes,
+    idle_timeout: Duration,
+) -> Result<Result<reqwest::Response, reqwest::Error>, tokio::time::error::Elapsed> {
+    let first = tokio::time::timeout(
+        idle_timeout,
+        primary
+            .request(method.clone(), target_url.clone())
+            .headers(headers.clone())
+            .body(body.clone())
+            .send(),
+    )
+    .await;
+    if let Some(direct) = fallback {
+        let should_retry_direct = match &first {
+            Ok(Err(err)) => err.is_connect() || err.is_timeout(),
+            Err(_) => true,
+            Ok(Ok(_)) => false,
+        };
+        if should_retry_direct {
+            tracing::debug!("proxied upstream request failed for {target_url}; retrying direct");
+            return tokio::time::timeout(
+                idle_timeout,
+                direct.request(method, target_url).headers(headers).body(body).send(),
+            )
+            .await;
+        }
+    }
+    first
+}
+
 /// Handle a plain HTTP forward-proxy request (`HTTP_PROXY`) with an absolute-form URI.
 pub(crate) async fn handle_forward_http_request(
     state: GatewayState,
@@ -1548,16 +2199,19 @@ pub(crate) async fn handle_forward_http_request(
     if !mitm_inspect {
         let idle_timeout = cfg.effective_upstream_idle_timeout();
         let is_loopback = allow_loopback && is_loopback_host_str(&host);
-        let client = if is_loopback {
-            &state.local_http_client
-        } else {
-            &state.http_client
-        };
-        let req = client
-            .request(method, target_url)
-            .headers(upstream_passthrough_request_headers(&headers, state.admin_token()))
-            .body(body);
-        return match tokio::time::timeout(idle_timeout, req.send()).await {
+        let (client, fallback) = state.resolve_http_clients(&host, is_loopback, false);
+        let fwd_headers = upstream_passthrough_request_headers(&headers, state.admin_token());
+        return match send_upstream_with_fallback(
+            &client,
+            fallback.as_ref(),
+            method,
+            target_url,
+            fwd_headers,
+            body,
+            idle_timeout,
+        )
+        .await
+        {
             Ok(Ok(resp)) => {
                 let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let resp_headers = upstream_binary_response_headers(resp.headers(), true);
@@ -1844,19 +2498,39 @@ async fn execute_proxy_forward(
     }
     let idle_timeout = cfg.effective_upstream_idle_timeout();
     let is_loopback = allow_loopback && is_loopback_host_str(target_host);
-    let client = if allow_operator_private_upstream {
-        &state.operator_http_client
-    } else if is_loopback {
-        &state.local_http_client
-    } else {
-        &state.http_client
-    };
+    let (client, fallback_client) =
+        state.resolve_http_clients(target_host, is_loopback, allow_operator_private_upstream);
     let vault_scope = upstream_vendor
         .clone()
         .or_else(|| target_url.host_str().map(str::to_string));
 
-    // Binary RPC (ConnectRPC protobuf / gRPC / octet-stream) cannot be rewritten without
-    // `.proto` schemas without corrupting varint length prefixes. Stream raw bytes cleanly.
+    // Schema-less Protobuf, gRPC, and ConnectRPC wire-format desensitization & streaming restoration.
+    if let Some(framing) = detect_protobuf_framing(req_ct) {
+        return execute_protobuf_forward(
+            state,
+            ProtobufForwardInput {
+                framing,
+                harness,
+                category,
+                method,
+                target_url,
+                endpoint_label,
+                upstream_vendor,
+                vault_scope,
+                cfg,
+                preserve_origin_headers,
+                idle_timeout,
+                start,
+                client,
+                fallback_client,
+                headers,
+                body,
+            },
+        )
+        .await;
+    }
+
+    // Truly opaque binary uploads (octet-stream / multipart) stream cleanly untouched.
     if is_binary_rpc_content_type(req_ct) {
         let req_len = body.len();
         let req_note = format!(
@@ -1864,11 +2538,18 @@ async fn execute_proxy_forward(
             req_ct.unwrap_or("binary"),
             req_len
         );
-        let upstream_req = client
-            .request(method.clone(), target_url)
-            .headers(upstream_passthrough_request_headers(&headers, state.admin_token()))
-            .body(body);
-        return match tokio::time::timeout(idle_timeout, upstream_req.send()).await {
+        let fwd_headers = upstream_passthrough_request_headers(&headers, state.admin_token());
+        return match send_upstream_with_fallback(
+            &client,
+            fallback_client.as_ref(),
+            method.clone(),
+            target_url,
+            fwd_headers,
+            body,
+            idle_timeout,
+        )
+        .await
+        {
             Ok(Ok(resp)) => {
                 let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let resp_headers = upstream_binary_response_headers(resp.headers(), preserve_origin_headers);
@@ -2131,16 +2812,18 @@ async fn execute_proxy_forward(
         );
     }
 
-    let upstream_req = client
-        .request(method.clone(), target_url)
-        .headers(upstream_request_headers(
-            &headers,
-            state.admin_token(),
-            was_decompressed,
-        ))
-        .body(vendor_body);
-
-    let upstream_resp = match tokio::time::timeout(idle_timeout, upstream_req.send()).await {
+    let fwd_headers = upstream_request_headers(&headers, state.admin_token(), was_decompressed);
+    let upstream_resp = match send_upstream_with_fallback(
+        &client,
+        fallback_client.as_ref(),
+        method.clone(),
+        target_url,
+        fwd_headers,
+        vendor_body,
+        idle_timeout,
+    )
+    .await
+    {
         Ok(Ok(resp)) => resp,
         Ok(Err(err)) => {
             let reason = if err.is_timeout() {
@@ -2168,6 +2851,24 @@ async fn execute_proxy_forward(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+
+    if let Some(resp_framing) = detect_protobuf_framing(resp_ct.as_deref()) {
+        return build_protobuf_upstream_response(
+            state,
+            upstream_resp,
+            resp_framing,
+            status,
+            preserve_origin_headers,
+            idle_timeout,
+            start,
+            &cfg,
+            vault_scope.as_deref(),
+            record_base(status.as_u16(), "", "", 0, 0, action_taken.clone()),
+            action_taken,
+            None,
+        )
+        .await;
+    }
 
     if is_binary_response_content_type(resp_ct.as_deref()) {
         let binary_headers = upstream_binary_response_headers(upstream_resp.headers(), preserve_origin_headers);
@@ -2343,6 +3044,586 @@ async fn execute_proxy_forward(
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
     response
+}
+
+struct ProtobufForwardInput {
+    framing: ProtobufFraming,
+    harness: HarnessKind,
+    category: TrafficCategory,
+    method: Method,
+    target_url: reqwest::Url,
+    endpoint_label: String,
+    upstream_vendor: Option<String>,
+    vault_scope: Option<String>,
+    cfg: HideConfig,
+    preserve_origin_headers: bool,
+    idle_timeout: Duration,
+    start: Instant,
+    client: reqwest::Client,
+    fallback_client: Option<reqwest::Client>,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+fn upstream_protobuf_request_headers(
+    headers: &HeaderMap,
+    admin_token: &str,
+    framing: ProtobufFraming,
+    strip_content_encoding: bool,
+) -> HeaderMap {
+    let mut forwarded = filter_forwarded_headers(headers, admin_token, false, strip_content_encoding);
+    if framing == ProtobufFraming::Grpc {
+        forwarded.insert(header::TE, "trailers".parse().unwrap());
+    }
+    forwarded
+}
+
+async fn execute_protobuf_forward(state: &GatewayState, input: ProtobufForwardInput) -> Response {
+    let ProtobufForwardInput {
+        framing,
+        harness,
+        category,
+        method,
+        target_url,
+        endpoint_label,
+        upstream_vendor,
+        vault_scope,
+        cfg,
+        preserve_origin_headers,
+        idle_timeout,
+        start,
+        client,
+        fallback_client,
+        headers,
+        body,
+    } = input;
+
+    let raw_req_len = body.len();
+    let req_ct_str = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/protobuf")
+        .to_string();
+    let http_enc = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let frame_enc = headers
+        .get(framing.encoding_header_name())
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    let vault = state.vault.clone();
+    let cfg_clone = cfg.clone();
+    let scope_clone = vault_scope.clone();
+    let body_for_work = body.clone();
+    let transformed = match tokio::task::spawn_blocking(move || {
+        transform_protobuf_outbound(
+            framing,
+            &body_for_work,
+            http_enc.as_deref(),
+            frame_enc.as_deref(),
+            category,
+            &cfg_clone,
+            &vault,
+            scope_clone.as_deref(),
+        )
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "transform_failed",
+                "outbound protobuf transformation panicked",
+            );
+        }
+    };
+
+    let local_req_preview = if transformed.local_preview.is_empty() {
+        format!("[{req_ct_str}, {raw_req_len} bytes]")
+    } else {
+        transformed.local_preview
+    };
+    let vendor_req_preview = if transformed.vendor_preview.is_empty() {
+        format!("[{req_ct_str}, {} bytes]", transformed.vendor_body.len())
+    } else {
+        transformed.vendor_preview
+    };
+    let action_taken = transformed.action_taken;
+    let findings = transformed.findings;
+
+    let make_record =
+        |status: u16, vendor_response: &str, local_response: &str, restored: usize, withheld: usize, action: String| {
+            let mut rec = build_record(RecordInput {
+                harness,
+                category,
+                method: method.to_string(),
+                endpoint: endpoint_label.clone(),
+                mode: cfg.mode,
+                action_taken: action,
+                status,
+                start,
+                simulated: false,
+                local_request: &local_req_preview,
+                vendor_request: &vendor_req_preview,
+                vendor_response,
+                local_response,
+                findings: findings.clone(),
+                restored_count: restored,
+                withheld_count: withheld,
+                upstream_vendor: upstream_vendor.clone(),
+            });
+            rec.request_bytes = raw_req_len;
+            rec
+        };
+
+    let fwd_headers = upstream_protobuf_request_headers(
+        &headers,
+        state.admin_token(),
+        framing,
+        transformed.stripped_content_encoding,
+    );
+    let upstream_resp = match send_upstream_with_fallback(
+        &client,
+        fallback_client.as_ref(),
+        method.clone(),
+        target_url,
+        fwd_headers,
+        Bytes::from(transformed.vendor_body),
+        idle_timeout,
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(err)) => {
+            let reason = if err.is_timeout() {
+                "upstream_timeout"
+            } else {
+                "upstream_connection_failed"
+            };
+            state.push_record(make_record(0, "", "", 0, 0, format!("{action_taken}+{reason}")));
+            return json_error(StatusCode::BAD_GATEWAY, reason, err.to_string());
+        }
+        Err(_) => {
+            let reason = "upstream_timeout";
+            state.push_record(make_record(0, "", "", 0, 0, format!("{action_taken}+{reason}")));
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                reason,
+                format!("upstream did not respond within {}s", idle_timeout.as_secs()),
+            );
+        }
+    };
+
+    let status = StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let resp_ct = upstream_resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    if let Some(resp_framing) = detect_protobuf_framing(resp_ct.as_deref()) {
+        return build_protobuf_upstream_response(
+            state,
+            upstream_resp,
+            resp_framing,
+            status,
+            preserve_origin_headers,
+            idle_timeout,
+            start,
+            &cfg,
+            vault_scope.as_deref(),
+            make_record(status.as_u16(), "", "", 0, 0, action_taken.clone()),
+            action_taken,
+            None,
+        )
+        .await;
+    }
+
+    // Fallback: upstream answered with non-Protobuf (e.g. HTTP error text/JSON).
+    let resp_headers = upstream_binary_response_headers(upstream_resp.headers(), preserve_origin_headers);
+    let raw_bytes = match read_limited_upstream_bytes(upstream_resp, MAX_RESPONSE_BODY, idle_timeout).await {
+        Ok(b) => b,
+        Err(err) => {
+            state.push_record(make_record(
+                status.as_u16(),
+                "",
+                "",
+                0,
+                0,
+                format!("{action_taken}+upstream_body_failed"),
+            ));
+            return json_error(StatusCode::BAD_GATEWAY, "upstream_body_failed", err);
+        }
+    };
+    let (out_bytes, vendor_resp_preview, local_resp_preview, restored_count, withheld_count) =
+        match String::from_utf8(raw_bytes) {
+            Ok(text) => {
+                if cfg.mode == PrivacyMode::AuditOnly {
+                    let bytes = text.as_bytes().to_vec();
+                    (bytes, text.clone(), text, 0, 0)
+                } else {
+                    let matcher = state.vault.matcher_for_scope(vault_scope.as_deref());
+                    let (restored, count, withheld) = restore_response(&matcher, &text, cfg.tool_call_secret_policy);
+                    (restored.as_bytes().to_vec(), text, restored, count, withheld)
+                }
+            }
+            Err(err) => {
+                let raw_bytes = err.into_bytes();
+                let note = format!(
+                    "[binary response ({}, {} bytes)]",
+                    resp_ct.as_deref().unwrap_or("binary"),
+                    raw_bytes.len()
+                );
+                (raw_bytes, note.clone(), note, 0, 0)
+            }
+        };
+    let mut rec = make_record(
+        status.as_u16(),
+        &vendor_resp_preview,
+        &local_resp_preview,
+        restored_count,
+        withheld_count,
+        action_taken,
+    );
+    rec.response_bytes = out_bytes.len();
+    state.push_record(rec);
+    let mut response = Response::new(Body::from(out_bytes));
+    *response.status_mut() = status;
+    *response.headers_mut() = resp_headers;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_protobuf_upstream_response(
+    state: &GatewayState,
+    upstream_resp: reqwest::Response,
+    resp_framing: ProtobufFraming,
+    status: StatusCode,
+    preserve_origin_headers: bool,
+    idle_timeout: Duration,
+    start: Instant,
+    cfg: &HideConfig,
+    vault_scope: Option<&str>,
+    mut base_record: TrafficAuditRecord,
+    action_taken: String,
+    outbound_metrics: Option<(Arc<parking_lot::Mutex<OutboundStreamMetrics>>, PrivacyMode, String)>,
+) -> Response {
+    let mut resp_headers = upstream_binary_response_headers(upstream_resp.headers(), preserve_origin_headers);
+    let resp_ct = upstream_resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/protobuf")
+        .to_string();
+
+    if resp_framing.is_enveloped() {
+        let frame_enc = upstream_resp
+            .headers()
+            .get(resp_framing.encoding_header_name())
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let live_vault =
+            (cfg.mode != PrivacyMode::AuditOnly).then(|| (state.vault.clone(), vault_scope.map(str::to_owned)));
+        let restorer = GrpcStreamRestorer::with_vault(resp_framing, frame_enc, live_vault, cfg.tool_call_secret_policy);
+        let http_resp: axum::http::Response<reqwest::Body> = upstream_resp.into();
+        let stream_state = GrpcProxyStreamState {
+            body: http_resp.into_body(),
+            idle_timeout,
+            restorer,
+            pending_trailers: None,
+            eof_flushed: false,
+            flushed: false,
+            started_at: start,
+            state_for_log: state.clone(),
+            record: Some(base_record),
+            action_taken,
+            resp_ct,
+            outbound_metrics,
+        };
+        let out_stream = futures_util::stream::unfold(stream_state, |mut st| async move {
+            loop {
+                if let Some(trailers) = st.pending_trailers.take() {
+                    st.eof_flushed = true;
+                    if !st.flushed {
+                        st.finish_record(false);
+                    }
+                    return Some((Ok::<Frame<Bytes>, std::io::Error>(Frame::trailers(trailers)), st));
+                }
+                if st.eof_flushed {
+                    if !st.flushed {
+                        st.finish_record(false);
+                    }
+                    return None;
+                }
+                match tokio::time::timeout(st.idle_timeout, st.body.frame()).await {
+                    Ok(Some(Ok(frame))) => match frame.into_data() {
+                        Ok(chunk) => {
+                            let out = st.restorer.push_chunk(&chunk);
+                            if !out.is_empty() {
+                                st.add_response_bytes(out.len());
+                                return Some((Ok(Frame::data(Bytes::from(out))), st));
+                            }
+                        }
+                        Err(frame) => {
+                            if let Ok(trailers) = frame.into_trailers() {
+                                let tail = st.restorer.finish();
+                                if !tail.is_empty() {
+                                    st.add_response_bytes(tail.len());
+                                    st.pending_trailers = Some(trailers);
+                                    return Some((Ok(Frame::data(Bytes::from(tail))), st));
+                                }
+                                st.eof_flushed = true;
+                                if !st.flushed {
+                                    st.finish_record(false);
+                                }
+                                return Some((Ok(Frame::trailers(trailers)), st));
+                            }
+                        }
+                    },
+                    Ok(Some(Err(err))) => {
+                        st.finish_record(true);
+                        return Some((
+                            Err(std::io::Error::other(format!(
+                                "upstream gRPC stream interrupted: {err}"
+                            ))),
+                            st,
+                        ));
+                    }
+                    Ok(None) => {
+                        st.eof_flushed = true;
+                        let tail = st.restorer.finish();
+                        if !tail.is_empty() {
+                            st.add_response_bytes(tail.len());
+                            return Some((Ok(Frame::data(Bytes::from(tail))), st));
+                        }
+                        st.finish_record(false);
+                        return None;
+                    }
+                    Err(_) => {
+                        st.finish_record(true);
+                        return Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("upstream gRPC stream idle timeout after {}s", st.idle_timeout.as_secs()),
+                            )),
+                            st,
+                        ));
+                    }
+                }
+            }
+        });
+        let mut response = Response::new(Body::new(StreamBody::new(out_stream)));
+        *response.status_mut() = status;
+        *response.headers_mut() = resp_headers;
+        return response;
+    }
+
+    // Unary Protobuf response
+    let resp_enc = upstream_resp
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let raw_bytes = match read_limited_upstream_bytes(upstream_resp, MAX_RESPONSE_BODY, idle_timeout).await {
+        Ok(b) => b,
+        Err(err) => {
+            base_record.action_taken = format!("{action_taken}+upstream_body_failed");
+            state.push_record(base_record);
+            return json_error(StatusCode::BAD_GATEWAY, "upstream_body_failed", err);
+        }
+    };
+    let (local_bytes, restored_count, withheld_count, vendor_prev, local_prev, stripped_enc) =
+        if cfg.mode == PrivacyMode::AuditOnly {
+            let note = format!("[{resp_ct}, {} bytes]", raw_bytes.len());
+            (raw_bytes, 0, 0, note.clone(), note, false)
+        } else {
+            let vault = state.vault.clone();
+            let scope_owned = vault_scope.map(str::to_owned);
+            let policy = cfg.tool_call_secret_policy;
+            let enc_clone = resp_enc.clone();
+            let raw_clone = raw_bytes.clone();
+            match tokio::task::spawn_blocking(move || {
+                let matcher = vault.matcher_for_scope(scope_owned.as_deref());
+                restore_unary_protobuf(&raw_clone, enc_clone.as_deref(), &matcher, policy)
+            })
+            .await
+            {
+                Ok(res) => (
+                    res.local_body,
+                    res.restored_count,
+                    res.withheld_count,
+                    res.vendor_preview,
+                    res.local_preview,
+                    res.stripped_content_encoding,
+                ),
+                Err(_) => {
+                    let note = format!("[{resp_ct}, {} bytes]", raw_bytes.len());
+                    (raw_bytes, 0, 0, note.clone(), note, false)
+                }
+            }
+        };
+
+    if stripped_enc {
+        resp_headers.remove(header::CONTENT_ENCODING);
+    }
+    let mut truncated = base_record.truncated;
+    let fallback_note = format!("[{resp_ct}, {} bytes]", local_bytes.len());
+    base_record.vendor_raw_response = cap_payload(
+        if vendor_prev.is_empty() {
+            &fallback_note
+        } else {
+            &vendor_prev
+        },
+        &mut truncated,
+    );
+    base_record.local_restored_response = cap_payload(
+        if local_prev.is_empty() {
+            &fallback_note
+        } else {
+            &local_prev
+        },
+        &mut truncated,
+    );
+    base_record.truncated = truncated;
+    base_record.response_bytes = local_bytes.len();
+    base_record.restored_count = restored_count;
+    base_record.withheld_count = withheld_count;
+    base_record.latency_ms = start.elapsed().as_millis().max(1) as u64;
+    state.push_record(base_record);
+
+    let mut response = Response::new(Body::from(local_bytes));
+    *response.status_mut() = status;
+    *response.headers_mut() = resp_headers;
+    response
+}
+
+async fn read_limited_upstream_bytes(
+    resp: reqwest::Response,
+    max_bytes: usize,
+    idle_timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes as u64 {
+            return Err(format!(
+                "upstream response Content-Length ({len} bytes) exceeds limit ({max_bytes} bytes)"
+            ));
+        }
+    }
+    let mut buf = Vec::new();
+    let mut stream = resp.bytes_stream();
+    loop {
+        match tokio::time::timeout(idle_timeout, stream.next()).await {
+            Ok(Some(chunk_res)) => {
+                let chunk = chunk_res.map_err(|err| err.to_string())?;
+                if buf.len().saturating_add(chunk.len()) > max_bytes {
+                    return Err(format!(
+                        "upstream response body exceeded maximum limit ({max_bytes} bytes)"
+                    ));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => {
+                return Err(format!(
+                    "upstream response body idle timeout after {}s",
+                    idle_timeout.as_secs()
+                ));
+            }
+        }
+    }
+    Ok(buf)
+}
+
+struct GrpcProxyStreamState {
+    body: reqwest::Body,
+    idle_timeout: Duration,
+    restorer: GrpcStreamRestorer,
+    pending_trailers: Option<HeaderMap>,
+    eof_flushed: bool,
+    flushed: bool,
+    started_at: Instant,
+    state_for_log: GatewayState,
+    record: Option<TrafficAuditRecord>,
+    action_taken: String,
+    resp_ct: String,
+    outbound_metrics: Option<(Arc<parking_lot::Mutex<OutboundStreamMetrics>>, PrivacyMode, String)>,
+}
+
+impl GrpcProxyStreamState {
+    fn add_response_bytes(&mut self, n: usize) {
+        if let Some(r) = &mut self.record {
+            r.response_bytes += n;
+        }
+    }
+
+    fn finish_record(&mut self, failed: bool) {
+        self.flushed = true;
+        let Some(mut record) = self.record.take() else { return };
+        let mut truncated = record.truncated;
+        if let Some((metrics, mode, req_ct)) = &self.outbound_metrics {
+            let m = metrics.lock();
+            record.request_bytes = m.request_bytes;
+            let local_fallback = format!("[{req_ct}, {} bytes]", m.request_bytes);
+            let vendor_fallback = format!("[{req_ct}, {} bytes]", m.vendor_bytes);
+            record.local_request_payload = cap_payload(
+                if m.local_preview.is_empty() {
+                    &local_fallback
+                } else {
+                    &m.local_preview
+                },
+                &mut truncated,
+            );
+            record.vendor_visible_payload = cap_payload(
+                if m.vendor_preview.is_empty() {
+                    &vendor_fallback
+                } else {
+                    &m.vendor_preview
+                },
+                &mut truncated,
+            );
+            record.findings = m.findings.clone();
+            self.action_taken = m.action_taken(*mode);
+            record.action_taken = self.action_taken.clone();
+        }
+        let fallback_note = format!("[{}, {} bytes]", self.resp_ct, record.response_bytes);
+        let vendor_prev = self.restorer.vendor_preview();
+        let local_prev = self.restorer.local_preview();
+        record.vendor_raw_response = cap_payload(
+            if vendor_prev.is_empty() {
+                &fallback_note
+            } else {
+                vendor_prev
+            },
+            &mut truncated,
+        );
+        record.local_restored_response = cap_payload(
+            if local_prev.is_empty() {
+                &fallback_note
+            } else {
+                local_prev
+            },
+            &mut truncated,
+        );
+        record.truncated = truncated;
+        record.latency_ms = self.started_at.elapsed().as_millis().max(1) as u64;
+        record.restored_count = self.restorer.restored_count();
+        record.withheld_count = self.restorer.withheld_count();
+        if failed {
+            record.action_taken = format!("{}+stream-error", self.action_taken);
+        }
+        self.state_for_log.push_record(record);
+    }
+}
+
+impl Drop for GrpcProxyStreamState {
+    fn drop(&mut self) {
+        if !self.flushed {
+            self.finish_record(true);
+        }
+    }
 }
 
 fn stream_with_idle_timeout<S>(
@@ -2598,6 +3879,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let mut state = test_state(HideConfig::default());
+        state.use_system_upstream_proxy = false;
         state.http_client = reqwest::Client::builder()
             .no_proxy()
             .proxy(reqwest::Proxy::all(format!("http://{address}")).unwrap())
@@ -3291,5 +4573,305 @@ mod tests {
         )
         .await;
         assert_eq!(blocked_mitm.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn semver_comparison_handles_prefixes_and_prereleases() {
+        assert!(is_newer_version("0.2.4", "v0.2.5"));
+        assert!(is_newer_version("v0.2.4", "0.3.0"));
+        assert!(is_newer_version("0.2.5-rc.1", "0.2.5"));
+        assert!(!is_newer_version("0.2.4", "v0.2.4"));
+        assert!(!is_newer_version("0.2.5", "0.2.4"));
+        assert!(!is_newer_version("0.2.5", "0.2.5-rc.1"));
+        assert!(!is_newer_version("0.2.4", "not-a-version"));
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_release_parses_release_and_sanitizes_url() {
+        let mock_app = Router::new().route(
+            "/latest",
+            get(|| async {
+                Json(serde_json::json!({
+                    "tag_name": "v0.9.0",
+                    "html_url": "https://github.com/Aflydream/hide-go/releases/tag/v0.9.0",
+                    "published_at": "2026-11-21T10:00:00Z"
+                }))
+            }),
+        );
+        let base = serve(mock_app).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let res = fetch_latest_release_from(&client, &format!("{base}/latest"), "0.2.4")
+            .await
+            .unwrap();
+        assert_eq!(res.current_version, "0.2.4");
+        assert_eq!(res.latest_version, "0.9.0");
+        assert!(res.update_available);
+        assert_eq!(
+            res.release_url,
+            "https://github.com/Aflydream/hide-go/releases/tag/v0.9.0"
+        );
+
+        let spoofed_app = Router::new().route(
+            "/latest",
+            get(|| async {
+                Json(serde_json::json!({
+                    "tag_name": "v0.9.0",
+                    "html_url": "https://evil.example/phish.exe"
+                }))
+            }),
+        );
+        let spoofed_base = serve(spoofed_app).await;
+        let sanitized = fetch_latest_release_from(&client, &format!("{spoofed_base}/latest"), "0.2.4")
+            .await
+            .unwrap();
+        assert_eq!(sanitized.release_url, UPDATE_RELEASE_FALLBACK_URL);
+    }
+
+    #[tokio::test]
+    async fn api_check_updates_returns_fresh_cache_without_network() {
+        use tower::ServiceExt;
+        let cfg = HideConfig::default();
+        let state = GatewayState::with_admin_token(cfg, "test-admin-token-0123456789abcd");
+        let cached = UpdateCheckResult {
+            current_version: "0.2.4".to_string(),
+            latest_version: "0.2.5".to_string(),
+            update_available: true,
+            release_url: UPDATE_RELEASE_FALLBACK_URL.to_string(),
+            published_at: Some("2026-11-21T10:00:00Z".to_string()),
+            checked_at: "2026-11-21T10:01:00+08:00".to_string(),
+        };
+        *state.update_cache.write() = Some((Instant::now(), cached));
+
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/updates/check")
+                    .header("host", "127.0.0.1:18787")
+                    .header("x-hide-go-token", "test-admin-token-0123456789abcd")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["latestVersion"], "0.2.5");
+        assert_eq!(json["updateAvailable"], true);
+    }
+
+    #[test]
+    fn outbound_headers_strip_proxy_and_gateway_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "sk-user-key".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("x-hide-go-upstream", "https://api.openai.com".parse().unwrap());
+        headers.insert("x-hide-go-mode", "all-hide".parse().unwrap());
+        headers.insert("via", "1.1 hide-go".parse().unwrap());
+        headers.insert("forwarded", "for=127.0.0.1".parse().unwrap());
+        headers.insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-real-ip", "127.0.0.1".parse().unwrap());
+
+        let clean = upstream_request_headers(&headers, "admin-tok", true);
+        assert_eq!(clean["x-api-key"], "sk-user-key");
+        assert_eq!(clean["content-type"], "application/json");
+        for scrubbed in [
+            "x-hide-go-upstream",
+            "x-hide-go-mode",
+            "via",
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-real-ip",
+        ] {
+            assert!(!clean.contains_key(scrubbed), "header leaked outbound: {scrubbed}");
+        }
+
+        let clean_pass = upstream_passthrough_request_headers(&headers, "admin-tok");
+        assert!(!clean_pass.contains_key("x-forwarded-for"));
+        assert!(!clean_pass.contains_key("via"));
+        assert_eq!(clean_pass["x-api-key"], "sk-user-key");
+    }
+
+    #[test]
+    fn windows_proxy_parser_and_self_loop_guard_work() {
+        use crate::upstream_proxy::{is_self_proxy, parse_proxy_server};
+        assert_eq!(
+            parse_proxy_server("127.0.0.1:7897").as_deref(),
+            Some("http://127.0.0.1:7897/")
+        );
+        assert_eq!(
+            parse_proxy_server("http=127.0.0.1:7890;https=127.0.0.1:7891;socks=127.0.0.1:7892").as_deref(),
+            Some("http://127.0.0.1:7891/")
+        );
+        assert_eq!(
+            parse_proxy_server("http=127.0.0.1:7890").as_deref(),
+            Some("http://127.0.0.1:7890/")
+        );
+        assert!(parse_proxy_server("socks5://127.0.0.1:7897").is_none());
+        assert!(parse_proxy_server("   ").is_none());
+
+        assert!(is_self_proxy("http://127.0.0.1:18787/", 18787));
+        assert!(is_self_proxy("http://localhost:18787/", 18787));
+        assert!(!is_self_proxy("http://127.0.0.1:7897/", 18787));
+        assert!(!is_self_proxy("http://proxy.corp.local:8080/", 18787));
+    }
+
+    #[tokio::test]
+    async fn grpc_streaming_proxy_desensitizes_restores_and_preserves_http2_trailers() {
+        use hyper::service::service_fn;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use std::convert::Infallible;
+
+        // Spawn an HTTP/2-capable (h2c prior knowledge) mock gRPC upstream that asserts
+        // outbound desensitization, echoes the masked Protobuf payload in two chunks, and
+        // appends `grpc-status: 0` as an HTTP/2 trailer frame.
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_seen = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let seen_clone = upstream_seen.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                let seen = seen_clone.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let seen = seen.clone();
+                        async move {
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            *seen.lock() = body.to_vec();
+
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert("grpc-status", "0".parse().unwrap());
+                            trailers.insert("grpc-message", "ok".parse().unwrap());
+
+                            let mid = body.len() / 2;
+                            let part1 = body.slice(..mid);
+                            let part2 = body.slice(mid..);
+                            let frame_stream = futures_util::stream::iter(vec![
+                                Ok::<Frame<Bytes>, Infallible>(Frame::data(part1)),
+                                Ok::<Frame<Bytes>, Infallible>(Frame::data(part2)),
+                                Ok::<Frame<Bytes>, Infallible>(Frame::trailers(trailers)),
+                            ]);
+                            let resp = Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/grpc+proto")
+                                .body(Body::new(StreamBody::new(frame_stream)))
+                                .unwrap();
+                            Ok::<_, Infallible>(resp)
+                        }
+                    });
+                    let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let h2_upstream_client = reqwest::Client::builder()
+            .no_proxy()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap();
+        let mut state = test_state(HideConfig::default());
+        state.local_http_client = h2_upstream_client;
+        let gateway_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_addr = gateway_listener.local_addr().unwrap();
+        let app = build_router(state.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = gateway_listener.accept().await else {
+                    break;
+                };
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let app = app.clone();
+                        async move {
+                            use tower::ServiceExt as _;
+                            app.oneshot(req.map(Body::new)).await
+                        }
+                    });
+                    let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        // Build a valid gRPC-framed Protobuf message containing the secret key
+        let secret_text = "sk-wbefwubfbsrfrsuf baseurl:linuu.do/v1 是什么";
+        let mut pb = vec![0x0A, secret_text.len() as u8];
+        pb.extend_from_slice(secret_text.as_bytes());
+        let mut grpc_req = vec![0x00];
+        grpc_req.extend_from_slice(&(pb.len() as u32).to_be_bytes());
+        grpc_req.extend_from_slice(&pb);
+
+        let h2_client = reqwest::Client::builder()
+            .no_proxy()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap();
+        let resp = h2_client
+            .post(format!(
+                "http://{gateway_addr}/antigravity/google.internal.cloud.code.v1internal.CodeAssist/StreamGenerateContent"
+            ))
+            .header("x-hide-go-token", TEST_TOKEN)
+            .header("x-hide-go-upstream", format!("http://{upstream_addr}"))
+            .header("content-type", "application/grpc+proto")
+            .body(grpc_req)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "application/grpc+proto");
+
+        // Verify upstream NEVER saw the real secret key
+        let sent = upstream_seen.lock().clone();
+        assert!(!String::from_utf8_lossy(&sent).contains("sk-wbefwubfbsrfrsuf"));
+        assert!(String::from_utf8_lossy(&sent).contains("baseurl:linuu.do/v1"));
+
+        // Drive response body via `http_body_util::BodyExt::frame()` to verify BOTH restored data AND `grpc-status: 0` trailer!
+        let http_resp: axum::http::Response<reqwest::Body> = resp.into();
+        let mut body = http_resp.into_body();
+        let mut received_data = Vec::new();
+        let mut received_trailers = HeaderMap::new();
+        while let Some(frame_res) = body.frame().await {
+            let frame = frame_res.unwrap();
+            match frame.into_data() {
+                Ok(data) => received_data.extend_from_slice(&data),
+                Err(frame) => {
+                    if let Ok(trailers) = frame.into_trailers() {
+                        received_trailers.extend(trailers);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            received_trailers.get("grpc-status").and_then(|v| v.to_str().ok()),
+            Some("0"),
+            "HTTP/2 grpc-status trailer must be preserved verbatim"
+        );
+        let frame_len =
+            u32::from_be_bytes([received_data[1], received_data[2], received_data[3], received_data[4]]) as usize;
+        assert_eq!(frame_len, received_data.len() - 5);
+        assert!(
+            String::from_utf8_lossy(&received_data[5..]).contains(secret_text),
+            "client must receive losslessly restored Protobuf payload"
+        );
+
+        let records = state.get_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].harness, HarnessKind::Antigravity);
+        assert_eq!(records[0].action_taken, "protobuf-desensitized");
+        assert!(!records[0].findings.is_empty());
+        assert_eq!(records[0].restored_count, 1);
     }
 }

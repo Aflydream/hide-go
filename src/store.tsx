@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { api, ApiError } from './lib/api';
 import { usePoll, useRoute, type Route } from './lib/hooks';
 import { useI18n } from './lib/i18n';
-import type { GatewayStatus, HarnessProfile, HideConfig, TrafficSummary, VaultEntry } from './types';
+import type { GatewayStatus, HarnessProfile, HideConfig, TrafficSummary, UpdateCheckResult, VaultEntry } from './types';
 import { useToast } from './components/ui';
 
 interface Store {
@@ -19,6 +19,10 @@ interface Store {
   vault: VaultEntry[];
   vaultLoading: boolean;
   refreshVault: () => Promise<unknown>;
+  updateInfo: UpdateCheckResult | null;
+  updateError: string | null;
+  checkingUpdates: boolean;
+  checkForUpdates: (force?: boolean) => Promise<UpdateCheckResult | null>;
   route: Route;
   params: URLSearchParams;
   navigate: (route: Route, params?: Record<string, string>) => void;
@@ -45,12 +49,50 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [config, setConfig] = useState<HideConfig | null>(null);
   const [saving, setSaving] = useState(false);
   const [simulatorOpen, setSimulatorOpen] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
   const saveSeq = useRef(0);
   const confirmedConfigRef = useRef<HideConfig | null>(null);
   const syncedLangRef = useRef(false);
+  const autoCheckDoneRef = useRef(false);
 
   const openSimulator = useCallback(() => setSimulatorOpen(true), []);
   const closeSimulator = useCallback(() => setSimulatorOpen(false), []);
+
+  const checkForUpdates = useCallback(
+    async (force = false) => {
+      setCheckingUpdates(true);
+      setUpdateError(null);
+      try {
+        const res = await api.checkUpdates(force);
+        setUpdateInfo(res);
+        if (force) {
+          toast.push({
+            tone: 'brand',
+            title: res.updateAvailable
+              ? t('settings.updatesToastAvailable', { version: res.latestVersion })
+              : t('settings.updatesToastLatest', { version: res.currentVersion }),
+          });
+        }
+        return res;
+      } catch (e) {
+        const msg = (e as Error).message;
+        setUpdateError(msg);
+        if (force) {
+          toast.push({
+            tone: 'danger',
+            title: t('settings.updatesToastFailed'),
+            body: msg,
+          });
+        }
+        return null;
+      } finally {
+        setCheckingUpdates(false);
+      }
+    },
+    [toast, t],
+  );
 
   const status = usePoll(api.status, 2500);
   const logs = usePoll(api.logs, 2500);
@@ -85,6 +127,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (timerId !== undefined) window.clearTimeout(timerId);
     };
   }, [syncPrefFromConfig]);
+
+  useEffect(() => {
+    if (config && !autoCheckDoneRef.current && config.autoCheckUpdates !== false) {
+      autoCheckDoneRef.current = true;
+      void checkForUpdates(false);
+    }
+  }, [config, checkForUpdates]);
 
   const saveConfig = useCallback(
     async (next: HideConfig, successMessage?: string) => {
@@ -127,6 +176,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       vault: vault.data ?? EMPTY_VAULT,
       vaultLoading: vault.loading,
       refreshVault: vault.refresh,
+      updateInfo,
+      updateError,
+      checkingUpdates,
+      checkForUpdates,
       route,
       params,
       navigate,
@@ -134,7 +187,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       simulatorOpen,
       closeSimulator,
     }),
-    [config, saveConfig, saving, status.data, status.error, logs.data, logs.loading, logs.refresh, harnesses.data, harnesses.refresh, vault.data, vault.loading, vault.refresh, route, params, navigate, openSimulator, simulatorOpen, closeSimulator],
+    [config, saveConfig, saving, status.data, status.error, logs.data, logs.loading, logs.refresh, harnesses.data, harnesses.refresh, vault.data, vault.loading, vault.refresh, updateInfo, updateError, checkingUpdates, checkForUpdates, route, params, navigate, openSimulator, simulatorOpen, closeSimulator],
   );
 
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;

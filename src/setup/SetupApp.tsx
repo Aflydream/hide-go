@@ -624,12 +624,15 @@ export function SetupApp() {
                     <input
                       id="install-dir-input"
                       type="text"
-                      readOnly
                       value={installDir}
+                      onChange={(e) => {
+                        setInstallDir(e.target.value);
+                        setActionError(null);
+                      }}
                       title={installDir}
                       aria-invalid={!!installDirError}
                       aria-describedby={installDirError ? 'install-dir-error' : undefined}
-                      className="h-9 min-w-0 flex-1 rounded border border-line-control bg-surface-2/60 px-3 font-mono text-xs text-fg focus:border-brand-solid focus:outline-none focus:ring-2 focus:ring-brand/20"
+                      className="h-9 min-w-0 flex-1 rounded border border-line-control bg-surface px-3 font-mono text-xs text-fg focus:border-brand-solid focus:outline-none focus:ring-2 focus:ring-brand/20"
                     />
                     <button
                       type="button"

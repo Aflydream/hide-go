@@ -51,6 +51,8 @@ async fn run_daemon_async() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
     let addr = listener.local_addr()?;
     state.config.write().proxy_port = addr.port();
+    let _sys_proxy_guard =
+        hide_core::system_proxy::SystemProxyRuntimeGuard::start(state.get_config().system_proxy_chain, addr.port());
 
     tracing::info!("Hide-Go gateway listening on http://{addr}");
     if std::env::var("HIDE_GO_ADMIN_TOKEN").is_err() {

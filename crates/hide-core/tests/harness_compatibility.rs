@@ -312,12 +312,15 @@ async fn c04_mitm_supports_http2_and_preserves_cors_and_non_session_cookies() {
         }
     });
 
-    let mut state = GatewayState::new(HideConfig::default()).with_ca(gateway_ca.clone());
-    state.http_client = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(upstream_ca.ca_cert_pem().as_bytes()).unwrap())
-        .proxy(reqwest::Proxy::all(format!("http://{mock_proxy_addr}")).unwrap())
-        .build()
-        .unwrap();
+    let state = GatewayState::new(HideConfig::default())
+        .with_ca(gateway_ca.clone())
+        .with_custom_http_client(
+            reqwest::Client::builder()
+                .add_root_certificate(reqwest::Certificate::from_pem(upstream_ca.ca_cert_pem().as_bytes()).unwrap())
+                .proxy(reqwest::Proxy::all(format!("http://{mock_proxy_addr}")).unwrap())
+                .build()
+                .unwrap(),
+        );
     let gw_addr = serve_gateway(state).await;
 
     let proxy_client = reqwest::Client::builder()
@@ -487,13 +490,27 @@ fn c06_gemini_thought_signature_and_json_boolean_short_token_preserved() {
         "svc_payment_router was skipped: {text}"
     );
 
-    // Own `svc-node-...` token is still preserved as an own token
-    let own = "connect to svc-node-deadbeef-01";
-    let own_out = AllHideEngine::process(own, TrafficCategory::InteractivePrompt, &ah_cfg, &ah_vault);
+    // Previously registered semantic token in `ah_vault` survives All-Hide untouched
+    let own_domain = SemanticDesensitizer::process("connect to auth.corp.internal", &cfg, &ah_vault);
+    let tok_domain = own_domain
+        .transformed_payload
+        .strip_prefix("connect to ")
+        .unwrap()
+        .to_string();
+    let own_out = AllHideEngine::process(
+        &own_domain.transformed_payload,
+        TrafficCategory::InteractivePrompt,
+        &ah_cfg,
+        &ah_vault,
+    );
     assert!(
-        own_out.vendor_payload.contains("svc-node-deadbeef-01"),
+        own_out.vendor_payload.contains(&tok_domain),
         "{}",
         own_out.vendor_payload
+    );
+    assert_eq!(
+        ah_vault.restore_text(&own_out.vendor_payload).0,
+        "connect to auth.corp.internal"
     );
 }
 

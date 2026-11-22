@@ -1,4 +1,4 @@
-# Build artifacts (keep dist/ tracked; CI verifies it matches src/ and desktop/build.rs embeds it)
+# Build artifacts (keep dist/ tracked; CI verifies it matches src/ and setup/packaging reads it)
 target/
 node_modules/
 .vite/
@@ -9,6 +9,7 @@ node_modules/
 .cursor/
 .codex/
 .gemini/
+GEMINI.md
 .vscode/
 .idea/
 

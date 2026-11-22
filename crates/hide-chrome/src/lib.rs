@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tao::{
-    dpi::LogicalSize,
+    dpi::{LogicalSize, PhysicalPosition},
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
     platform::run_return::EventLoopExtRunReturn,
-    window::{ResizeDirection, WindowBuilder},
+    window::{ResizeDirection, Theme, WindowBuilder},
 };
 use wry::{http::Request, WebContext, WebViewBuilder};
 
@@ -134,6 +134,7 @@ fn try_run_frameless_window(opts: &NativeWindowOptions) -> Result<(), String> {
         .with_min_inner_size(LogicalSize::new(opts.min_width, opts.min_height))
         .with_resizable(opts.resizable)
         .with_decorations(false)
+        .with_visible(false)
         .build(&event_loop)
         .map_err(|e| format!("failed to create window: {e}"))?;
 
@@ -143,7 +144,20 @@ fn try_run_frameless_window(opts: &NativeWindowOptions) -> Result<(), String> {
         window.set_undecorated_shadow(true);
         window.set_taskbar_icon(taskbar_icon);
     }
-    window.set_focus();
+
+    if let Some(monitor) = window.primary_monitor().or_else(|| window.current_monitor()) {
+        let mon_pos = monitor.position();
+        let mon_size = monitor.size();
+        let win_size = window.outer_size();
+        let x = mon_pos.x + ((mon_size.width as i32 - win_size.width as i32) / 2).max(0);
+        let y = mon_pos.y + ((mon_size.height as i32 - win_size.height as i32) / 2).max(0);
+        window.set_outer_position(PhysicalPosition::new(x, y));
+    }
+
+    let bg_rgba: wry::RGBA = match window.theme() {
+        Theme::Dark => (20, 26, 35, 255),
+        _ => (253, 252, 249, 255),
+    };
 
     let proxy = event_loop.create_proxy();
     let ipc_handler = move |req: Request<String>| {
@@ -174,10 +188,17 @@ fn try_run_frameless_window(opts: &NativeWindowOptions) -> Result<(), String> {
         None => WebViewBuilder::new(),
     }
     .with_url(&opts.url)
+    .with_background_color(bg_rgba)
     .with_initialization_script(INIT_SCRIPT)
     .with_ipc_handler(ipc_handler)
     .with_navigation_handler(move |target| !allowed_origin.is_empty() && is_same_origin_url(&allowed_origin, &target))
-    .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
+    .with_new_window_req_handler(|url, _| {
+        let lower = url.to_ascii_lowercase();
+        if lower.starts_with("https://github.com/aflydream/hide-go/") && is_safe_external_http_url(&url) {
+            open_browser_fallback(&url);
+        }
+        wry::NewWindowResponse::Deny
+    })
     .with_drag_drop_handler(|_| true)
     .with_devtools(cfg!(debug_assertions))
     .with_accept_first_mouse(true);
@@ -198,6 +219,9 @@ fn try_run_frameless_window(opts: &NativeWindowOptions) -> Result<(), String> {
             .build_gtk(vbox)
             .map_err(|e| format!("failed to create WebKitGTK WebView: {e}"))?
     };
+
+    window.set_visible(true);
+    window.set_focus();
 
     let mut webview = Some(webview);
     let cleanup_on_close = opts.cleanup_on_close;
@@ -433,41 +457,69 @@ pub fn pick_folder(title: &str, initial_dir: Option<&Path>) -> Option<PathBuf> {
     let init = existing_initial_dir(initial_dir);
     #[cfg(windows)]
     {
-        let esc = |s: &str| s.replace('\'', "''");
-        let desc = esc(title);
-        let init_line = match init {
-            Some(ref dir) => format!("$dlg.SelectedPath = '{}';", esc(&dir.to_string_lossy())),
-            None => String::new(),
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::ERROR_CANCELLED;
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
+            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
         };
-        let script = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; \
-             [System.Windows.Forms.Application]::EnableVisualStyles(); \
-             $owner = New-Object System.Windows.Forms.Form; \
-             $owner.TopMost = $true; \
-             $dlg = New-Object System.Windows.Forms.FolderBrowserDialog; \
-             $dlg.Description = '{desc}'; \
-             $dlg.ShowNewFolderButton = $true; \
-             if ($dlg.PSObject.Properties['UseDescriptionForTitle']) {{ $dlg.UseDescriptionForTitle = $true }}; \
-             {init_line} \
-             try {{ \
-               if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK -and $dlg.SelectedPath) {{ \
-                 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
-                 [Console]::Out.WriteLine($dlg.SelectedPath); \
-               }} \
-             }} finally {{ \
-               $owner.Dispose(); \
-             }}"
-        );
-        let ps = windows_system_executable(r"WindowsPowerShell\v1.0\powershell.exe");
-        let out = hidden_command_path(&ps)
-            .args(["-STA", "-NoProfile", "-NonInteractive", "-Command", &script])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!chosen.is_empty()).then(|| PathBuf::from(chosen))
+        use windows::Win32::UI::Shell::{
+            FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, FOS_FORCEFILESYSTEM,
+            FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+        };
+
+        let title_owned = title.to_string();
+        std::thread::spawn(move || -> Option<PathBuf> {
+            struct ComGuard(bool);
+            impl Drop for ComGuard {
+                fn drop(&mut self) {
+                    if self.0 {
+                        // SAFETY: balanced with a successful `CoInitializeEx` on this dedicated STA thread.
+                        unsafe { CoUninitialize() };
+                    }
+                }
+            }
+
+            // SAFETY: initialize single-threaded apartment COM on a dedicated worker thread.
+            let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+            let _guard = ComGuard(hr.is_ok());
+
+            // SAFETY: instantiates the native Windows Explorer folder picker dialog.
+            let dialog: IFileOpenDialog =
+                unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }.ok()?;
+            // SAFETY: valid `IFileOpenDialog` COM pointer used strictly within this STA thread.
+            unsafe {
+                let mut opts = dialog.GetOptions().ok()?;
+                opts |= FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
+                dialog.SetOptions(opts).ok()?;
+
+                let title_w = HSTRING::from(title_owned.as_str());
+                let _ = dialog.SetTitle(&title_w);
+
+                if let Some(ref dir) = init {
+                    let hdir = HSTRING::from(dir.as_os_str());
+                    if let Ok(folder_item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&hdir, None) {
+                        let _ = dialog.SetFolder(&folder_item);
+                    }
+                }
+
+                if let Err(err) = dialog.Show(None) {
+                    if err.code() != ERROR_CANCELLED.to_hresult() {
+                        tracing::warn!("native folder dialog failed: {err}");
+                    }
+                    return None;
+                }
+
+                let item = dialog.GetResult().ok()?;
+                let pwstr = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+                let path = pwstr.to_string().ok().filter(|s| !s.is_empty()).map(PathBuf::from);
+                CoTaskMemFree(Some(pwstr.0 as *const _));
+                path
+            }
+        })
+        .join()
+        .ok()
+        .flatten()
     }
     #[cfg(target_os = "macos")]
     {

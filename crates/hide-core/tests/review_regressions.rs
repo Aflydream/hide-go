@@ -213,7 +213,7 @@ fn r12_paths_keep_directory_structure() {
         .strip_prefix("cwd: ")
         .and_then(|s| s.split("/titan").next())
         .unwrap();
-    assert!(prefix.starts_with("/workspace/user_"));
+    assert!(prefix.starts_with("/opt/work/"), "{prefix}");
     assert_eq!(
         vendor,
         format!("cwd: {prefix}/titan\nfiles: {prefix}/titan/src/a.rs {prefix}/titan/src/b.rs")
@@ -301,18 +301,26 @@ fn r16_env_secret_ignores_type_annotations_and_keeps_quoted_spaces() {
 fn r17_windows_workspace_placeholder_is_not_double_masked() {
     let cfg = HideConfig::default();
     let vault = PrivacyVault::new();
-    let already_placeholder = r"read C:\workspace\user_01\src\main.rs";
-    let res = SemanticDesensitizer::process(already_placeholder, &cfg, &vault);
-    assert!(res.findings.is_empty(), "unexpected findings: {:?}", res.findings);
-    assert_eq!(res.transformed_payload, already_placeholder);
 
     let first = SemanticDesensitizer::process(r"read C:\Users\alice\src\main.rs", &cfg, &vault);
     assert!(!first.transformed_payload.contains("alice"));
-    assert!(first.transformed_payload.starts_with(r"read C:\workspace\user_"));
-    assert!(first.transformed_payload.ends_with(r"\src\main.rs"));
+    assert!(
+        first.transformed_payload.starts_with(r"read C:\work\"),
+        "{}",
+        first.transformed_payload
+    );
+    assert!(
+        first.transformed_payload.ends_with(r"\src\main.rs"),
+        "{}",
+        first.transformed_payload
+    );
+
     let second = SemanticDesensitizer::process(&first.transformed_payload, &cfg, &vault);
-    assert!(second.findings.is_empty());
+    assert!(second.findings.is_empty(), "{:?}", second.findings);
     assert_eq!(second.transformed_payload, first.transformed_payload);
+
+    let restored = vault.restore_plain_text(&first.transformed_payload).0;
+    assert_eq!(restored, r"read C:\Users\alice\src\main.rs");
 }
 
 #[test]

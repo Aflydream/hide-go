@@ -118,7 +118,7 @@ function getModeOptions(locale: Locale): Array<{ value: PrivacyMode; label: stri
 }
 
 function Sidebar({ navItems }: { navItems: NavItem[] }) {
-  const { route, navigate, logs, vault, status, config, statusError } = useStore();
+  const { route, navigate, logs, vault, status, config, statusError, updateInfo } = useStore();
   const { locale, t } = useI18n();
   const liveCount = useMemo(() => logs.reduce((n, l) => n + (l.simulated ? 0 : 1), 0), [logs]);
   const online = !!status && !statusError;
@@ -133,6 +133,7 @@ function Sidebar({ navItems }: { navItems: NavItem[] }) {
         {navItems.map((item) => {
           const active = item.route === route;
           const count = counts[item.route];
+          const hasUpdateDot = item.route === 'settings' && !!updateInfo?.updateAvailable;
           return (
             <button
               key={item.route}
@@ -150,6 +151,12 @@ function Sidebar({ navItems }: { navItems: NavItem[] }) {
                 {item.icon}
               </span>
               <span className="flex-1 truncate text-left max-[1180px]:sr-only">{item.label}</span>
+              {hasUpdateDot && (
+                <span
+                  aria-hidden="true"
+                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-brand max-[1180px]:absolute max-[1180px]:right-2 max-[1180px]:top-2"
+                />
+              )}
               {count !== undefined && count > 0 && (
                 <span className="tabular rounded-sm bg-surface-3 px-1.5 py-px font-mono text-2xs text-fg-subtle max-[1180px]:hidden">
                   {formatCount(count, locale)}

@@ -183,6 +183,10 @@ impl DesktopBridge {
             .map_err(std::io::Error::other)?;
         let addr = listener.local_addr()?;
         self.state.config.write().proxy_port = addr.port();
+        let _sys_proxy_guard = hide_core::system_proxy::SystemProxyRuntimeGuard::start(
+            self.state.get_config().system_proxy_chain,
+            addr.port(),
+        );
         let shutdown = Arc::new(Notify::new());
         let ui_seen = Arc::new(AtomicBool::new(false));
         let app = self.build_desktop_gateway_service_with_control(shutdown.clone(), ui_seen);
@@ -247,6 +251,10 @@ impl DesktopBridge {
                     }
                 };
                 state.config.write().proxy_port = addr.port();
+                let _sys_proxy_guard = hide_core::system_proxy::SystemProxyRuntimeGuard::start(
+                    state.get_config().system_proxy_chain,
+                    addr.port(),
+                );
                 let ui_url = format!("http://{addr}/");
                 tracing::info!("Hide-Go Standalone Desktop App running at {}", ui_url);
                 let _ = tx.send(Ok(ui_url));

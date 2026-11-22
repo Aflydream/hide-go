@@ -117,6 +117,9 @@ export function describeAction(
   action: string,
   locale: Locale,
 ): { label: string; tone: 'brand' | 'warn' | 'danger' | 'neutral' | 'info' } {
+  if (action === 'tls-handshake-failed') {
+    return { label: translate(locale, 'action.tlsFailed'), tone: 'danger' };
+  }
   if (
     action.includes('stream-error') ||
     action.includes('upstream_') ||
@@ -133,10 +136,10 @@ export function describeAction(
   if (action === 'chaff-injected') {
     return { label: translate(locale, 'action.chaffInjected'), tone: 'warn' };
   }
-  if (action === 'passed') {
+  if (action === 'passed' || action === 'protobuf-passed' || action === 'protobuf-audited') {
     return { label: translate(locale, 'action.passed'), tone: 'neutral' };
   }
-  if (action === 'desensitized') {
+  if (action === 'desensitized' || action === 'protobuf-desensitized') {
     return { label: translate(locale, 'action.desensitized'), tone: 'brand' };
   }
   if (action.includes('all-hide') || action.includes('strict-literal')) {

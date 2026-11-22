@@ -284,18 +284,26 @@ const BOTANICAL_NOUNS: &[&str] = &[
     "foliage",
     "meadow",
     "planter",
+    "iris",
+    "cedar",
+    "willow",
+    "acorn",
+    "thicket",
+    "verbena",
+    "trellis",
+    "botany",
 ];
 
 const LIBRARY_NOUNS: &[&str] = &[
     "catalog",
     "manuscript",
     "anthology",
-    "codex_leaf",
+    "codex",
     "bookmark",
     "periodical",
     "lexicon",
-    "index_card",
-    "shelf_bay",
+    "index",
+    "shelf",
     "folio",
     "archive",
     "binding",
@@ -311,7 +319,7 @@ const LIBRARY_NOUNS: &[&str] = &[
     "edition",
     "librarian",
     "carousel",
-    "reading_room",
+    "atrium",
     "monograph",
     "atlas",
     "gazette",
@@ -319,6 +327,14 @@ const LIBRARY_NOUNS: &[&str] = &[
     "parchment",
     "incipit",
     "epilogue",
+    "vellum",
+    "marginality",
+    "quarto",
+    "spine",
+    "tract",
+    "appendix",
+    "volume",
+    "concordance",
 ];
 
 const BAKERY_NOUNS: &[&str] = &[
@@ -339,34 +355,87 @@ const BAKERY_NOUNS: &[&str] = &[
     "cinnamon",
     "cardamom",
     "vanilla",
-    "yeast_starter",
-    "oven_deck",
-    "kneading_hook",
-    "proofing_tray",
-    "flour_sifter",
-    "pastry_brush",
+    "starter",
+    "oven",
+    "kneader",
+    "proofer",
+    "sifter",
+    "pastry",
     "glaze",
-    "crumb_coat",
+    "crumb",
     "shortbread",
-    "muffin_tin",
+    "muffin",
     "wafer",
     "biscotti",
     "galette",
     "palmier",
     "kouign",
+    "levain",
+    "boule",
+    "choux",
+    "eclair",
+    "praline",
+    "crust",
+    "batard",
+    "sponge",
 ];
 
-/// Prefixes of identifiers produced by Hide-Go itself.
+const BOTANICAL_COMMENTS: &[&str] = &[
+    "Calibrate misting interval for north greenhouse bed",
+    "Check soil moisture baseline before dawn irrigation",
+    "Adjust shade cloth schedule after midday peak irradiance",
+    "Flush drip manifold lines following nutrient dosing",
+    "Verify vent louver limits across propagation bay",
+    "Record nocturnal humidity drift across seedling trays",
+    "Balance pH buffer prior to reservoir recirculation",
+    "Inspect rootstock drainage channels for mineral scale",
+    "Sync ambient PAR readings with grow-light relay",
+    "Pre-warm misting tank ahead of morning mist cycle",
+    "Check canopy airflow velocity to prevent condensation",
+    "Sample substrate EC levels along bench aisle",
+];
+
+const LIBRARY_COMMENTS: &[&str] = &[
+    "Verify call-number ordering across mezzanine stacks",
+    "Reconcile barcode scan batch with circulation ledger",
+    "Audit climate telemetry inside rare folio vault",
+    "Reindex monograph subject headings after acquisition",
+    "Check microfilm scanner calibration before batch job",
+    "Update interlibrary loan routing manifest for branch",
+    "Normalize diacritics in transliterated author records",
+    "Inspect archival box labels along aisle four",
+    "Validate ISSN checksums on incoming serial shipments",
+    "Refresh reading-room hold shelf expiration queue",
+    "Consolidate duplicate authority records in thesaurus",
+    "Check spine-label printer thermal head alignment",
+];
+
+const BAKERY_COMMENTS: &[&str] = &[
+    "Check bulk fermentation dough temperature before fold",
+    "Calibrate deck steam injection duration for boules",
+    "Adjust proofer humidity setpoint for overnight levain",
+    "Verify butter plasticity ahead of croissant lamination",
+    "Record oven spring timing after hearth stone heat-soak",
+    "Weigh starter refreshment ratio for morning bake",
+    "Rotate baking sheet racks halfway through caramelization",
+    "Check custard tempering probe against ice-bath reference",
+    "Inspect flour hopper sift screen before mixing batch",
+    "Log ambient kitchen dew point for pastry sheeting",
+    "Stabilize meringue whip speed before folding sugar",
+    "Monitor cooling rack interval prior to ganache glaze",
+];
+
+/// Prefixes of synthetic placeholder forms excluded from identifier camouflage.
 const OWN_TOKEN_PREFIXES: &[&str] = &[
     "HIDE_",
     "__HIDE_",
+    "key_ref_",
     "BotanicalSensor",
     "CatalogIndex",
     "OvenController",
     "db_user_",
     "db_pass_placeholder_",
     "app_schema_",
-    "user_",
     "dev_member_",
     "svc-node-",
     "sk-sem",
@@ -402,7 +471,7 @@ impl AllHideEngine {
     /// the request stays a valid API call.
     /// - Chaff: telemetry is acknowledged locally; indexing uploads keep their JSON shape and
     ///   size but every content string is replaced with decoy code.
-    /// - Strict literal masking: quoted string literals become `<<HIDE_STR_nnn>>` tokens.
+    /// - Strict literal masking: quoted string literals become short `lit_…` tokens.
     /// - Isomorphic camouflage: compound code identifiers and `//` comments are mapped into a
     ///   cover domain deterministically from the project salt.
     /// - Cipher garble: each content string becomes a keyed Braille cipher block.
@@ -596,6 +665,7 @@ impl AllHideEngine {
     }
 
     fn mask_quoted_literals(text: &str, vault: &PrivacyVault, scope: Option<&str>, stats: &mut LayerStats) -> String {
+        const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
         let tokens = vault.matcher_for_scope(scope).token_ranges(text);
         let mut out = String::with_capacity(text.len());
         let mut last = 0;
@@ -624,14 +694,19 @@ impl AllHideEngine {
                 continue;
             }
             let quote = &lit[..1];
-            let tok = vault.register_derived_scoped_with(
+            let (tok, _) = vault.register_derived_scoped_unique(
                 scope,
                 inner,
                 "StrictStringLiteral",
                 DerivedContext::PlainText,
-                |idx| {
-                    let tag = vault.keyed_tag("StrictStringLiteral", scope, idx, 8);
-                    format!("<<HIDE_STR_{tag}_{idx:03}>>")
+                |attempt| {
+                    let d = vault.keyed_bytes("StrictStringLiteral", scope, "", inner, attempt);
+                    let tag: String = d
+                        .iter()
+                        .take(12)
+                        .map(|&b| BASE62[(b as usize) % BASE62.len()] as char)
+                        .collect();
+                    format!("lit_{tag}")
                 },
             );
             LayerStats::note(&mut stats.literal, inner, &tok);
@@ -645,7 +720,7 @@ impl AllHideEngine {
         out
     }
 
-    /// Single-pass cover-domain mapping of `//` comments and compound identifiers.
+    /// Single-pass cover-domain mapping of `//` / `# ` comments and compound identifiers.
     fn camouflage(
         text: &str,
         theme: CoverTheme,
@@ -656,26 +731,15 @@ impl AllHideEngine {
     ) -> String {
         let tokens = vault.matcher_for_scope(scope).token_ranges(text);
         let overlaps_token = |s: usize, e: usize| tokens.iter().any(|&(a, b)| s < b && a < e);
-        let scoped_salt = format!("{salt}:{}", vault.keyed_tag("cover", scope, 0, 12));
-
-        // 1. Comments (`//` and `# `) become numbered cover comments. When a comment contains
-        // already-masked tokens (paths, keys, strict literals), camouflage the unmasked prose
-        // segments around those tokens instead of skipping the whole comment.
-        let mut replacements: Vec<(usize, usize, String)> = Vec::new();
-        let cover_phrase = |theme: CoverTheme, n: usize, tag: &str, comment_prefix: &str| {
-            let body = match theme {
-                CoverTheme::BotanicalGarden => {
-                    format!("[BotanicalSensor-{tag}-{n:02}] Calibrate greenhouse soil humidity and mist interval")
-                }
-                CoverTheme::LibraryCatalog => {
-                    format!("[CatalogIndex-{tag}-{n:02}] Verify shelf Dewey decimal classification order")
-                }
-                CoverTheme::BakeryRecipe => {
-                    format!("[OvenController-{tag}-{n:02}] Adjust sourdough fermentation thermal curve")
-                }
-            };
-            format!("{comment_prefix}{body}")
+        let comment_pool = match theme {
+            CoverTheme::BotanicalGarden => BOTANICAL_COMMENTS,
+            CoverTheme::LibraryCatalog => LIBRARY_COMMENTS,
+            CoverTheme::BakeryRecipe => BAKERY_COMMENTS,
         };
+
+        // 1. Comments (`//` and `# `) become rotating domain-authentic comments. When a comment
+        // contains already-masked tokens, camouflage the unmasked prose around them.
+        let mut replacements: Vec<(usize, usize, String)> = Vec::new();
         let mut raw_comments: Vec<(usize, usize)> = LINE_COMMENT_RE
             .captures_iter(text)
             .filter_map(|caps| caps.get(1).map(|m| (m.start(), m.end())))
@@ -721,8 +785,6 @@ impl AllHideEngine {
                 if !seg.chars().any(|c| c.is_alphanumeric()) {
                     continue;
                 }
-                let n = replacements.len() + 1;
-                let tag = vault.keyed_tag("CoverComment", scope, n, 8);
                 let comment_prefix = if seg.starts_with("//") {
                     "// "
                 } else if seg.starts_with("# ") {
@@ -730,11 +792,18 @@ impl AllHideEngine {
                 } else {
                     ""
                 };
-                let preferred = cover_phrase(theme, n, &tag, comment_prefix);
-                let cover =
-                    vault.register_derived_scoped_with(scope, seg, "CoverComment", DerivedContext::PlainText, |_| {
-                        preferred
-                    });
+                let (cover, _) = vault.register_derived_scoped_unique(
+                    scope,
+                    seg,
+                    "CoverComment",
+                    DerivedContext::PlainText,
+                    |attempt| {
+                        let d = vault.keyed_bytes("cover-comment", scope, salt, seg, attempt);
+                        let phrase_idx = u16::from_le_bytes([d[0], d[1]]) as usize % comment_pool.len();
+                        let tag4 = hex::encode(&d[2..4]);
+                        format!("{comment_prefix}{} (#{tag4})", comment_pool[phrase_idx])
+                    },
+                );
                 LayerStats::note(&mut stats.camouflage, seg, &cover);
                 replacements.push((seg_s, seg_e, cover));
             }
@@ -750,13 +819,15 @@ impl AllHideEngine {
                 continue;
             }
             if !covers.contains_key(ident) {
-                let preferred = Self::deterministic_cover_symbol(ident, theme, &scoped_salt);
-                let cover = vault.register_derived_scoped_with(
+                let (cover, _) = vault.register_derived_scoped_unique(
                     scope,
                     ident,
                     "IsomorphicSymbol",
                     DerivedContext::PlainText,
-                    |_| preferred,
+                    |attempt| {
+                        let d = vault.keyed_bytes("cover-ident", scope, salt, ident, attempt);
+                        format_cover_symbol_from_digest(ident, theme, &d, attempt)
+                    },
                 );
                 LayerStats::note(&mut stats.camouflage, ident, &cover);
                 covers.insert(ident, cover);
@@ -785,27 +856,8 @@ impl AllHideEngine {
         hasher.update(salt.as_bytes());
         hasher.update(b":");
         hasher.update(symbol.as_bytes());
-        let digest = hasher.finalize();
-
-        let wordlist = match theme {
-            CoverTheme::BotanicalGarden => BOTANICAL_NOUNS,
-            CoverTheme::LibraryCatalog => LIBRARY_NOUNS,
-            CoverTheme::BakeryRecipe => BAKERY_NOUNS,
-        };
-        let w1 = wordlist[(digest[0] as usize) % wordlist.len()];
-        let w2 = wordlist[(digest[1] as usize) % wordlist.len()];
-        let suffix = u16::from_be_bytes([digest[2], digest[3]]) % 900 + 100;
-
-        // Preserve casing convention (PascalCase / SCREAMING_SNAKE / snake_case).
-        if symbol.chars().all(|c| !c.is_lowercase()) {
-            format!("{}_{}_{}", w1, w2, suffix).to_uppercase()
-        } else if symbol.chars().next().is_some_and(|c| c.is_uppercase()) {
-            format!("{}{}{}", capitalize(w1), capitalize(w2), suffix)
-        } else if symbol.contains('_') {
-            format!("{}_{}_{}", w1, w2, suffix)
-        } else {
-            format!("{}{}{}", w1.replace('_', ""), capitalize(w2), suffix)
-        }
+        let digest: [u8; 32] = hasher.finalize().into();
+        format_cover_symbol_from_digest(symbol, theme, &digest, 0)
     }
 
     /// Encrypt text into an authenticated keyed SHA-256 CTR Braille cipher block (`⟦HIDE-CIPHER::...⟧`)
@@ -956,7 +1008,7 @@ fn decoy_json(value: &mut Value, decoy: &str, n: &mut usize, depth: usize) {
                 if let Value::String(s) = v {
                     if k == "path" || k == "file" || k == "filename" || k.ends_with("_path") {
                         *n += 1;
-                        *s = format!("src/garden/module_{:02}.rs", *n);
+                        *s = format!("src/modules/unit_{:02}.rs", *n);
                         continue;
                     }
                 }
@@ -969,6 +1021,43 @@ fn decoy_json(value: &mut Value, decoy: &str, n: &mut usize, depth: usize) {
             *s = decoy_text(decoy, s.chars().count(), *n);
         }
         _ => {}
+    }
+}
+
+fn format_cover_symbol_from_digest(symbol: &str, theme: CoverTheme, digest: &[u8; 32], attempt: usize) -> String {
+    let wordlist = match theme {
+        CoverTheme::BotanicalGarden => BOTANICAL_NOUNS,
+        CoverTheme::LibraryCatalog => LIBRARY_NOUNS,
+        CoverTheme::BakeryRecipe => BAKERY_NOUNS,
+    };
+    let n = wordlist.len();
+    let i1 = (digest[0] as usize) % n;
+    let i2 = (i1 + 1 + ((digest[1] as usize) % (n - 1))) % n;
+    let i3 = (i2 + 1 + ((digest[2] as usize) % (n - 1))) % n;
+    let w1 = wordlist[i1];
+    let w2 = wordlist[i2];
+    let w3 = wordlist[i3];
+
+    let base = if symbol.chars().all(|c| !c.is_lowercase()) {
+        format!("{w1}_{w2}_{w3}").to_uppercase()
+    } else if symbol.chars().next().is_some_and(|c| c.is_uppercase()) {
+        format!("{}{}{}", capitalize(w1), capitalize(w2), capitalize(w3))
+    } else if symbol.contains('_') {
+        format!("{w1}_{w2}_{w3}")
+    } else {
+        format!("{w1}{}{}", capitalize(w2), capitalize(w3))
+    };
+
+    if attempt == 0 {
+        return base;
+    }
+    let w4 = wordlist[(i3 + 1 + (attempt % (n - 1))) % n];
+    if symbol.chars().all(|c| !c.is_lowercase()) {
+        format!("{base}_{}", w4.to_uppercase())
+    } else if symbol.contains('_') {
+        format!("{base}_{w4}")
+    } else {
+        format!("{base}{}", capitalize(w4))
     }
 }
 
@@ -1214,7 +1303,13 @@ mod tests {
         assert!(!out.vendor_payload.contains("ledger"), "{}", out.vendor_payload);
         assert!(!out.vendor_payload.contains("internal flag"), "{}", out.vendor_payload);
         assert!(!out.vendor_payload.contains("/home/alice"), "{}", out.vendor_payload);
-        assert!(out.vendor_payload.contains("BotanicalSensor"), "{}", out.vendor_payload);
+        assert!(
+            !out.vendor_payload.contains("BotanicalSensor"),
+            "{}",
+            out.vendor_payload
+        );
+        assert!(!out.vendor_payload.contains("HIDE_STR"), "{}", out.vendor_payload);
+        assert!(out.vendor_payload.starts_with("// "), "{}", out.vendor_payload);
         assert_eq!(vault.restore_text(&out.vendor_payload).0, src);
     }
 
@@ -1225,9 +1320,8 @@ mod tests {
         let vault = PrivacyVault::new();
         let src = "#!/usr/bin/env python3\n# Internal proprietary trading loop\n#[derive(Debug)]\ncolor = #1a2b3c\nif isinstance(state, AbortController): serde_json.unwrap_or_else()\ncompute_margin_liquidation()";
         let out = AllHideEngine::process(src, TrafficCategory::InteractivePrompt, &cfg, &vault);
-        assert!(out
-            .vendor_payload
-            .starts_with("#!/usr/bin/env python3\n# [BotanicalSensor-"));
+        assert!(out.vendor_payload.starts_with("#!/usr/bin/env python3\n# "));
+        assert!(!out.vendor_payload.contains("BotanicalSensor"));
         assert!(!out.vendor_payload.contains("proprietary trading"));
         assert!(out.vendor_payload.contains("#[derive(Debug)]"));
         assert!(out.vendor_payload.contains("#1a2b3c"));
@@ -1236,5 +1330,26 @@ mod tests {
         assert!(out.vendor_payload.contains("serde_json.unwrap_or_else()"));
         assert!(!out.vendor_payload.contains("compute_margin_liquidation"));
         assert_eq!(vault.restore_text(&out.vendor_payload).0, src);
+    }
+
+    #[test]
+    fn all_hide_keyed_camouflage_isolates_vaults() {
+        let mut cfg = all_hide_cfg();
+        cfg.all_hide.strict_literal_masking = true;
+        let src = "// Confidential risk engine check\npub fn check_risk_threshold(secret_flag: &str) -> bool { check_order_book(\"margin-tier\") }";
+        let v1 = PrivacyVault::new();
+        let v2 = PrivacyVault::new();
+        let o1 = AllHideEngine::process_with_scope(src, TrafficCategory::InteractivePrompt, &cfg, &v1, Some("s1"));
+        let o2 = AllHideEngine::process_with_scope(src, TrafficCategory::InteractivePrompt, &cfg, &v2, Some("s1"));
+        assert_ne!(o1.vendor_payload, o2.vendor_payload);
+        for marker in ["BotanicalSensor", "HIDE_", "sk-sem", "placeholder"] {
+            assert!(!o1.vendor_payload.contains(marker), "{}", o1.vendor_payload);
+        }
+        assert_eq!(
+            v1.matcher_for_scope(Some("s1"))
+                .restore(&o1.vendor_payload, None, true)
+                .0,
+            src
+        );
     }
 }

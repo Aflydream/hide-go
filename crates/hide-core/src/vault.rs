@@ -134,14 +134,78 @@ impl TrieNode {
 
 /// Immutable lookup structure built from a vault snapshot. Tokens are indexed by a compact
 /// byte trie, so matching and prefix checks take O(|token|) per position regardless of vault size.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Matcher {
     pairs: Vec<Pair>,
     trie: Vec<TrieNode>,
+    root_next: [u32; 256],
     max_len: usize,
     json_values: HashMap<String, Value>,
-    /// Indices into `pairs`, longest original first, grouped by the original's first byte.
-    by_original_first: HashMap<u8, Vec<usize>>,
+    /// Indices into `pairs`, longest original first, indexed by the original's first byte.
+    by_original_first: Box<[Vec<usize>; 256]>,
+    has_remaskable_secrets: bool,
+    /// `(pair_idx, percent_encoded_original)` for secrets containing RFC 3986 reserved bytes.
+    pct_secrets: Vec<(usize, String)>,
+}
+
+impl Default for Matcher {
+    fn default() -> Self {
+        Self {
+            pairs: Vec::new(),
+            trie: Vec::new(),
+            root_next: [0u32; 256],
+            max_len: 0,
+            json_values: HashMap::new(),
+            by_original_first: Box::new(std::array::from_fn(|_| Vec::new())),
+            has_remaskable_secrets: false,
+            pct_secrets: Vec::new(),
+        }
+    }
+}
+
+fn is_rfc3986_unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~')
+}
+
+fn percent_encode_rfc3986(raw: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(raw.len());
+    for &b in raw.as_bytes() {
+        if is_rfc3986_unreserved(b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
+fn pct_matches_slice(haystack: &[u8], pattern: &[u8]) -> bool {
+    if haystack.len() < pattern.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < pattern.len() {
+        let hb = haystack[i];
+        let pb = pattern[i];
+        if pb == b'%' && i + 2 < pattern.len() {
+            if hb != b'%'
+                || !haystack[i + 1].eq_ignore_ascii_case(&pattern[i + 1])
+                || !haystack[i + 2].eq_ignore_ascii_case(&pattern[i + 2])
+            {
+                return false;
+            }
+            i += 3;
+        } else {
+            if hb != pb {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    true
 }
 
 impl Matcher {
@@ -177,6 +241,11 @@ impl Matcher {
             }
         }
 
+        let mut root_next = [0u32; 256];
+        for &(b, next_node) in &trie[0].next {
+            root_next[b as usize] = next_node as u32;
+        }
+
         let max_len = pairs.first().map_or(0, |p| p.token.len());
         let mut json_values = HashMap::new();
         for p in &pairs {
@@ -187,18 +256,33 @@ impl Matcher {
 
         let mut by_orig: Vec<usize> = (0..pairs.len()).filter(|&i| pairs[i].original.len() >= 3).collect();
         by_orig.sort_by(|&a, &b| pairs[b].original.len().cmp(&pairs[a].original.len()));
-        let mut by_original_first: HashMap<u8, Vec<usize>> = HashMap::new();
+        let mut by_original_first: Box<[Vec<usize>; 256]> = Box::new(std::array::from_fn(|_| Vec::new()));
+        let mut has_remaskable_secrets = false;
+        let mut pct_secrets = Vec::new();
         for i in by_orig {
-            if let Some(&first_b) = pairs[i].original.as_bytes().first() {
-                by_original_first.entry(first_b).or_default().push(i);
+            let p = &pairs[i];
+            if let Some(&first_b) = p.original.as_bytes().first() {
+                by_original_first[first_b as usize].push(i);
+            }
+            if p.secret && p.original.len() >= 6 && !matches!(p.original.as_str(), "true" | "false" | "null") {
+                has_remaskable_secrets = true;
+                if p.original.as_bytes().iter().any(|&b| !is_rfc3986_unreserved(b)) {
+                    let encoded = percent_encode_rfc3986(&p.original);
+                    if encoded.len() > p.original.len() {
+                        pct_secrets.push((i, encoded));
+                    }
+                }
             }
         }
         Self {
             pairs,
             trie,
+            root_next,
             max_len,
             json_values,
             by_original_first,
+            has_remaskable_secrets,
+            pct_secrets,
         }
     }
 
@@ -228,33 +312,38 @@ impl Matcher {
     /// signed reasoning blocks echoed back by the harness, whose signature covers the text the
     /// vendor produced (with tokens), not the restored text.
     pub fn reseal(&self, text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut pos = 0;
-        while pos < text.len() {
-            let rem = &text[pos..];
-            let hit = rem
-                .as_bytes()
-                .first()
-                .and_then(|b| self.by_original_first.get(b))
-                .and_then(|idx| {
-                    idx.iter().map(|&i| &self.pairs[i]).find(|p| {
-                        rem.starts_with(p.original.as_str())
-                            && is_valid_token_boundary_with_left(text, pos, &p.original, None)
-                    })
-                });
-            match hit {
-                Some(p) => {
-                    out.push_str(&p.token);
+        if self.pairs.is_empty() || text.len() < 3 {
+            return text.to_string();
+        }
+        let bytes = text.as_bytes();
+        let mut out: Option<String> = None;
+        let mut pos = 0usize;
+        let mut copied = 0usize;
+        while pos < bytes.len() {
+            let bucket = &self.by_original_first[bytes[pos] as usize];
+            if !bucket.is_empty() {
+                let rem = &text[pos..];
+                if let Some(p) = bucket.iter().map(|&i| &self.pairs[i]).find(|p| {
+                    rem.starts_with(p.original.as_str())
+                        && is_valid_token_boundary_with_left(text, pos, &p.original, None)
+                }) {
+                    let buf = out.get_or_insert_with(|| String::with_capacity(text.len()));
+                    buf.push_str(&text[copied..pos]);
+                    buf.push_str(&p.token);
                     pos += p.original.len();
-                }
-                None => {
-                    let Some(ch) = rem.chars().next() else { break };
-                    out.push(ch);
-                    pos += ch.len_utf8();
+                    copied = pos;
+                    continue;
                 }
             }
+            pos += 1;
         }
-        out
+        match out {
+            None => text.to_string(),
+            Some(mut buf) => {
+                buf.push_str(&text[copied..]);
+                buf
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -267,13 +356,22 @@ impl Matcher {
 
     /// Longest token at `text[pos..]` that respects identifier/number boundaries.
     pub fn find_at(&self, text: &str, pos: usize, left: Option<char>) -> Option<&Pair> {
-        if self.trie.is_empty() || pos >= text.len() {
+        let bytes = text.as_bytes();
+        if self.trie.is_empty() || pos >= bytes.len() {
             return None;
         }
-        let bytes = &text.as_bytes()[pos..];
-        let mut node = 0usize;
+        let mut node = self.root_next[bytes[pos] as usize] as usize;
+        if node == 0 {
+            return None;
+        }
         let mut matched: Option<&Pair> = None;
-        for &b in bytes {
+        if let Some(pair_idx) = self.trie[node].pair_idx {
+            let p = &self.pairs[pair_idx];
+            if is_valid_token_boundary_with_left(text, pos, &p.token, left) {
+                matched = Some(p);
+            }
+        }
+        for &b in &bytes[pos + 1..] {
             let Some(next) = self.trie[node].child(b) else {
                 break;
             };
@@ -293,8 +391,12 @@ impl Matcher {
         if rem.is_empty() || rem.len() >= self.max_len || self.trie.is_empty() {
             return false;
         }
-        let mut node = 0usize;
-        for &b in rem.as_bytes() {
+        let bytes = rem.as_bytes();
+        let mut node = self.root_next[bytes[0] as usize] as usize;
+        if node == 0 {
+            return false;
+        }
+        for &b in &bytes[1..] {
             let Some(next) = self.trie[node].child(b) else {
                 return false;
             };
@@ -309,15 +411,17 @@ impl Matcher {
         if self.pairs.is_empty() {
             return out;
         }
-        let mut pos = 0;
-        while pos < text.len() {
-            if let Some(p) = self.find_at(text, pos, None) {
-                out.push((pos, pos + p.token.len()));
-                pos += p.token.len();
-            } else {
-                let Some(ch) = text[pos..].chars().next() else { break };
-                pos += ch.len_utf8();
+        let bytes = text.as_bytes();
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            if self.root_next[bytes[pos] as usize] != 0 {
+                if let Some(p) = self.find_at(text, pos, None) {
+                    out.push((pos, pos + p.token.len()));
+                    pos += p.token.len();
+                    continue;
+                }
             }
+            pos += 1;
         }
         out
     }
@@ -328,72 +432,94 @@ impl Matcher {
         if self.pairs.is_empty() || text.is_empty() {
             return (text.to_string(), 0, 0);
         }
-        let mut output = String::with_capacity(text.len());
-        let (mut count, mut withheld, mut pos) = (0, 0, 0);
-        while pos < text.len() {
-            if let Some(p) = self.find_at(text, pos, left) {
-                if p.secret && !allow_secret {
-                    output.push_str(&p.token);
-                    withheld += 1;
-                } else {
-                    output.push_str(&p.original);
+        let bytes = text.as_bytes();
+        let mut out: Option<String> = None;
+        let (mut count, mut withheld, mut pos, mut copied) = (0usize, 0usize, 0usize, 0usize);
+        while pos < bytes.len() {
+            if self.root_next[bytes[pos] as usize] != 0 {
+                if let Some(p) = self.find_at(text, pos, left) {
+                    if p.secret && !allow_secret {
+                        withheld += 1;
+                        pos += p.token.len();
+                        continue;
+                    }
+                    let buf = out.get_or_insert_with(|| String::with_capacity(text.len()));
+                    buf.push_str(&text[copied..pos]);
+                    buf.push_str(&p.original);
                     count += 1;
+                    pos += p.token.len();
+                    copied = pos;
+                    continue;
                 }
-                pos += p.token.len();
-            } else {
-                let Some(ch) = text[pos..].chars().next() else { break };
-                output.push(ch);
-                pos += ch.len_utf8();
+            }
+            pos += 1;
+        }
+        match out {
+            None => (text.to_string(), count, withheld),
+            Some(mut buf) => {
+                buf.push_str(&text[copied..]);
+                (buf, count, withheld)
             }
         }
-        (output, count, withheld)
     }
 
-    /// Re-mask verbatim occurrences of known secret originals in `text` (longest-first,
-    /// boundary-checked) outside `existing_ranges`. Returns the rewritten text and `(raw, token, count)`.
+    /// Re-mask verbatim occurrences (and URL percent-encoded forms) of known secret originals in `text`
+    /// outside `existing_ranges`. Returns the rewritten text and `(raw, token, count)`.
     pub fn remask_secrets(
         &self,
         text: &str,
         existing_ranges: &[(usize, usize)],
     ) -> (String, Vec<(String, String, usize)>) {
-        if self.pairs.is_empty()
-            || text.len() < 6
-            || !self
-                .pairs
-                .iter()
-                .any(|p| p.secret && p.original.len() >= 6 && !matches!(p.original.as_str(), "true" | "false" | "null"))
-        {
+        if !self.has_remaskable_secrets || text.len() < 6 {
             return (text.to_string(), Vec::new());
         }
-        let mut out = String::new();
+        let (first_pass, mut stats) = self.remask_raw_pass(text, existing_ranges);
+        if self.pct_secrets.is_empty() || !first_pass.as_bytes().contains(&b'%') {
+            return (first_pass, stats);
+        }
+        let pct_ranges = if stats.is_empty() {
+            existing_ranges.to_vec()
+        } else {
+            self.token_ranges(&first_pass)
+        };
+        let (second_pass, pct_stats) = self.remask_pct_pass(&first_pass, &pct_ranges);
+        for (raw, tok, count) in pct_stats {
+            if let Some(entry) = stats.iter_mut().find(|e| e.1 == tok) {
+                entry.2 += count;
+            } else {
+                stats.push((raw, tok, count));
+            }
+        }
+        (second_pass, stats)
+    }
+
+    fn remask_raw_pass(
+        &self,
+        text: &str,
+        existing_ranges: &[(usize, usize)],
+    ) -> (String, Vec<(String, String, usize)>) {
+        let bytes = text.as_bytes();
+        let mut out: Option<String> = None;
         let mut stats: Vec<(String, String, usize)> = Vec::new();
         let mut pos = 0usize;
         let mut copied = 0usize;
-        while pos < text.len() {
-            let rem = &text[pos..];
-            let hit = rem
-                .as_bytes()
-                .first()
-                .and_then(|b| self.by_original_first.get(b))
-                .and_then(|idx| {
-                    idx.iter().map(|&i| &self.pairs[i]).find(|p| {
-                        p.secret
-                            && p.original.len() >= 6
-                            && !matches!(p.original.as_str(), "true" | "false" | "null")
-                            && rem.starts_with(p.original.as_str())
-                            && !existing_ranges
-                                .iter()
-                                .any(|&(a, b)| pos < b && a < pos + p.original.len())
-                            && is_valid_token_boundary_with_left(text, pos, &p.original, None)
-                    })
-                });
-            match hit {
-                Some(p) => {
-                    if out.is_empty() {
-                        out.reserve(text.len());
-                    }
-                    out.push_str(&text[copied..pos]);
-                    out.push_str(&p.token);
+        while pos < bytes.len() {
+            let bucket = &self.by_original_first[bytes[pos] as usize];
+            if !bucket.is_empty() {
+                let rem = &text[pos..];
+                if let Some(p) = bucket.iter().map(|&i| &self.pairs[i]).find(|p| {
+                    p.secret
+                        && p.original.len() >= 6
+                        && !matches!(p.original.as_str(), "true" | "false" | "null")
+                        && rem.starts_with(p.original.as_str())
+                        && !existing_ranges
+                            .iter()
+                            .any(|&(a, b)| pos < b && a < pos + p.original.len())
+                        && is_valid_token_boundary_with_left(text, pos, &p.original, None)
+                }) {
+                    let buf = out.get_or_insert_with(|| String::with_capacity(text.len()));
+                    buf.push_str(&text[copied..pos]);
+                    buf.push_str(&p.token);
                     if let Some(entry) = stats.iter_mut().find(|e| e.1 == p.token) {
                         entry.2 += 1;
                     } else {
@@ -401,18 +527,69 @@ impl Matcher {
                     }
                     pos += p.original.len();
                     copied = pos;
-                }
-                None => {
-                    let Some(ch) = rem.chars().next() else { break };
-                    pos += ch.len_utf8();
+                    continue;
                 }
             }
+            pos += 1;
         }
-        if copied == 0 {
-            return (text.to_string(), stats);
+        match out {
+            None => (text.to_string(), stats),
+            Some(mut buf) => {
+                buf.push_str(&text[copied..]);
+                (buf, stats)
+            }
         }
-        out.push_str(&text[copied..]);
-        (out, stats)
+    }
+
+    fn remask_pct_pass(
+        &self,
+        text: &str,
+        existing_ranges: &[(usize, usize)],
+    ) -> (String, Vec<(String, String, usize)>) {
+        let bytes = text.as_bytes();
+        let mut out: Option<String> = None;
+        let mut stats: Vec<(String, String, usize)> = Vec::new();
+        let mut pos = 0usize;
+        let mut copied = 0usize;
+        while pos < bytes.len() {
+            let cur_b = bytes[pos];
+            let hit = self.pct_secrets.iter().find(|&(pair_idx, pct)| {
+                let pct_bytes = pct.as_bytes();
+                if pct_bytes[0] != cur_b
+                    || existing_ranges
+                        .iter()
+                        .any(|&(a, b)| pos < b && a < pos + pct_bytes.len())
+                    || !pct_matches_slice(&bytes[pos..], pct_bytes)
+                {
+                    return false;
+                }
+                let p = &self.pairs[*pair_idx];
+                is_valid_token_boundary_with_left(text, pos, pct, None)
+                    || !p.original.as_bytes()[0].is_ascii_alphanumeric()
+            });
+            if let Some(&(pair_idx, ref pct)) = hit {
+                let p = &self.pairs[pair_idx];
+                let buf = out.get_or_insert_with(|| String::with_capacity(text.len()));
+                buf.push_str(&text[copied..pos]);
+                buf.push_str(&p.token);
+                if let Some(entry) = stats.iter_mut().find(|e| e.1 == p.token) {
+                    entry.2 += 1;
+                } else {
+                    stats.push((p.original.clone(), p.token.clone(), 1));
+                }
+                pos += pct.len();
+                copied = pos;
+                continue;
+            }
+            pos += 1;
+        }
+        match out {
+            None => (text.to_string(), stats),
+            Some(mut buf) => {
+                buf.push_str(&text[copied..]);
+                (buf, stats)
+            }
+        }
     }
 
     /// Restore keys and string values of a JSON document structurally.
@@ -518,6 +695,34 @@ impl PrivacyVault {
     /// Return the vault's ephemeral 256-bit secret key without locking `VaultInner`.
     pub fn secret_key(&self) -> [u8; 32] {
         self.secret_key.read().0
+    }
+
+    /// Derive a 32-byte HMAC-SHA256 digest bound to the vault's secret key, salt, scope, and input.
+    pub fn keyed_bytes(
+        &self,
+        domain: &str,
+        scope: Option<&str>,
+        project_salt: &str,
+        input: &str,
+        attempt: usize,
+    ) -> [u8; 32] {
+        let key_bytes = self.secret_key();
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
+        let mut ctx = hmac::Context::with_key(&key);
+        ctx.update(b"hide-go-hmac-v2:");
+        ctx.update(domain.as_bytes());
+        ctx.update(b"\0");
+        ctx.update(project_salt.as_bytes());
+        ctx.update(b"\0");
+        ctx.update(scope.unwrap_or("").as_bytes());
+        ctx.update(b"\0");
+        ctx.update(input.as_bytes());
+        ctx.update(b"\0");
+        ctx.update(&attempt.to_le_bytes());
+        let tag = ctx.sign();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(tag.as_ref());
+        out
     }
 
     /// Derive a keyed, unguessable hex tag from the vault's secret key.
@@ -773,6 +978,162 @@ impl PrivacyVault {
         )
     }
 
+    /// Scoped collision-free registration: invokes `generator(attempt)` until an unused token
+    /// is found. Returns `(token, inserted_new)`.
+    pub fn get_or_insert_scoped_unique<F>(
+        &self,
+        scope: Option<&str>,
+        raw_value: &str,
+        category: &str,
+        generator: F,
+    ) -> (String, bool)
+    where
+        F: FnMut(usize) -> String,
+    {
+        if raw_value.trim().is_empty() {
+            return (raw_value.to_string(), false);
+        }
+        let owned_scope = scope.map(str::to_string);
+        self.register_unique_with(
+            raw_value,
+            category,
+            RegistrationKey::Original(owned_scope.clone(), raw_value.to_string()),
+            None,
+            is_secret_category(category),
+            owned_scope,
+            generator,
+        )
+    }
+
+    /// JSON-value-preserving variant of `get_or_insert_scoped_unique`.
+    pub fn get_or_insert_json_value_scoped_unique<F>(
+        &self,
+        scope: Option<&str>,
+        value: &Value,
+        category: &str,
+        generator: F,
+    ) -> (String, bool)
+    where
+        F: FnMut(usize) -> String,
+    {
+        if let Value::String(raw) = value {
+            return self.get_or_insert_scoped_unique(scope, raw, category, generator);
+        }
+        let raw = value.to_string();
+        let owned_scope = scope.map(str::to_string);
+        self.register_unique_with(
+            &raw,
+            category,
+            RegistrationKey::Json(owned_scope.clone(), raw.clone()),
+            Some(value.clone()),
+            is_secret_category(category),
+            owned_scope,
+            generator,
+        )
+    }
+
+    /// Scoped collision-free derived registration folding earlier tokens. Returns `(token, inserted_new)`.
+    pub fn register_derived_scoped_unique<F>(
+        &self,
+        scope: Option<&str>,
+        transformed_value: &str,
+        category: &str,
+        context: DerivedContext,
+        generator: F,
+    ) -> (String, bool)
+    where
+        F: FnMut(usize) -> String,
+    {
+        if transformed_value.is_empty() {
+            return (String::new(), false);
+        }
+        let matcher = if scope.is_some() {
+            self.matcher_for_scope(scope)
+        } else {
+            self.matcher()
+        };
+        let folds_secret = matcher
+            .pairs
+            .iter()
+            .any(|p| p.secret && transformed_value.contains(p.token.as_str()));
+        let original = match context {
+            DerivedContext::PlainText => matcher.restore(transformed_value, None, true).0,
+            DerivedContext::JsonPayload => matcher.restore_document(transformed_value, true).0,
+        };
+        let json_value = matcher.json_values.get(transformed_value).cloned();
+        let owned_scope = scope.map(str::to_string);
+        let key = RegistrationKey::Derived(
+            owned_scope.clone(),
+            category.to_string(),
+            original.clone(),
+            json_value.is_some(),
+        );
+        self.register_unique_with(
+            &original,
+            category,
+            key,
+            json_value,
+            folds_secret || is_secret_category(category),
+            owned_scope,
+            generator,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_unique_with<F>(
+        &self,
+        raw_value: &str,
+        category: &str,
+        key: RegistrationKey,
+        json_value: Option<Value>,
+        secret: bool,
+        scope: Option<String>,
+        mut generator: F,
+    ) -> (String, bool)
+    where
+        F: FnMut(usize) -> String,
+    {
+        let mut guard = self.inner.write();
+        guard.tick += 1;
+        let tick = guard.tick;
+        if let Some(existing) = guard.source_to_token.get(&key).cloned() {
+            if let Some(entry) = guard.token_to_real.get_mut(&existing) {
+                entry.hit_count += 1;
+                entry.last_used = tick;
+            }
+            return (existing, false);
+        }
+
+        let mut chosen = None;
+        for attempt in 0..64usize {
+            let candidate = generator(attempt);
+            if candidate.len() >= 2 && !guard.token_to_real.contains_key(&candidate) {
+                chosen = Some(candidate);
+                break;
+            }
+        }
+        let token = chosen.unwrap_or_else(|| {
+            let counter_key = match &scope {
+                Some(s) => format!("{s}::{category}"),
+                None => category.to_string(),
+            };
+            let index = *guard.counters.entry(counter_key).and_modify(|c| *c += 1).or_insert(1);
+            disambiguate_token(&guard.token_to_real, &generator(64 + index), index)
+        });
+        commit_vault_entry(
+            &mut guard,
+            raw_value,
+            category,
+            key,
+            json_value,
+            secret,
+            scope,
+            tick,
+            token.clone(),
+        );
+        (token, true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn register_with<F>(
         &self,
@@ -803,27 +1164,17 @@ impl PrivacyVault {
         };
         let index = *guard.counters.entry(counter_key).and_modify(|c| *c += 1).or_insert(1);
         let token = disambiguate_token(&guard.token_to_real, &generator(index), index);
-        guard.source_to_token.insert(key, token.clone());
-        if let Some(value) = json_value {
-            guard.json_values.insert(token.clone(), value);
-        }
-        guard.token_to_real.insert(
+        commit_vault_entry(
+            &mut guard,
+            raw_value,
+            category,
+            key,
+            json_value,
+            secret,
+            scope,
+            tick,
             token.clone(),
-            VaultEntry {
-                token: token.clone(),
-                original_masked: mask_preview(raw_value),
-                original_raw: raw_value.to_string(),
-                category: category.to_string(),
-                hit_count: 1,
-                secret,
-                last_used: tick,
-                scope,
-            },
         );
-        guard.generation += 1;
-        if guard.token_to_real.len() > MAX_VAULT_ENTRIES {
-            evict_least_recent(&mut guard, &token);
-        }
         token
     }
 
@@ -875,6 +1226,41 @@ impl PrivacyVault {
             key_guard.0 = generate_ephemeral_key();
         }
         guard.generation += 1;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_vault_entry(
+    guard: &mut VaultInner,
+    raw_value: &str,
+    category: &str,
+    key: RegistrationKey,
+    json_value: Option<Value>,
+    secret: bool,
+    scope: Option<String>,
+    tick: u64,
+    token: String,
+) {
+    guard.source_to_token.insert(key, token.clone());
+    if let Some(value) = json_value {
+        guard.json_values.insert(token.clone(), value);
+    }
+    guard.token_to_real.insert(
+        token.clone(),
+        VaultEntry {
+            token: token.clone(),
+            original_masked: mask_preview(raw_value),
+            original_raw: raw_value.to_string(),
+            category: category.to_string(),
+            hit_count: 1,
+            secret,
+            last_used: tick,
+            scope,
+        },
+    );
+    guard.generation += 1;
+    if guard.token_to_real.len() > MAX_VAULT_ENTRIES {
+        evict_least_recent(guard, &token);
     }
 }
 
@@ -1102,5 +1488,52 @@ mod tests {
         );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].2, 1);
+    }
+
+    #[test]
+    fn remask_secrets_catches_percent_encoded_secrets_in_urls() {
+        let vault = PrivacyVault::new();
+        vault.insert_explicit("abc+secret/xyz=", "sec_9f8e7d6c", "EnvSecret");
+        let matcher = vault.matcher();
+
+        let upper = "GET https://example.com/?k=abc%2Bsecret%2Fxyz%3D&ok=1";
+        let (out_u, hits_u) = matcher.remask_secrets(upper, &[]);
+        assert_eq!(out_u, "GET https://example.com/?k=sec_9f8e7d6c&ok=1");
+        assert_eq!(hits_u.len(), 1);
+
+        let lower = "GET https://example.com/?k=abc%2bsecret%2fxyz%3d";
+        let (out_l, _) = matcher.remask_secrets(lower, &[]);
+        assert_eq!(out_l, "GET https://example.com/?k=sec_9f8e7d6c");
+    }
+
+    #[test]
+    fn unique_registration_avoids_collisions_and_tracks_insertion_flag() {
+        let vault = PrivacyVault::new();
+        let (t1, ins1) = vault.get_or_insert_scoped_unique(Some("s1"), "secret-a", "ApiKey", |attempt| {
+            format!("tok_same_{attempt}")
+        });
+        assert!(ins1);
+        assert_eq!(t1, "tok_same_0");
+
+        let (t1_again, ins1_again) =
+            vault.get_or_insert_scoped_unique(Some("s1"), "secret-a", "ApiKey", |_| "tok_same_0".to_string());
+        assert!(!ins1_again);
+        assert_eq!(t1_again, "tok_same_0");
+
+        let (t2, ins2) = vault.get_or_insert_scoped_unique(Some("s1"), "secret-b", "ApiKey", |attempt| {
+            format!("tok_same_{attempt}")
+        });
+        assert!(ins2);
+        assert_eq!(t2, "tok_same_1");
+    }
+
+    #[test]
+    fn root_trie_handles_multibyte_utf8_and_braille_tokens_cleanly() {
+        let vault = PrivacyVault::new();
+        vault.insert_explicit("密钥A", "tok_alpha_99", "EnvSecret");
+        vault.insert_explicit("密钥B", "⟦HIDE-CIPHER::⠀⠁⟧", "CipherGarble");
+        let text = "中文前缀—tok_alpha_99——⟦HIDE-CIPHER::⠀⠁⟧结尾";
+        let m = vault.matcher();
+        assert_eq!(m.restore(text, None, true).0, "中文前缀—密钥A——密钥B结尾");
     }
 }

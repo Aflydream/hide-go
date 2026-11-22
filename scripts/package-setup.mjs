@@ -26,15 +26,6 @@ function parseArgs(argv) {
   return args;
 }
 
-function readWorkspaceVersion() {
-  const cargoToml = fs.readFileSync(path.join(repoRoot, 'Cargo.toml'), 'utf8');
-  const match = cargoToml.match(/^version\s*=\s*"([^"]+)"/m);
-  if (!match) {
-    throw new Error('Could not find workspace version in Cargo.toml');
-  }
-  return match[1];
-}
-
 function sha256Hex(buffer) {
   return createHash('sha256').update(buffer).digest('hex');
 }
@@ -138,130 +129,67 @@ function buildDeterministicTarGz(entries) {
   return zlib.gzipSync(Buffer.concat(chunks), { level: 9 });
 }
 
-function copyFileEnsuringDir(src, dst, mode = null) {
-  fs.mkdirSync(path.dirname(dst), { recursive: true });
-  fs.copyFileSync(src, dst);
-  if (mode !== null && process.platform !== 'win32') {
-    fs.chmodSync(dst, mode);
+function platformSpec(targetOs) {
+  if (targetOs === 'windows') {
+    return {
+      desktopBin: 'hide-go-desktop.exe',
+      daemonBin: 'hide-go-daemon.exe',
+      setupBin: 'hide-go-setup.exe',
+      setupEntry: 'Hide-Go-Setup.exe',
+      engineLib: 'hide_engine.dll',
+      chromeLib: 'hide_chrome.dll',
+    };
   }
+  if (targetOs === 'macos') {
+    return {
+      desktopBin: 'hide-go-desktop',
+      daemonBin: 'hide-go-daemon',
+      setupBin: 'hide-go-setup',
+      setupEntry: 'Hide-Go-Setup',
+      engineLib: 'libhide_engine.dylib',
+      chromeLib: 'libhide_chrome.dylib',
+    };
+  }
+  return {
+    desktopBin: 'hide-go-desktop',
+    daemonBin: 'hide-go-daemon',
+    setupBin: 'hide-go-setup',
+    setupEntry: 'Hide-Go-Setup',
+    engineLib: 'libhide_engine.so',
+    chromeLib: 'libhide_chrome.so',
+  };
 }
 
-function writeFileEnsuringDir(dst, data, mode = null) {
-  fs.mkdirSync(path.dirname(dst), { recursive: true });
-  fs.writeFileSync(dst, data);
-  if (mode !== null && process.platform !== 'win32') {
-    fs.chmodSync(dst, mode);
+function resolveReleaseDir(args) {
+  if (args['build-dir']) {
+    return path.resolve(repoRoot, args['build-dir']);
   }
+  if (args.target) {
+    return path.join(repoRoot, 'target', args.target, 'release');
+  }
+  return path.join(repoRoot, 'target', 'release');
 }
 
-function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const targetOs = args.os;
-  if (!['windows', 'macos', 'linux'].includes(targetOs)) {
-    throw new Error(`--os must be one of windows|macos|linux (got: ${targetOs ?? ''})`);
-  }
-  const format = args.format ?? (targetOs === 'windows' ? 'zip' : 'tar.gz');
-  if (!['zip', 'tar.gz'].includes(format)) {
-    throw new Error(`--format must be zip|tar.gz (got: ${format})`);
-  }
-
-  const releaseDir = args['build-dir']
-    ? path.resolve(repoRoot, args['build-dir'])
-    : args.target
-      ? path.join(repoRoot, 'target', args.target, 'release')
-      : path.join(repoRoot, 'target', 'release');
-
-  const pkgDir = path.resolve(repoRoot, args['package-dir'] ?? `Hide-Go-Setup-${targetOs}`);
-  const archivePath = path.resolve(
-    repoRoot,
-    args.archive ?? `${pkgDir}.${format === 'zip' ? 'zip' : 'tar.gz'}`,
-  );
-
-  const spec =
-    targetOs === 'windows'
-      ? {
-          desktopBin: 'hide-go-desktop.exe',
-          daemonBin: 'hide-go-daemon.exe',
-          setupBin: 'hide-go-setup.exe',
-          setupEntry: 'Hide-Go-Setup.exe',
-          engineLib: 'hide_engine.dll',
-          chromeLib: 'hide_chrome.dll',
-        }
-      : targetOs === 'macos'
-        ? {
-            desktopBin: 'hide-go-desktop',
-            daemonBin: 'hide-go-daemon',
-            setupBin: 'hide-go-setup',
-            setupEntry: 'Hide-Go-Setup',
-            engineLib: 'libhide_engine.dylib',
-            chromeLib: 'libhide_chrome.dylib',
-          }
-        : {
-            desktopBin: 'hide-go-desktop',
-            daemonBin: 'hide-go-daemon',
-            setupBin: 'hide-go-setup',
-            setupEntry: 'Hide-Go-Setup',
-            engineLib: 'libhide_engine.so',
-            chromeLib: 'libhide_chrome.so',
-          };
-
-  const version = readWorkspaceVersion();
+function stagePayloadArchive(targetOs, releaseDir, outPath) {
+  const spec = platformSpec(targetOs);
   const distDir = path.join(repoRoot, 'dist');
   const localesDir = path.join(repoRoot, 'src', 'locales');
   const iconsDir = path.join(repoRoot, 'desktop', 'icons');
 
   for (const reqFile of [
-    path.join(releaseDir, spec.setupBin),
     path.join(releaseDir, spec.desktopBin),
     path.join(releaseDir, spec.daemonBin),
     path.join(releaseDir, spec.engineLib),
     path.join(releaseDir, spec.chromeLib),
     path.join(distDir, 'index.html'),
-    path.join(distDir, 'setup.html'),
   ]) {
     if (!fs.existsSync(reqFile)) {
       throw new Error(`Required build artifact missing: ${reqFile}`);
     }
   }
 
-  fs.rmSync(pkgDir, { recursive: true, force: true });
-  fs.rmSync(archivePath, { force: true });
-  fs.rmSync(`${archivePath}.sha256`, { force: true });
-  fs.mkdirSync(pkgDir, { recursive: true });
-
-  // 1. Setup entry launcher + shared runtime DLLs
-  copyFileEnsuringDir(path.join(releaseDir, spec.setupBin), path.join(pkgDir, spec.setupEntry), 0o755);
-  copyFileEnsuringDir(path.join(releaseDir, spec.engineLib), path.join(pkgDir, spec.engineLib), 0o755);
-  copyFileEnsuringDir(path.join(releaseDir, spec.chromeLib), path.join(pkgDir, spec.chromeLib), 0o755);
-
-  // 2. Setup runtime resources (setup HTML/assets, locales, icons)
-  copyFileEnsuringDir(path.join(distDir, 'setup.html'), path.join(pkgDir, 'resources/setup/setup.html'), 0o644);
-  const setupAssets = collectReferencedAssets(distDir, 'setup.html');
-  for (const name of setupAssets) {
-    copyFileEnsuringDir(
-      path.join(distDir, 'assets', name),
-      path.join(pkgDir, 'resources/setup/assets', name),
-      0o644,
-    );
-  }
-  for (const locFile of ['zh-CN.json', 'en.json']) {
-    copyFileEnsuringDir(
-      path.join(localesDir, locFile),
-      path.join(pkgDir, 'resources/locales', locFile),
-      0o644,
-    );
-  }
-  for (const iconFile of ['icon.ico', 'icon.png', '32x32.png', '128x128.png']) {
-    copyFileEnsuringDir(
-      path.join(iconsDir, iconFile),
-      path.join(pkgDir, 'resources/icons', iconFile),
-      0o644,
-    );
-  }
-
-  // 3. Compressed data/app.tar.gz holding desktop & daemon launchers + desktop UI resources
   const uiAssets = collectReferencedAssets(distDir, 'index.html');
-  const appEntries = [
+  const entries = [
     {
       tarPath: spec.desktopBin,
       data: fs.readFileSync(path.join(releaseDir, spec.desktopBin)),
@@ -270,6 +198,16 @@ function main() {
     {
       tarPath: spec.daemonBin,
       data: fs.readFileSync(path.join(releaseDir, spec.daemonBin)),
+      mode: 0o755,
+    },
+    {
+      tarPath: spec.engineLib,
+      data: fs.readFileSync(path.join(releaseDir, spec.engineLib)),
+      mode: 0o755,
+    },
+    {
+      tarPath: spec.chromeLib,
+      data: fs.readFileSync(path.join(releaseDir, spec.chromeLib)),
       mode: 0o755,
     },
     {
@@ -282,73 +220,82 @@ function main() {
       data: fs.readFileSync(path.join(distDir, 'assets', name)),
       mode: 0o644,
     })),
+    ...['zh-CN.json', 'en.json'].map((locFile) => ({
+      tarPath: `resources/locales/${locFile}`,
+      data: fs.readFileSync(path.join(localesDir, locFile)),
+      mode: 0o644,
+    })),
+    ...['icon.ico', 'icon.png', '32x32.png', '128x128.png'].map((iconFile) => ({
+      tarPath: `resources/icons/${iconFile}`,
+      data: fs.readFileSync(path.join(iconsDir, iconFile)),
+      mode: 0o644,
+    })),
   ];
-  const appTarGz = buildDeterministicTarGz(appEntries);
-  writeFileEnsuringDir(path.join(pkgDir, 'data/app.tar.gz'), appTarGz, 0o644);
 
-  // 4. Write data/payload-manifest.json covering all verified package files
-  const manifestFiles = {};
-  const walkPackage = (dir) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walkPackage(full);
-      } else if (entry.isFile()) {
-        const rel = path.relative(pkgDir, full).replace(/\\/g, '/');
-        if (rel === spec.setupEntry || rel === 'data/payload-manifest.json') continue;
-        manifestFiles[rel] = sha256Hex(fs.readFileSync(full));
-      }
-    }
-  };
-  walkPackage(pkgDir);
+  const tarGz = buildDeterministicTarGz(entries);
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, tarGz);
+  const digest = sha256Hex(tarGz);
+  console.log(`Staged ${outPath} (${tarGz.length} bytes, sha256=${digest})`);
+}
 
-  const sortedFiles = {};
-  for (const key of Object.keys(manifestFiles).sort()) {
-    sortedFiles[key] = manifestFiles[key];
+function packageReleaseSetup(targetOs, releaseDir, outPath, format) {
+  const spec = platformSpec(targetOs);
+  const setupSrc = path.join(releaseDir, spec.setupBin);
+  if (!fs.existsSync(setupSrc)) {
+    throw new Error(`Required setup executable missing: ${setupSrc}`);
   }
-  writeFileEnsuringDir(
-    path.join(pkgDir, 'data/payload-manifest.json'),
-    `${JSON.stringify({ version, files: sortedFiles }, null, 2)}\n`,
-    0o644,
-  );
 
-  // 5. Pack archive & write .sha256
-  fs.mkdirSync(path.dirname(archivePath), { recursive: true });
-  if (format === 'zip') {
-    if (process.platform === 'win32') {
-      execFileSync(
-        'powershell.exe',
-        [
-          '-NoProfile',
-          '-NonInteractive',
-          '-Command',
-          'Compress-Archive -Path $env:HIDE_GO_PKG_DIR -DestinationPath $env:HIDE_GO_ZIP_OUT -CompressionLevel Optimal -Force',
-        ],
-        {
-          stdio: 'inherit',
-          env: {
-            ...process.env,
-            HIDE_GO_PKG_DIR: pkgDir,
-            HIDE_GO_ZIP_OUT: archivePath,
-          },
-        },
-      );
-    } else {
-      execFileSync('zip', ['-r', '-q', archivePath, path.basename(pkgDir)], {
-        cwd: path.dirname(pkgDir),
-        stdio: 'inherit',
-      });
-    }
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.rmSync(outPath, { force: true });
+  fs.rmSync(`${outPath}.sha256`, { force: true });
+
+  if (format === 'exe') {
+    fs.copyFileSync(setupSrc, outPath);
+  } else if (format === 'tar.gz') {
+    const setupData = fs.readFileSync(setupSrc);
+    const tarGz = buildDeterministicTarGz([
+      {
+        tarPath: spec.setupEntry,
+        data: setupData,
+        mode: 0o755,
+      },
+    ]);
+    fs.writeFileSync(outPath, tarGz);
   } else {
-    execFileSync('tar', ['-czf', archivePath, '-C', path.dirname(pkgDir), path.basename(pkgDir)], {
-      stdio: 'inherit',
-      env: { ...process.env, COPYFILE_DISABLE: '1' },
-    });
+    throw new Error(`--format must be exe|tar.gz (got: ${format})`);
   }
 
-  const archiveHash = sha256Hex(fs.readFileSync(archivePath));
-  fs.writeFileSync(`${archivePath}.sha256`, `${archiveHash}  ${path.basename(archivePath)}\n`);
-  console.log(`Packaged ${archivePath} (${fs.statSync(archivePath).size} bytes)`);
+  const outBytes = fs.readFileSync(outPath);
+  const digest = sha256Hex(outBytes);
+  fs.writeFileSync(`${outPath}.sha256`, `${digest}  ${path.basename(outPath)}\n`);
+  console.log(`Packaged ${outPath} (${outBytes.length} bytes, sha256=${digest})`);
+}
+
+function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const mode = args.mode;
+  if (!['stage-payload', 'release-setup'].includes(mode)) {
+    throw new Error(`--mode must be one of stage-payload|release-setup (got: ${mode ?? ''})`);
+  }
+
+  const targetOs = args.os;
+  if (!['windows', 'macos', 'linux'].includes(targetOs)) {
+    throw new Error(`--os must be one of windows|macos|linux (got: ${targetOs ?? ''})`);
+  }
+
+  const releaseDir = resolveReleaseDir(args);
+  if (mode === 'stage-payload') {
+    const outPath = path.resolve(repoRoot, args.out ?? `target/pkg/app-${targetOs}.tar.gz`);
+    stagePayloadArchive(targetOs, releaseDir, outPath);
+    return;
+  }
+
+  const defaultFormat = targetOs === 'windows' ? 'exe' : 'tar.gz';
+  const format = args.format ?? defaultFormat;
+  const defaultOut = targetOs === 'windows' ? 'Hide-Go-Setup-windows-x64.exe' : `Hide-Go-Setup-${targetOs}.tar.gz`;
+  const outPath = path.resolve(repoRoot, args.out ?? defaultOut);
+  packageReleaseSetup(targetOs, releaseDir, outPath, format);
 }
 
 main();

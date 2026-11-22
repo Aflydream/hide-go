@@ -2,14 +2,16 @@ use crate::config::{CustomRule, FindingKind, HideConfig};
 use crate::vault::MAX_JSON_DEPTH;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use regex::{Regex, RegexBuilder};
+use regex::{Regex, RegexBuilder, RegexSet};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 struct BuiltinRule {
     kind: FindingKind,
     label: &'static str,
     severity: &'static str,
+    pattern: String,
     regex: Regex,
     capture_group: usize,
     key_group: Option<usize>,
@@ -20,6 +22,7 @@ fn rule(kind: FindingKind, label: &'static str, severity: &'static str, re: &str
         kind,
         label,
         severity,
+        pattern: re.to_string(),
         regex: Regex::new(re).expect("valid builtin regex"),
         capture_group,
         key_group: None,
@@ -31,6 +34,7 @@ fn kv_rule(label: &'static str, severity: &'static str, re: &str, key_group: usi
         kind: FindingKind::EnvSecret,
         label,
         severity,
+        pattern: re.to_string(),
         regex: Regex::new(re).expect("valid builtin regex"),
         capture_group: value_group,
         key_group: Some(key_group),
@@ -275,6 +279,10 @@ static BUILTIN_RULES: Lazy<Vec<BuiltinRule>> = Lazy::new(|| {
             0,
         ),
     ]
+});
+
+static BUILTIN_PREFILTER_SET: Lazy<RegexSet> = Lazy::new(|| {
+    RegexSet::new(BUILTIN_RULES.iter().map(|r| r.pattern.as_str())).expect("valid builtin regex prefilter")
 });
 
 const CUSTOM_REGEX_SIZE_LIMIT: usize = 1 << 20;
@@ -916,17 +924,84 @@ fn rule_enabled(kind: FindingKind, config: &HideConfig) -> bool {
     }
 }
 
+pub struct CompiledCustomRule {
+    pub name: String,
+    pub replacement_hint: String,
+    pub regex: Regex,
+}
+
+/// Pre-compiled custom rules + `RegexSet` prefilter cached per active rule signature.
+pub struct CompiledScanner {
+    pub custom_rules: Vec<CompiledCustomRule>,
+    custom_set: Option<RegexSet>,
+}
+
+type ScannerCacheKey = Vec<(String, String, String)>;
+type CompiledScannerMap = HashMap<ScannerCacheKey, Arc<CompiledScanner>>;
+
+static COMPILED_SCANNER_CACHE: Lazy<Mutex<CompiledScannerMap>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+impl CompiledScanner {
+    pub fn for_config(config: &HideConfig) -> Arc<Self> {
+        let key: Vec<(String, String, String)> = config
+            .custom_rules
+            .iter()
+            .filter(|r| r.enabled && !r.pattern.trim().is_empty())
+            .map(|r| (r.name.clone(), r.pattern.clone(), r.replacement_hint.clone()))
+            .collect();
+        let mut cache = COMPILED_SCANNER_CACHE.lock();
+        if let Some(hit) = cache.get(&key) {
+            return hit.clone();
+        }
+        let mut custom_rules = Vec::with_capacity(key.len());
+        let mut patterns = Vec::with_capacity(key.len());
+        for (name, pattern, replacement_hint) in &key {
+            if let Ok(re) = compile_custom_regex(pattern) {
+                custom_rules.push(CompiledCustomRule {
+                    name: name.clone(),
+                    replacement_hint: replacement_hint.clone(),
+                    regex: re,
+                });
+                patterns.push(pattern.as_str());
+            }
+        }
+        let custom_set = if patterns.is_empty() {
+            None
+        } else {
+            RegexSet::new(patterns).ok()
+        };
+        if cache.len() > 64 {
+            cache.clear();
+        }
+        let compiled = Arc::new(Self {
+            custom_rules,
+            custom_set,
+        });
+        cache.insert(key, compiled.clone());
+        compiled
+    }
+}
+
 /// Positional scan of plain text. Spans may overlap; callers resolve overlaps.
 /// Custom rules come first so project codenames win ties against generic detectors.
 pub fn scan_spans(text: &str, config: &HideConfig) -> Vec<Span> {
+    let compiled = CompiledScanner::for_config(config);
+    scan_spans_with_scanner(text, config, &compiled)
+}
+
+/// Positional scan using a pre-compiled scanner and `RegexSet` single-pass prefilter.
+pub fn scan_spans_with_scanner(text: &str, config: &HideConfig, scanner: &CompiledScanner) -> Vec<Span> {
+    let custom_hits = scanner.custom_set.as_ref().map(|set| set.matches(text));
+    let builtin_hits = BUILTIN_PREFILTER_SET.matches(text);
+    if !builtin_hits.matched_any() && !custom_hits.as_ref().is_some_and(|m| m.matched_any()) {
+        return Vec::new();
+    }
+
     let mut spans = Vec::new();
-    for rule in config
-        .custom_rules
-        .iter()
-        .filter(|r| r.enabled && !r.pattern.trim().is_empty())
-    {
-        if let Ok(re) = compile_custom_regex(&rule.pattern) {
-            for m in re.find_iter(text) {
+    if let Some(hits) = custom_hits {
+        for idx in hits {
+            let rule = &scanner.custom_rules[idx];
+            for m in rule.regex.find_iter(text) {
                 if !m.as_str().is_empty() && !is_placeholder_token(m.as_str()) {
                     spans.push(Span {
                         start: m.start(),
@@ -939,7 +1014,11 @@ pub fn scan_spans(text: &str, config: &HideConfig) -> Vec<Span> {
             }
         }
     }
-    for rule in BUILTIN_RULES.iter().filter(|r| rule_enabled(r.kind, config)) {
+    for idx in builtin_hits {
+        let rule = &BUILTIN_RULES[idx];
+        if !rule_enabled(rule.kind, config) {
+            continue;
+        }
         for caps in rule.regex.captures_iter(text) {
             if let Some(kg) = rule.key_group {
                 if caps.get(kg).is_some_and(|k| {
@@ -1013,34 +1092,36 @@ impl ProjectScanner {
     pub fn scan_Matches(payload: &str, config: &HideConfig) -> Vec<(FindingKind, String, String, String)> {
         let mut results = Vec::new();
         let mut seen = HashSet::new();
+        let scanner = CompiledScanner::for_config(config);
         let trimmed = payload.trim();
         if trimmed.starts_with(['{', '[', '"']) {
             if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                Self::scan_json_value_depth(&val, config, &mut results, &mut seen, 0);
+                Self::scan_json_value_depth(&val, config, &scanner, &mut results, &mut seen, 0);
                 return results;
             }
         }
-        Self::scan_plain_text_into(payload, config, &mut results, &mut seen);
+        Self::scan_plain_text_into(payload, config, &scanner, &mut results, &mut seen);
         results
     }
 
     fn scan_json_value_depth(
         val: &Value,
         config: &HideConfig,
+        scanner: &CompiledScanner,
         results: &mut Vec<(FindingKind, String, String, String)>,
         seen: &mut HashSet<String>,
         depth: usize,
     ) {
         if depth >= MAX_JSON_DEPTH {
             if let Value::String(s) = val {
-                Self::scan_plain_text_into(s, config, results, seen);
+                Self::scan_plain_text_into(s, config, scanner, results, seen);
             }
             return;
         }
         match val {
             Value::Object(map) => {
                 for (k, v) in map {
-                    Self::scan_plain_text_into(k, config, results, seen);
+                    Self::scan_plain_text_into(k, config, scanner, results, seen);
                     if config.protect_secrets_and_keys && is_sensitive_secret_key(k) {
                         let raw = match v {
                             Value::String(s)
@@ -1066,21 +1147,21 @@ impl ProjectScanner {
                             continue;
                         }
                     }
-                    Self::scan_json_value_depth(v, config, results, seen, depth + 1);
+                    Self::scan_json_value_depth(v, config, scanner, results, seen, depth + 1);
                 }
             }
             Value::Array(arr) => arr
                 .iter()
-                .for_each(|item| Self::scan_json_value_depth(item, config, results, seen, depth + 1)),
+                .for_each(|item| Self::scan_json_value_depth(item, config, scanner, results, seen, depth + 1)),
             Value::String(s) => {
                 let st = s.trim();
                 if depth + 1 < MAX_JSON_DEPTH && st.starts_with(['{', '[']) {
                     if let Ok(inner) = serde_json::from_str::<Value>(st) {
-                        Self::scan_json_value_depth(&inner, config, results, seen, depth + 1);
+                        Self::scan_json_value_depth(&inner, config, scanner, results, seen, depth + 1);
                         return;
                     }
                 }
-                Self::scan_plain_text_into(s, config, results, seen);
+                Self::scan_plain_text_into(s, config, scanner, results, seen);
             }
             _ => {}
         }
@@ -1089,12 +1170,13 @@ impl ProjectScanner {
     pub(crate) fn scan_plain_text_into(
         payload: &str,
         config: &HideConfig,
+        scanner: &CompiledScanner,
         results: &mut Vec<(FindingKind, String, String, String)>,
         seen: &mut HashSet<String>,
     ) {
         let decoded = decode_inline_unicode(payload);
         let target = decoded.as_ref().map_or(payload, |d| d.text.as_str());
-        for span in resolve_overlaps(scan_spans(target, config)) {
+        for span in resolve_overlaps(scan_spans_with_scanner(target, config, scanner)) {
             let raw = target[span.start..span.end].to_string();
             if seen.insert(raw.clone()) {
                 results.push((span.kind, span.label, raw, span.severity));

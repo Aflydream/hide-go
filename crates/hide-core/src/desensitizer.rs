@@ -1,15 +1,57 @@
 use crate::config::{FindingKind, HideConfig, LeakFinding};
 use crate::protocol::{is_api_schema_container_key, is_opaque_block, is_structural_key, is_tool_call_object};
 use crate::scanner::{
-    compile_custom_regex, decode_inline_unicode, is_placeholder_or_template_secret, is_placeholder_token,
-    is_sensitive_secret_key, resolve_overlaps, scan_spans, source_span, Span,
+    decode_inline_unicode, is_placeholder_or_template_secret, is_placeholder_token, is_sensitive_secret_key,
+    resolve_overlaps, scan_spans_with_scanner, source_span, CompiledScanner, Span,
 };
-use crate::vault::{is_bare_ident_token, is_word_char, mask_preview, reserialize_like, PrivacyVault, MAX_JSON_DEPTH};
+use crate::vault::{
+    is_bare_ident_token, is_word_char, mask_preview, reserialize_like, Matcher, PrivacyVault, MAX_JSON_DEPTH,
+};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 pub struct DesensitizeResult {
     pub transformed_payload: String,
     pub findings: Vec<LeakFinding>,
+}
+
+const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const LOWER_ALNUM: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+const UPPER_ALNUM: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const DIGITS: &[u8] = b"0123456789";
+
+const HOST_ROLES: &[&str] = &[
+    "api", "core", "edge", "auth", "sync", "data", "mesh", "node", "gw", "app", "ops", "svc",
+];
+const FIRST_NAMES: &[&str] = &[
+    "alex", "sam", "jordan", "taylor", "morgan", "casey", "riley", "quinn", "avery", "drew", "cameron", "devon",
+];
+const MAIL_DOMAINS: &[&str] = &["mail", "work", "dev", "team", "box", "org"];
+
+struct DesensitizeCtx<'a> {
+    raw_payload: &'a str,
+    config: &'a HideConfig,
+    scanner: &'a CompiledScanner,
+    vault: &'a PrivacyVault,
+    scope: Option<&'a str>,
+    matcher: Option<Arc<Matcher>>,
+    findings: &'a mut Vec<LeakFinding>,
+}
+
+impl<'a> DesensitizeCtx<'a> {
+    fn current_matcher(&mut self) -> Arc<Matcher> {
+        if let Some(m) = &self.matcher {
+            return m.clone();
+        }
+        let fresh = self.vault.matcher_for_scope(self.scope);
+        self.matcher = Some(fresh.clone());
+        fresh
+    }
+
+    fn invalidate_matcher(&mut self) {
+        self.matcher = None;
+    }
 }
 
 /// Format-preserving bidirectional semantic desensitizer.
@@ -34,35 +76,37 @@ impl SemanticDesensitizer {
         scope: Option<&str>,
     ) -> DesensitizeResult {
         let mut findings = Vec::new();
+        let scanner = CompiledScanner::for_config(config);
+        let mut dctx = DesensitizeCtx {
+            raw_payload: payload,
+            config,
+            scanner: &scanner,
+            vault,
+            scope,
+            matcher: None,
+            findings: &mut findings,
+        };
         let trimmed = payload.trim();
         if trimmed.starts_with(['{', '[', '"']) {
             if let Ok(mut json_val) = serde_json::from_str::<Value>(trimmed) {
-                Self::desensitize_json_value_depth(&mut json_val, payload, config, vault, scope, &mut findings, 0);
+                Self::desensitize_json_value_depth(&mut json_val, &mut dctx, 0);
                 return DesensitizeResult {
                     transformed_payload: reserialize_like(trimmed, &json_val),
                     findings,
                 };
             }
         }
-        let transformed = Self::desensitize_text_scoped(payload, payload, config, vault, scope, &mut findings);
+        let transformed = Self::desensitize_text_ctx(payload, &mut dctx);
         DesensitizeResult {
             transformed_payload: transformed,
             findings,
         }
     }
 
-    pub(crate) fn desensitize_json_value_depth(
-        val: &mut Value,
-        ctx: &str,
-        config: &HideConfig,
-        vault: &PrivacyVault,
-        scope: Option<&str>,
-        findings: &mut Vec<LeakFinding>,
-        depth: usize,
-    ) {
+    fn desensitize_json_value_depth(val: &mut Value, dctx: &mut DesensitizeCtx<'_>, depth: usize) {
         if depth >= MAX_JSON_DEPTH {
             if let Value::String(s) = val {
-                *s = Self::desensitize_text_scoped(s, ctx, config, vault, scope, findings);
+                *s = Self::desensitize_text_ctx(s, dctx);
             }
             return;
         }
@@ -73,12 +117,14 @@ impl SemanticDesensitizer {
                     // reseal it so it matches its signature again.
                     if map.get("type").and_then(Value::as_str) == Some("thinking") {
                         if let Some(Value::String(t)) = map.get_mut("thinking") {
-                            *t = vault.matcher_for_scope(scope).reseal(t);
+                            let matcher = dctx.current_matcher();
+                            *t = matcher.reseal(t);
                         }
                     }
                     return;
                 }
                 let tool_call = is_tool_call_object(map);
+                let protect_secrets = dctx.config.protect_secrets_and_keys;
                 for (key, mut value) in std::mem::take(map) {
                     if is_api_schema_container_key(&key)
                         || (is_structural_key(&key) && value.is_string())
@@ -87,15 +133,15 @@ impl SemanticDesensitizer {
                         map.insert(key, value);
                         continue;
                     }
-                    let sensitive_field = config.protect_secrets_and_keys && is_sensitive_secret_key(&key);
-                    let key = Self::desensitize_text_scoped(&key, ctx, config, vault, scope, findings);
+                    let sensitive_field = protect_secrets && is_sensitive_secret_key(&key);
+                    let key = Self::desensitize_text_ctx(&key, dctx);
                     let secret = match &value {
                         Value::String(raw)
                             if sensitive_field
                                 && !raw.trim().is_empty()
                                 && !is_placeholder_token(raw)
                                 && !is_placeholder_or_template_secret(raw)
-                                && !vault.contains_token_in_scope(raw, scope)
+                                && !dctx.vault.contains_token_in_scope(raw, dctx.scope)
                                 && (!key.eq_ignore_ascii_case("token") || raw.trim().len() >= 6) =>
                         {
                             Some(raw.clone())
@@ -113,68 +159,56 @@ impl SemanticDesensitizer {
                             "high",
                             1,
                             Some(&value),
-                            ctx,
-                            config,
-                            vault,
-                            scope,
-                            findings,
+                            dctx,
                         );
                         value = Value::String(token);
                     } else {
-                        Self::desensitize_json_value_depth(&mut value, ctx, config, vault, scope, findings, depth + 1);
+                        Self::desensitize_json_value_depth(&mut value, dctx, depth + 1);
                     }
                     map.insert(key, value);
                 }
             }
-            Value::Array(arr) => arr.iter_mut().for_each(|item| {
-                Self::desensitize_json_value_depth(item, ctx, config, vault, scope, findings, depth + 1)
-            }),
+            Value::Array(arr) => arr
+                .iter_mut()
+                .for_each(|item| Self::desensitize_json_value_depth(item, dctx, depth + 1)),
             Value::String(s) => {
                 let st = s.trim();
                 if st.starts_with(['{', '[']) && depth + 1 < MAX_JSON_DEPTH {
                     if let Ok(mut inner) = serde_json::from_str::<Value>(st) {
-                        Self::desensitize_json_value_depth(&mut inner, ctx, config, vault, scope, findings, depth + 1);
+                        Self::desensitize_json_value_depth(&mut inner, dctx, depth + 1);
                         *s = reserialize_like(st, &inner);
                         return;
                     }
                 }
-                *s = Self::desensitize_text_scoped(s, ctx, config, vault, scope, findings);
+                *s = Self::desensitize_text_ctx(s, dctx);
             }
             _ => {}
         }
     }
 
-    /// Mask one plain-text string in a single pass.
-    pub(crate) fn desensitize_text_scoped(
-        text: &str,
-        ctx: &str,
-        config: &HideConfig,
-        vault: &PrivacyVault,
-        scope: Option<&str>,
-        findings: &mut Vec<LeakFinding>,
-    ) -> String {
-        if text.len() < 3 {
+    fn desensitize_text_ctx(text: &str, dctx: &mut DesensitizeCtx<'_>) -> String {
+        if text.len() < 3 && dctx.scanner.custom_rules.is_empty() {
             return text.to_string();
         }
         // Detect on the `\uXXXX`-decoded view, but rewrite the untouched source text.
         let decoded = decode_inline_unicode(text);
         let mut spans: Vec<Span> = match &decoded {
-            Some(d) => scan_spans(&d.text, config)
+            Some(d) => scan_spans_with_scanner(&d.text, dctx.config, dctx.scanner)
                 .into_iter()
                 .map(|mut s| {
                     (s.start, s.end) = source_span(d, s.start, s.end, text);
                     s
                 })
                 .collect(),
-            None => scan_spans(text, config),
+            None => scan_spans_with_scanner(text, dctx.config, dctx.scanner),
         };
-        let existing = vault.matcher_for_scope(scope).token_ranges(text);
+        let existing = dctx.current_matcher().token_ranges(text);
         let (after_regex, did_replace_spans) = if spans.is_empty() {
             (text.to_string(), false)
         } else {
             spans.retain(|s| !existing.iter().any(|&(a, b)| s.start < b && a < s.end));
             for span in &mut spans {
-                Self::extend_to_token_boundary(text, span, config);
+                Self::extend_to_token_boundary(text, span, dctx.config);
             }
 
             let mut out = String::with_capacity(text.len());
@@ -185,19 +219,7 @@ impl SemanticDesensitizer {
                 if raw.len() < 3 {
                     continue;
                 }
-                let token = Self::register_finding_token(
-                    span.kind,
-                    &span.label,
-                    raw,
-                    &span.severity,
-                    1,
-                    None,
-                    ctx,
-                    config,
-                    vault,
-                    scope,
-                    findings,
-                );
+                let token = Self::register_finding_token(span.kind, &span.label, raw, &span.severity, 1, None, dctx);
                 out.push_str(&text[last..span.start]);
                 out.push_str(&token);
                 last = span.end;
@@ -207,7 +229,7 @@ impl SemanticDesensitizer {
             (out, replaced_any)
         };
 
-        let matcher = vault.matcher_for_scope(scope);
+        let matcher = dctx.current_matcher();
         let remask_existing = if did_replace_spans {
             matcher.token_ranges(&after_regex)
         } else {
@@ -216,7 +238,7 @@ impl SemanticDesensitizer {
         let (remasked, remask_hits) = matcher.remask_secrets(&after_regex, &remask_existing);
         for (raw_secret, token, count) in remask_hits {
             Self::record_finding(
-                findings,
+                dctx.findings,
                 FindingKind::EnvSecret,
                 "Previously Seen Scope Secret",
                 &raw_secret,
@@ -255,7 +277,7 @@ impl SemanticDesensitizer {
     /// restorer refuses to match. Mask the whole enclosing identifier instead.
     fn extend_to_token_boundary(text: &str, span: &mut Span, config: &HideConfig) {
         let raw = &text[span.start..span.end];
-        let sample = Self::generate_semantic_token(span.kind, raw, 1, config);
+        let sample = Self::format_token(span.kind, raw, &[0u8; 32], config);
         if !is_bare_ident_token(&sample) {
             return;
         }
@@ -267,7 +289,6 @@ impl SemanticDesensitizer {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn register_finding_token(
         kind: FindingKind,
         label: &str,
@@ -275,31 +296,39 @@ impl SemanticDesensitizer {
         severity: &str,
         occurrences: usize,
         json_value: Option<&Value>,
-        ctx: &str,
-        config: &HideConfig,
-        vault: &PrivacyVault,
-        scope: Option<&str>,
-        findings: &mut Vec<LeakFinding>,
+        dctx: &mut DesensitizeCtx<'_>,
     ) -> String {
         let category_key = format!("{:?}", kind);
-        // Never emit a token that already occurs verbatim in the outbound payload.
-        let generator = |idx: usize| {
-            for attempt in 0..64usize {
-                let token = Self::generate_semantic_token_scoped(kind, raw_val, idx, attempt, config, vault, scope);
-                if !ctx.contains(token.as_str()) {
+        let domain = format!("sem:{kind:?}");
+        let vault = dctx.vault;
+        let config = dctx.config;
+        let scope = dctx.scope;
+        let raw_payload = dctx.raw_payload;
+
+        let generator = |attempt: usize| -> String {
+            // Skip any candidate that already appears verbatim in the inbound payload.
+            for sub in 0..8usize {
+                let effective_attempt = attempt.saturating_mul(8).saturating_add(sub);
+                let digest = vault.keyed_bytes(&domain, scope, &config.project_salt, raw_val, effective_attempt);
+                let token = Self::format_token(kind, raw_val, &digest, config);
+                if !raw_payload.contains(token.as_str()) {
                     return token;
                 }
             }
-            let fallback_tag = vault.keyed_tag("fallback", scope, idx, 16);
-            format!("<<HIDE_REDACTED_{fallback_tag}_{idx:04}>>")
-        };
-        let replacement_token = match json_value {
-            Some(value) => vault.get_or_insert_json_value_scoped_with(scope, value, &category_key, generator),
-            None => vault.get_or_insert_scoped_with(scope, raw_val, &category_key, generator),
+            let digest = vault.keyed_bytes("sem:fallback", scope, &config.project_salt, raw_val, attempt + 1024);
+            format!("tok_{}", encode_from_digest(&digest, 24, BASE62, b"fb"))
         };
 
+        let (replacement_token, inserted_new) = match json_value {
+            Some(value) => vault.get_or_insert_json_value_scoped_unique(scope, value, &category_key, generator),
+            None => vault.get_or_insert_scoped_unique(scope, raw_val, &category_key, generator),
+        };
+        if inserted_new {
+            dctx.invalidate_matcher();
+        }
+
         Self::record_finding(
-            findings,
+            dctx.findings,
             kind,
             label,
             raw_val,
@@ -310,43 +339,22 @@ impl SemanticDesensitizer {
         replacement_token
     }
 
-    /// Placeholders live in namespaces real data does not use (RFC 2544 benchmark addresses,
-    /// `example.*` domains) and embed per-vault/per-scope HMAC tags so tokens cannot be guessed
-    /// or collided across vendors or sessions.
+    /// Generate a deterministic format-preserving placeholder using HMAC/SHA-256 keyed material.
     pub fn generate_semantic_token(kind: FindingKind, raw_val: &str, idx: usize, config: &HideConfig) -> String {
-        let fallback_ip = benchmark_ip(idx);
-        Self::format_semantic_token(kind, raw_val, idx, "000000000000", "00000000", &fallback_ip, config)
+        let mut hasher = Sha256::new();
+        hasher.update(b"hide-go-preview:");
+        hasher.update(config.project_salt.as_bytes());
+        hasher.update(b":");
+        hasher.update(raw_val.as_bytes());
+        hasher.update(idx.to_le_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        Self::format_token(kind, raw_val, &digest, config)
     }
 
-    fn generate_semantic_token_scoped(
-        kind: FindingKind,
-        raw_val: &str,
-        idx: usize,
-        attempt: usize,
-        config: &HideConfig,
-        vault: &PrivacyVault,
-        scope: Option<&str>,
-    ) -> String {
-        let salt_idx = idx.wrapping_add(attempt.wrapping_mul(10_007));
-        let tag12 = vault.keyed_tag(&format!("{kind:?}"), scope, salt_idx, 12);
-        let tag8 = &tag12[..8];
-        let ip_num = vault.keyed_u64("InternalIp", scope, salt_idx);
-        let ip = benchmark_ip_keyed(ip_num, idx.wrapping_add(attempt));
-        Self::format_semantic_token(kind, raw_val, idx, &tag12, tag8, &ip, config)
-    }
-
-    fn format_semantic_token(
-        kind: FindingKind,
-        raw_val: &str,
-        idx: usize,
-        tag12: &str,
-        tag8: &str,
-        ip: &str,
-        config: &HideConfig,
-    ) -> String {
+    fn format_token(kind: FindingKind, raw_val: &str, digest: &[u8; 32], config: &HideConfig) -> String {
         match kind {
-            FindingKind::ApiKey => format!("sk-sem-{tag12}-{idx:04}"),
-            FindingKind::PrivateKey => format!("<<HIDE_PEM_PRIVATE_KEY_{tag12}_{idx:03}>>"),
+            FindingKind::ApiKey => format_api_key_token(raw_val, digest),
+            FindingKind::PrivateKey => format!("key_ref_{}", encode_from_digest(digest, 20, BASE62, b"pk")),
             FindingKind::DatabaseUrl => {
                 let scheme = raw_val.split("://").next().unwrap_or("postgres");
                 let port = match scheme.to_ascii_lowercase().as_str() {
@@ -360,13 +368,26 @@ impl SemanticDesensitizer {
                     "https" => 443,
                     _ => 5432,
                 };
-                format!(
-                    "{scheme}://db_user_{tag8}_{idx:02}:db_pass_placeholder_{tag12}_{idx:02}@db-{tag8}-{idx:02}.example.internal:{port}/app_schema_{idx:02}"
-                )
+                let user_tag = encode_from_digest(digest, 6, LOWER_ALNUM, b"du");
+                let pass_tag = encode_from_digest(digest, 14, BASE62, b"dp");
+                let host_tag = encode_from_digest(digest, 6, LOWER_ALNUM, b"dh");
+                let db_tag = encode_from_digest(digest, 5, LOWER_ALNUM, b"dn");
+                let role = HOST_ROLES[(digest[0] as usize) % HOST_ROLES.len()];
+                format!("{scheme}://svc_{user_tag}:{pass_tag}@{role}-{host_tag}.db.example:{port}/app_{db_tag}")
             }
-            FindingKind::InternalIp => ip.to_string(),
-            FindingKind::InternalDomain => format!("svc-node-{tag8}-{idx:02}.example.internal"),
+            FindingKind::InternalIp => {
+                let mut raw_u64 = [0u8; 8];
+                raw_u64.copy_from_slice(&digest[..8]);
+                benchmark_ip_keyed(u64::from_le_bytes(raw_u64))
+            }
+            FindingKind::InternalDomain => {
+                let role = HOST_ROLES[(digest[0] as usize) % HOST_ROLES.len()];
+                let tld = if digest[1] & 1 == 0 { "example" } else { "test" };
+                let host_tag = encode_from_digest(digest, 6, LOWER_ALNUM, b"id");
+                format!("{role}-{host_tag}.{tld}")
+            }
             FindingKind::ProjectPath => {
+                let dir_tag = encode_from_digest(digest, 8, LOWER_ALNUM, b"pp");
                 if let Some(drive) = raw_val
                     .chars()
                     .next()
@@ -379,46 +400,162 @@ impl SemanticDesensitizer {
                     } else {
                         "\\"
                     };
-                    format!("{drive}:{sep}workspace{sep}user_{tag8}_{idx:02}")
+                    format!("{drive}:{sep}work{sep}{dir_tag}")
                 } else {
-                    format!("/workspace/user_{tag8}_{idx:02}")
+                    format!("/opt/work/{dir_tag}")
                 }
             }
-            FindingKind::EmailOrPii => format!("dev_member_{tag8}_{idx:02}@sandbox.example.org"),
-            FindingKind::GitMetadata => format!("git-ref-placeholder-{tag8}-{idx:02}"),
-            FindingKind::EnvSecret => format!("<<ENV_SECRET_TOKEN_{tag12}_{idx:03}>>"),
+            FindingKind::EmailOrPii => {
+                let first = FIRST_NAMES[(digest[0] as usize) % FIRST_NAMES.len()];
+                let domain = MAIL_DOMAINS[(digest[1] as usize) % MAIL_DOMAINS.len()];
+                let tag6 = encode_from_digest(digest, 6, LOWER_ALNUM, b"em");
+                format!("{first}.{tag6}@{domain}.example")
+            }
+            FindingKind::GitMetadata => format!("ref_{}", encode_from_digest(digest, 10, LOWER_ALNUM, b"gm")),
+            FindingKind::EnvSecret => format!("sec_{}", encode_from_digest(digest, 18, BASE62, b"es")),
             FindingKind::CustomKeyword => {
                 for rule in config
                     .custom_rules
                     .iter()
-                    .filter(|r| r.enabled && !r.replacement_hint.is_empty())
+                    .filter(|r| r.enabled && !r.replacement_hint.trim().is_empty())
                 {
-                    if compile_custom_regex(&rule.pattern).is_ok_and(|re| re.is_match(raw_val)) {
-                        return format!("{}_{tag8}_{idx:02}", rule.replacement_hint);
+                    if crate::scanner::compile_custom_regex(&rule.pattern).is_ok_and(|re| re.is_match(raw_val)) {
+                        let hint = rule.replacement_hint.trim();
+                        let tag = encode_from_digest(digest, 8, LOWER_ALNUM, b"ck");
+                        if let Some((first_label, rest)) = hint.split_once('.') {
+                            return format!("{first_label}-{tag}.{rest}");
+                        }
+                        return format!("{hint}_{tag}");
                     }
                 }
-                format!("CustomConcept_{tag8}_{idx:02}")
+                format!("ref_{}", encode_from_digest(digest, 10, LOWER_ALNUM, b"cr"))
             }
-            FindingKind::ProprietaryCodeSymbol => format!("sym_entity_{tag8}_{idx:02}"),
+            FindingKind::ProprietaryCodeSymbol => {
+                format!("sym_{}", encode_from_digest(digest, 10, LOWER_ALNUM, b"cs"))
+            }
         }
     }
 }
 
-/// Map an index onto 198.18.0.0/15 (RFC 2544), skipping .0 and .255 host octets.
-fn benchmark_ip(idx: usize) -> String {
-    let n = idx.saturating_sub(1);
-    let host = n % 254 + 1;
-    let third = (n / 254) % 256;
-    let second = 18 + (n / 254 / 256) % 2;
-    format!("198.{second}.{third}.{host}")
+fn format_api_key_token(raw_val: &str, digest: &[u8; 32]) -> String {
+    if raw_val.starts_with("sk-ant-") {
+        format!("sk-ant-api03-{}", encode_from_digest(digest, 24, BASE62, b"ak"))
+    } else if raw_val.starts_with("sk-proj-") {
+        format!("sk-proj-{}", encode_from_digest(digest, 24, BASE62, b"ak"))
+    } else if raw_val.starts_with("sk_live_") || raw_val.starts_with("sk_test_") {
+        format!("sk_test_{}", encode_from_digest(digest, 24, BASE62, b"ak"))
+    } else if raw_val.starts_with("rk_live_") || raw_val.starts_with("rk_test_") {
+        format!("rk_test_{}", encode_from_digest(digest, 24, BASE62, b"ak"))
+    } else if raw_val.starts_with("sk-") {
+        format!("sk-{}", encode_from_digest(digest, 28, BASE62, b"ak"))
+    } else if raw_val.starts_with("github_pat_") {
+        format!(
+            "github_pat_{}_{}",
+            encode_from_digest(digest, 22, BASE62, b"gp1"),
+            encode_from_digest(digest, 24, BASE62, b"gp2")
+        )
+    } else if raw_val.starts_with("ghp_")
+        || raw_val.starts_with("gho_")
+        || raw_val.starts_with("ghu_")
+        || raw_val.starts_with("ghs_")
+        || raw_val.starts_with("ghr_")
+    {
+        let prefix = &raw_val[..4];
+        format!("{prefix}{}", encode_from_digest(digest, 36, BASE62, b"gh"))
+    } else if let Some(prefix) = ["glpat-", "glrt-", "glptt-", "gloass-"]
+        .into_iter()
+        .find(|p| raw_val.starts_with(p))
+    {
+        format!("{prefix}{}", encode_from_digest(digest, 20, BASE62, b"gl"))
+    } else if raw_val.starts_with("AKIA") || raw_val.starts_with("ASIA") {
+        format!("AKIA{}", encode_from_digest(digest, 16, UPPER_ALNUM, b"aw"))
+    } else if raw_val.starts_with("AIza") {
+        format!("AIza{}", encode_from_digest(digest, 35, BASE62, b"gg"))
+    } else if raw_val.starts_with("xoxb-")
+        || raw_val.starts_with("xoxp-")
+        || raw_val.starts_with("xoxa-")
+        || raw_val.starts_with("xoxr-")
+        || raw_val.starts_with("xoxs-")
+    {
+        let prefix = &raw_val[..5];
+        format!(
+            "{prefix}{}-{}-{}",
+            encode_from_digest(digest, 10, DIGITS, b"sx1"),
+            encode_from_digest(digest, 10, DIGITS, b"sx2"),
+            encode_from_digest(digest, 24, BASE62, b"sx3")
+        )
+    } else if raw_val.starts_with("hf_") {
+        format!("hf_{}", encode_from_digest(digest, 30, BASE62, b"hf"))
+    } else if raw_val.starts_with("npm_") {
+        format!("npm_{}", encode_from_digest(digest, 36, BASE62, b"np"))
+    } else if raw_val.starts_with("pypi-") {
+        format!("pypi-AgEI{}", encode_from_digest(digest, 36, BASE62, b"py"))
+    } else if raw_val.starts_with("gsk_") {
+        format!("gsk_{}", encode_from_digest(digest, 24, BASE62, b"gs"))
+    } else if raw_val.starts_with("pplx-") {
+        format!("pplx-{}", encode_from_digest(digest, 28, BASE62, b"px"))
+    } else if raw_val.starts_with("r8_") {
+        format!("r8_{}", encode_from_digest(digest, 28, BASE62, b"r8"))
+    } else if raw_val.starts_with("SG.") {
+        format!(
+            "SG.{}.{}",
+            encode_from_digest(digest, 16, BASE62, b"sg1"),
+            encode_from_digest(digest, 20, BASE62, b"sg2")
+        )
+    } else if raw_val.starts_with("LTAI") {
+        format!("LTAI{}", encode_from_digest(digest, 20, BASE62, b"al"))
+    } else if raw_val.starts_with("AKID") {
+        format!("AKID{}", encode_from_digest(digest, 32, BASE62, b"tc"))
+    } else if raw_val.starts_with("xai-") {
+        format!("xai-{}", encode_from_digest(digest, 28, BASE62, b"xa"))
+    } else if raw_val.starts_with("eyJ") {
+        format!(
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ{}In0.{}",
+            encode_from_digest(digest, 16, BASE62, b"jw1"),
+            encode_from_digest(digest, 24, BASE62, b"jw2")
+        )
+    } else if raw_val.starts_with("https://hooks.slack.com/") {
+        format!(
+            "https://hooks.slack.com/services/T{}/B{}/{}",
+            encode_from_digest(digest, 8, UPPER_ALNUM, b"wh1"),
+            encode_from_digest(digest, 8, UPPER_ALNUM, b"wh2"),
+            encode_from_digest(digest, 24, BASE62, b"wh3")
+        )
+    } else if raw_val.starts_with("https://") {
+        format!(
+            "https://webhook.example/hook/{}",
+            encode_from_digest(digest, 24, BASE62, b"wb")
+        )
+    } else {
+        format!("tok_{}", encode_from_digest(digest, 24, BASE62, b"ak"))
+    }
+}
+
+fn encode_from_digest(digest: &[u8; 32], len: usize, alphabet: &[u8], domain_tag: &[u8]) -> String {
+    let mut out = String::with_capacity(len);
+    let mut counter: u32 = 0;
+    while out.len() < len {
+        let mut hasher = Sha256::new();
+        hasher.update(digest);
+        hasher.update(domain_tag);
+        hasher.update(counter.to_le_bytes());
+        let block = hasher.finalize();
+        for &b in block.as_slice() {
+            if out.len() >= len {
+                break;
+            }
+            out.push(alphabet[(b as usize) % alphabet.len()] as char);
+        }
+        counter += 1;
+    }
+    out
 }
 
 /// Map a keyed 64-bit value onto 198.18.0.0/15 (RFC 2544), skipping .0 and .255 host octets.
-fn benchmark_ip_keyed(keyed: u64, salt: usize) -> String {
-    let mixed = keyed ^ (salt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let host = (mixed % 254) + 1;
-    let third = (mixed >> 8) % 256;
-    let second = 18 + ((mixed >> 16) % 2);
+fn benchmark_ip_keyed(keyed: u64) -> String {
+    let host = (keyed % 254) + 1;
+    let third = (keyed >> 8) % 256;
+    let second = 18 + ((keyed >> 16) % 2);
     format!("198.{second}.{third}.{host}")
 }
 
@@ -479,10 +616,7 @@ mod tests {
             !out.contains("/home/alice") && !out.contains("C:\\Users\\alice"),
             "{out}"
         );
-        assert!(
-            out.contains("/workspace/user_") && out.contains("\\workspace\\user_"),
-            "{out}"
-        );
+        assert!(out.contains("/opt/work/") && out.contains("\\work\\"), "{out}");
         let unix_prefix = out
             .lines()
             .next()
@@ -612,7 +746,7 @@ mod tests {
             "{masked_db}"
         );
         let masked_win = parsed["win_fwd"].as_str().unwrap();
-        assert!(masked_win.starts_with("C:/workspace/user_") && masked_win.ends_with("/my-repo/src/main.rs"));
+        assert!(masked_win.starts_with("C:/work/") && masked_win.ends_with("/my-repo/src/main.rs"));
 
         let restored = vault
             .matcher_for_scope(scope)
@@ -631,5 +765,58 @@ mod tests {
             SemanticDesensitizer::process_with_scope("Repeat whsec_real_secret_value_12345 now", &cfg, &vault, scope);
         assert!(!followup.transformed_payload.contains("whsec_real_secret_value_12345"));
         assert!(!followup.findings.is_empty());
+    }
+
+    #[test]
+    fn keyed_tokens_isolate_across_vaults_and_roundtrip_cleanly() {
+        let cfg = HideConfig::default();
+        let join = |a: &str, b: &str| format!("{a}{b}");
+        let sample = format!(
+            "key={} ghp={} mail=alice@internal-ops.corp db=postgres://admin:RealPass99@10.20.30.40:5432/prod dom=auth.corp.internal path=/home/alice/app",
+            join("sk-ant-api03-", "RealSecretValue0123456789"),
+            join("ghp_", "0123456789abcdef0123456789abcdef1234"),
+        );
+
+        let v1 = PrivacyVault::new();
+        let v2 = PrivacyVault::new();
+        let out1 = SemanticDesensitizer::process_with_scope(&sample, &cfg, &v1, Some("harness:claude-code"))
+            .transformed_payload;
+        let out2 = SemanticDesensitizer::process_with_scope(&sample, &cfg, &v2, Some("harness:claude-code"))
+            .transformed_payload;
+        let out_other_scope =
+            SemanticDesensitizer::process_with_scope(&sample, &cfg, &v1, Some("harness:codex")).transformed_payload;
+
+        for marker in [
+            "sk-sem-",
+            "HIDE_",
+            "placeholder",
+            "svc-node-",
+            "/workspace/user_",
+            "dev_member_",
+            "RealSecretValue0123456789",
+            "RealPass99",
+            "alice@internal-ops.corp",
+            "10.20.30.40",
+        ] {
+            assert!(!out1.contains(marker), "found marker {marker} in {out1}");
+        }
+        assert_ne!(out1, out2, "distinct ephemeral vault keys must produce distinct tokens");
+        assert_ne!(out1, out_other_scope, "distinct scopes must produce distinct tokens");
+
+        // Double-pass inside the same vault must be 100% idempotent
+        let second = SemanticDesensitizer::process_with_scope(&out1, &cfg, &v1, Some("harness:claude-code"));
+        assert!(
+            second.findings.is_empty(),
+            "unexpected findings on second pass: {:?}",
+            second.findings
+        );
+        assert_eq!(second.transformed_payload, out1);
+
+        // Full roundtrip restoration
+        let restored = v1
+            .matcher_for_scope(Some("harness:claude-code"))
+            .restore(&out1, None, true)
+            .0;
+        assert_eq!(restored, sample);
     }
 }

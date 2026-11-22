@@ -91,8 +91,8 @@ export function ColorSchemeProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // Two-state space-constrained toggle matching modern-web-guidance `dark-mode-toggle`:
-  // toggles between rendered scheme inverse (stored literally) and reverting to System when target matches OS.
+  // Two-state space-constrained toggle: switches to the opposite of the rendered scheme,
+  // or reverts to System when the target matches the OS preference.
   const toggle = useCallback(() => {
     const target: 'light' | 'dark' = resolved === 'dark' ? 'light' : 'dark';
     const currentSys: 'light' | 'dark' = sysDark ? 'dark' : 'light';

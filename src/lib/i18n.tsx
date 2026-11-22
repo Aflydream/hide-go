@@ -163,7 +163,13 @@ export function localizeHarnessTargets(targets: string[], locale: Locale): strin
   if (locale === 'zh-CN') return targets;
   const shellProfile = translate(locale, 'integrations.shellProfile');
   const envVars = translate(locale, 'integrations.envVars');
-  return targets.map((t) => t.replace(/Shell 配置文件/g, shellProfile).replace(/环境变量/g, envVars));
+  const systemProxyChain = translate(locale, 'integrations.systemProxyChainTarget');
+  return targets.map((t) =>
+    t
+      .replace(/系统代理链（运行期接管，退出自动还原）/g, systemProxyChain)
+      .replace(/Shell 配置文件/g, shellProfile)
+      .replace(/环境变量/g, envVars),
+  );
 }
 
 const SETUP_STEP_KEYS: Record<string, MessageKey> = {

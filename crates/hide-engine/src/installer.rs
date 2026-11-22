@@ -119,9 +119,16 @@ pub struct PayloadManifest {
     pub files: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EmbeddedPayloadArchive {
+    pub bytes: &'static [u8],
+    pub sha256: &'static str,
+}
+
 #[derive(Debug, Clone)]
 pub struct PayloadSource {
     pub package_root: Option<PathBuf>,
+    pub embedded_archive: Option<EmbeddedPayloadArchive>,
     pub require_manifest: bool,
     pub version: &'static str,
 }
@@ -298,6 +305,18 @@ pub fn validate_install_dir(dir: &Path) -> Result<(), String> {
 
 static ATOMIC_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
+fn format_io_permission_hint(err: &std::io::Error) -> &'static str {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        if cfg!(windows) {
+            " (permission denied: choose a user-writable folder such as %LOCALAPPDATA%\\Hide-Go / 目标目录无写入权限，请选择 %LOCALAPPDATA%\\Hide-Go 等用户可写目录)"
+        } else {
+            " (permission denied: choose a user-writable directory / 目标目录缺少写入权限，请选择用户可写目录)"
+        }
+    } else {
+        ""
+    }
+}
+
 fn ensure_safe_parent_dirs(root: &Path, parts: &[&str]) -> Result<(), String> {
     let mut cur = root.to_path_buf();
     for comp in parts {
@@ -306,7 +325,8 @@ fn ensure_safe_parent_dirs(root: &Path, parts: &[&str]) -> Result<(), String> {
             return Err(format!("目录 {} 是符号链接，拒绝写入", cur.display()));
         }
         if !cur.exists() {
-            std::fs::create_dir(&cur).map_err(|e| format!("创建目录 {} 失败: {e}", cur.display()))?;
+            std::fs::create_dir(&cur)
+                .map_err(|e| format!("创建目录 {} 失败{}: {e}", cur.display(), format_io_permission_hint(&e)))?;
         } else if !cur.is_dir() {
             return Err(format!("路径 {} 不是目录", cur.display()));
         }
@@ -359,11 +379,21 @@ fn atomic_write_bytes(dest: &Path, bytes: &[u8], executable: bool) -> Result<(),
         .write(true)
         .create_new(true)
         .open(&tmp)
-        .map_err(|e| format!("创建临时文件 {} 失败: {e}", tmp.display()))?;
+        .map_err(|e| {
+            format!(
+                "创建临时文件 {} 失败{}: {e}",
+                tmp.display(),
+                format_io_permission_hint(&e)
+            )
+        })?;
     if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
         drop(file);
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("写入 {} 失败: {e}", dest.display()));
+        return Err(format!(
+            "写入 {} 失败{}: {e}",
+            dest.display(),
+            format_io_permission_hint(&e)
+        ));
     }
     drop(file);
     if executable {
@@ -374,7 +404,11 @@ fn atomic_write_bytes(dest: &Path, bytes: &[u8], executable: bool) -> Result<(),
     }
     if let Err(e) = std::fs::rename(&tmp, dest) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("替换目标文件 {} 失败: {e}", dest.display()));
+        return Err(format!(
+            "替换目标文件 {} 失败{}: {e}",
+            dest.display(),
+            format_io_permission_hint(&e)
+        ));
     }
     Ok(())
 }
@@ -438,9 +472,84 @@ fn build_linux_desktop_entry(desktop_bin: &Path, icon_path: &Path) -> Result<Str
     ))
 }
 
+#[cfg(windows)]
+const WINDOWS_UNINSTALL_REG_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Hide-Go";
+
+#[cfg(windows)]
+struct RegKeyGuard(windows::Win32::System::Registry::HKEY);
+
+#[cfg(windows)]
+impl Drop for RegKeyGuard {
+    fn drop(&mut self) {
+        // SAFETY: closes a registry key handle opened via `RegCreateKeyExW` or `RegOpenKeyExW`.
+        unsafe {
+            let _ = windows::Win32::System::Registry::RegCloseKey(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_registered_install_dir() -> Option<PathBuf> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ, REG_VALUE_TYPE,
+    };
+
+    let subkey = HSTRING::from(WINDOWS_UNINSTALL_REG_KEY);
+    let val_name = HSTRING::from("InstallLocation");
+    let mut hkey = HKEY::default();
+    // SAFETY: queries the per-user uninstall key for Hide-Go if present.
+    let open_err = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, &subkey, None, KEY_READ, &mut hkey) };
+    if open_err != ERROR_SUCCESS {
+        return None;
+    }
+    let _guard = RegKeyGuard(hkey);
+
+    let mut val_type = REG_VALUE_TYPE::default();
+    let mut byte_len: u32 = 0;
+    // SAFETY: first call measures buffer length for `InstallLocation`.
+    let q1 = unsafe { RegQueryValueExW(hkey, &val_name, None, Some(&mut val_type), None, Some(&mut byte_len)) };
+    if q1 != ERROR_SUCCESS || val_type != REG_SZ || byte_len == 0 || byte_len > 32 * 1024 {
+        return None;
+    }
+    let mut buf = vec![0u8; byte_len as usize];
+    // SAFETY: second call populates allocated byte buffer of `byte_len`.
+    let q2 = unsafe {
+        RegQueryValueExW(
+            hkey,
+            &val_name,
+            None,
+            Some(&mut val_type),
+            Some(buf.as_mut_ptr()),
+            Some(&mut byte_len),
+        )
+    };
+    if q2 != ERROR_SUCCESS || val_type != REG_SZ {
+        return None;
+    }
+    let used = &buf[..(byte_len as usize).min(buf.len())];
+    let wide: Vec<u16> = used
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[lo, hi]| u16::from_le_bytes([lo, hi]))
+        .take_while(|&ch| ch != 0)
+        .collect();
+    let raw = String::from_utf16(&wide).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
 pub fn detect_existing_install() -> Option<InstallManifest> {
     let default_dir = default_install_dir();
     let mut candidates = vec![default_dir];
+    #[cfg(windows)]
+    if let Some(reg_dir) = windows_registered_install_dir() {
+        if !candidates.iter().any(|c| same_path(c, &reg_dir)) {
+            candidates.push(reg_dir);
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             if manifest_path(parent).is_file() && !candidates.iter().any(|c| same_path(c, parent)) {
@@ -643,8 +752,15 @@ impl SystemOps for RealSystemOps {
         icon_path: &Path,
         version: &str,
     ) -> Result<(), String> {
-        let _ = (install_dir, uninstall_bin, icon_path, version);
-        Ok(())
+        #[cfg(windows)]
+        {
+            windows_register_uninstaller(install_dir, uninstall_bin, icon_path, version)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (install_dir, uninstall_bin, icon_path, version);
+            Ok(())
+        }
     }
 
     fn add_to_path(&self, dir: &Path) -> Result<(), String> {
@@ -746,7 +862,14 @@ impl SystemOps for RealSystemOps {
     }
 
     fn unregister_uninstaller(&self) -> Result<(), String> {
-        Ok(())
+        #[cfg(windows)]
+        {
+            windows_unregister_uninstaller()
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
     }
 
     fn remove_shortcuts(&self, manifest: &InstallManifest) -> Vec<String> {
@@ -859,6 +982,138 @@ fn is_allowed_shortcut_path(p: &Path) -> bool {
 }
 
 #[cfg(windows)]
+fn encode_utf16_nul(s: &str) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut bytes = Vec::with_capacity(wide.len() * 2);
+    for ch in wide {
+        bytes.extend_from_slice(&ch.to_le_bytes());
+    }
+    bytes
+}
+
+#[cfg(windows)]
+fn dir_total_size_bytes(dir: &Path, depth: usize) -> u64 {
+    if depth > 8 || is_reparse_or_symlink(dir) {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if is_reparse_or_symlink(&p) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            } else if meta.is_dir() {
+                total = total.saturating_add(dir_total_size_bytes(&p, depth + 1));
+            }
+        }
+    }
+    total
+}
+
+#[cfg(windows)]
+fn windows_register_uninstaller(
+    install_dir: &Path,
+    uninstall_bin: &Path,
+    icon_path: &Path,
+    version: &str,
+) -> Result<(), String> {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
+
+    let subkey = HSTRING::from(WINDOWS_UNINSTALL_REG_KEY);
+    let mut hkey = HKEY::default();
+    // SAFETY: creates or opens our per-user Uninstall registry key under `HKCU`.
+    let open_err = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            &subkey,
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut hkey,
+            None,
+        )
+    };
+    if open_err != ERROR_SUCCESS {
+        return Err(format!("注册系统卸载项失败: win32 error {}", open_err.0));
+    }
+    let _guard = RegKeyGuard(hkey);
+
+    let set_sz = |name: &str, value: &str| -> Result<(), String> {
+        let hname = HSTRING::from(name);
+        let bytes = encode_utf16_nul(value);
+        // SAFETY: `hkey` is open for `KEY_WRITE` and `bytes` is a valid NUL-terminated UTF-16 buffer.
+        let err = unsafe { RegSetValueExW(hkey, &hname, None, REG_SZ, Some(&bytes)) };
+        if err != ERROR_SUCCESS {
+            return Err(format!("写入卸载注册表值 {name} 失败: win32 error {}", err.0));
+        }
+        Ok(())
+    };
+    let set_dword = |name: &str, value: u32| -> Result<(), String> {
+        let hname = HSTRING::from(name);
+        let bytes = value.to_le_bytes();
+        // SAFETY: `hkey` is open for `KEY_WRITE` and `bytes` is a 4-byte little-endian DWORD.
+        let err = unsafe { RegSetValueExW(hkey, &hname, None, REG_DWORD, Some(&bytes)) };
+        if err != ERROR_SUCCESS {
+            return Err(format!("写入卸载注册表值 {name} 失败: win32 error {}", err.0));
+        }
+        Ok(())
+    };
+
+    let display_icon = if icon_path.is_file() {
+        format!("{},0", icon_path.display())
+    } else {
+        format!("{},0", install_dir.join(desktop_bin_name()).display())
+    };
+    let install_loc = install_dir.to_string_lossy().into_owned();
+    let uninstall_cmd = format!("\"{}\" --uninstall", uninstall_bin.display());
+    let quiet_uninstall_cmd = format!("\"{}\" --uninstall --silent", uninstall_bin.display());
+    let estimated_kb = (dir_total_size_bytes(install_dir, 0) / 1024).clamp(1, u32::MAX as u64) as u32;
+
+    set_sz("DisplayName", "Hide-Go")?;
+    set_sz("DisplayVersion", version)?;
+    set_sz("Publisher", "Hide-Go")?;
+    set_sz("InstallLocation", &install_loc)?;
+    set_sz("DisplayIcon", &display_icon)?;
+    set_sz("UninstallString", &uninstall_cmd)?;
+    set_sz("QuietUninstallString", &quiet_uninstall_cmd)?;
+    set_dword("NoModify", 1)?;
+    set_dword("NoRepair", 1)?;
+    set_dword("EstimatedSize", estimated_kb)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_unregister_uninstaller() -> Result<(), String> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
+
+    let subkey = HSTRING::from(WINDOWS_UNINSTALL_REG_KEY);
+    // SAFETY: deletes our per-user Uninstall registry key under `HKCU`.
+    let err = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &subkey) };
+    if err != ERROR_SUCCESS && err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND {
+        return Err(format!("清理系统卸载注册表项失败: win32 error {}", err.0));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn create_windows_shortcut(
     lnk_path: &Path,
     target: &Path,
@@ -867,6 +1122,13 @@ fn create_windows_shortcut(
     icon_path: &Path,
     description: &str,
 ) -> Result<(), String> {
+    use windows::core::{Interface, HSTRING};
+    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
     if is_reparse_or_symlink(lnk_path) {
         return Err(format!("快捷方式路径 {} 是符号链接，拒绝覆盖", lnk_path.display()));
     }
@@ -876,49 +1138,62 @@ fn create_windows_shortcut(
         }
         std::fs::create_dir_all(parent).map_err(|e| format!("failed to create shortcut folder: {e}"))?;
     }
-    let script = "\
-        $ws = New-Object -ComObject WScript.Shell; \
-        $s = $ws.CreateShortcut($env:HIDE_GO_LNK_PATH); \
-        $s.TargetPath = $env:HIDE_GO_LNK_TARGET; \
-        $s.Arguments = $env:HIDE_GO_LNK_ARGS; \
-        $s.WorkingDirectory = $env:HIDE_GO_LNK_WORKDIR; \
-        $s.IconLocation = $env:HIDE_GO_LNK_ICON; \
-        $s.Description = $env:HIDE_GO_LNK_DESC; \
-        $s.Save()";
-    let ps = windows_system_powershell();
-    let out = hidden_command_path(&ps)
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("HIDE_GO_LNK_PATH", lnk_path)
-        .env("HIDE_GO_LNK_TARGET", target)
-        .env("HIDE_GO_LNK_ARGS", args)
-        .env("HIDE_GO_LNK_WORKDIR", working_dir)
-        .env("HIDE_GO_LNK_ICON", format!("{},0", icon_path.display()))
-        .env("HIDE_GO_LNK_DESC", description)
-        .output()
-        .map_err(|e| format!("powershell shortcut creation failed: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+
+    struct ComGuard(bool);
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                // SAFETY: balanced with a successful `CoInitializeEx` on this thread.
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    // SAFETY: ensures COM is initialized on the calling thread for ShellLink instantiation.
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if hr.is_err() && hr != RPC_E_CHANGED_MODE {
+        return Err(format!("COM 初始化失败: {}", windows::core::Error::from(hr)));
+    }
+    let _com_guard = ComGuard(hr.is_ok());
+
+    // SAFETY: creates and writes a standard Windows ShellLink (`.lnk`) file via documented COM APIs.
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
+            .map_err(|e| format!("创建 ShellLink 对象失败: {e}"))?;
+        link.SetPath(&HSTRING::from(target.as_os_str()))
+            .map_err(|e| format!("设置快捷方式目标失败: {e}"))?;
+        if !args.is_empty() {
+            link.SetArguments(&HSTRING::from(args))
+                .map_err(|e| format!("设置快捷方式参数失败: {e}"))?;
+        }
+        link.SetWorkingDirectory(&HSTRING::from(working_dir.as_os_str()))
+            .map_err(|e| format!("设置快捷方式工作目录失败: {e}"))?;
+        let icon_src = if icon_path.is_file() { icon_path } else { target };
+        link.SetIconLocation(&HSTRING::from(icon_src.as_os_str()), 0)
+            .map_err(|e| format!("设置快捷方式图标失败: {e}"))?;
+        link.SetDescription(&HSTRING::from(description))
+            .map_err(|e| format!("设置快捷方式描述失败: {e}"))?;
+
+        let persist: IPersistFile = link.cast().map_err(|e| format!("查询 IPersistFile 接口失败: {e}"))?;
+        persist
+            .Save(&HSTRING::from(lnk_path.as_os_str()), true)
+            .map_err(|e| format!("保存快捷方式 {} 失败: {e}", lnk_path.display()))?;
     }
     Ok(())
 }
 
 #[cfg(windows)]
 fn windows_desktop_dir() -> Option<PathBuf> {
-    let ps = windows_system_powershell();
-    let out = hidden_command_path(&ps)
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Environment]::GetFolderPath('Desktop')",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_Desktop, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG};
+
+    // SAFETY: queries `FOLDERID_Desktop` and frees the returned shell string via `CoTaskMemFree`.
+    unsafe {
+        let pwstr = SHGetKnownFolderPath(&FOLDERID_Desktop, KNOWN_FOLDER_FLAG(0), None).ok()?;
+        let path = pwstr.to_string().ok().filter(|s| !s.is_empty()).map(PathBuf::from);
+        CoTaskMemFree(Some(pwstr.0 as *const _));
+        path
     }
-    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!dir.is_empty()).then(|| PathBuf::from(dir))
 }
 
 #[cfg(not(windows))]
@@ -1043,6 +1318,9 @@ fn load_payload_manifest(package_root: &Path, required: bool) -> Result<Option<P
 }
 
 pub fn has_install_payload(source: &PayloadSource) -> bool {
+    if let Some(emb) = source.embedded_archive {
+        return !emb.bytes.is_empty() && !emb.sha256.trim().is_empty();
+    }
     let Some(root) = source.package_root.as_deref() else {
         return false;
     };
@@ -1068,16 +1346,28 @@ fn is_allowed_package_copy_rel(rel: &str, engine_lib: &str, chrome_lib: &str) ->
         || rel.starts_with("resources/icons/")
 }
 
-fn is_allowed_archive_entry_rel(rel: &str, desktop_bin: &str, daemon_bin: &str) -> bool {
+fn is_allowed_archive_entry_rel(
+    rel: &str,
+    desktop_bin: &str,
+    daemon_bin: &str,
+    engine_lib: &str,
+    chrome_lib: &str,
+) -> bool {
     rel == desktop_bin
         || rel == daemon_bin
+        || rel == engine_lib
+        || rel == chrome_lib
         || rel == "resources"
         || rel == "resources/ui"
         || rel.starts_with("resources/ui/")
+        || rel == "resources/locales"
+        || rel.starts_with("resources/locales/")
+        || rel == "resources/icons"
+        || rel.starts_with("resources/icons/")
 }
 
-fn is_archive_executable(rel: &str, desktop_bin: &str, daemon_bin: &str) -> bool {
-    rel == desktop_bin || rel == daemon_bin
+fn is_archive_executable(rel: &str, desktop_bin: &str, daemon_bin: &str, engine_lib: &str, chrome_lib: &str) -> bool {
+    rel == desktop_bin || rel == daemon_bin || rel == engine_lib || rel == chrome_lib
 }
 
 fn collect_dev_copy_files(root: &Path, sub: &str, out: &mut Vec<String>) -> Result<(), String> {
@@ -1110,24 +1400,26 @@ struct StagedFile {
     executable: bool,
 }
 
-fn extract_app_tar_gz(archive_bytes: &[u8]) -> Result<Vec<StagedFile>, String> {
+fn extract_app_tar_gz(archive_bytes: &[u8], require_runtime_libs: bool) -> Result<Vec<StagedFile>, String> {
     if archive_bytes.len() > MAX_ARCHIVE_BYTES {
         return Err("安装包数据归档超出安全体积上限".to_string());
     }
     let desktop_bin = desktop_bin_name();
     let daemon_bin = daemon_bin_name();
+    let engine_lib = shared_lib_file_name("hide_engine");
+    let chrome_lib = shared_lib_file_name("hide_chrome");
 
     let gz = GzDecoder::new(archive_bytes);
     let mut archive = Archive::new(gz);
-    let entries = archive
-        .entries()
-        .map_err(|e| format!("解析安装包数据归档 data/app.tar.gz 失败: {e}"))?;
+    let entries = archive.entries().map_err(|e| format!("解析安装包数据归档失败: {e}"))?;
 
     let mut staged = Vec::new();
     let mut total_bytes: usize = 0;
     let mut saw_desktop = false;
     let mut saw_daemon = false;
     let mut saw_ui_index = false;
+    let mut saw_engine_lib = false;
+    let mut saw_chrome_lib = false;
 
     for entry in entries {
         let mut entry = entry.map_err(|e| format!("读取安装包归档条目失败: {e}"))?;
@@ -1143,7 +1435,7 @@ fn extract_app_tar_gz(archive_bytes: &[u8]) -> Result<Vec<StagedFile>, String> {
                 continue;
             }
             validate_relative_asset_path(trimmed)?;
-            if !is_allowed_archive_entry_rel(trimmed, desktop_bin, daemon_bin) {
+            if !is_allowed_archive_entry_rel(trimmed, desktop_bin, daemon_bin, &engine_lib, &chrome_lib) {
                 return Err(format!("安装包归档包含未授权目录: {trimmed}"));
             }
             continue;
@@ -1159,7 +1451,7 @@ fn extract_app_tar_gz(archive_bytes: &[u8]) -> Result<Vec<StagedFile>, String> {
             .replace('\\', "/");
         let rel = raw_path.strip_prefix("./").unwrap_or(&raw_path);
         validate_relative_asset_path(rel)?;
-        if !is_allowed_archive_entry_rel(rel, desktop_bin, daemon_bin) {
+        if !is_allowed_archive_entry_rel(rel, desktop_bin, daemon_bin, &engine_lib, &chrome_lib) {
             return Err(format!("安装包归档包含未授权文件路径: {rel}"));
         }
 
@@ -1182,6 +1474,10 @@ fn extract_app_tar_gz(archive_bytes: &[u8]) -> Result<Vec<StagedFile>, String> {
             saw_desktop = true;
         } else if rel == daemon_bin {
             saw_daemon = true;
+        } else if rel == engine_lib {
+            saw_engine_lib = true;
+        } else if rel == chrome_lib {
+            saw_chrome_lib = true;
         } else if rel == "resources/ui/index.html" {
             saw_ui_index = true;
         }
@@ -1189,14 +1485,25 @@ fn extract_app_tar_gz(archive_bytes: &[u8]) -> Result<Vec<StagedFile>, String> {
         staged.push(StagedFile {
             rel: rel.to_string(),
             bytes: buf,
-            executable: is_archive_executable(rel, desktop_bin, daemon_bin),
+            executable: is_archive_executable(rel, desktop_bin, daemon_bin, &engine_lib, &chrome_lib),
         });
     }
 
-    if !saw_desktop || !saw_daemon || !saw_ui_index {
-        return Err("安装包归档 data/app.tar.gz 缺少必需的主程序或 UI 资源".to_string());
+    if !saw_desktop || !saw_daemon || !saw_ui_index || (require_runtime_libs && (!saw_engine_lib || !saw_chrome_lib)) {
+        return Err("安装包归档缺少必需的主程序、运行库或 UI 资源".to_string());
     }
     Ok(staged)
+}
+
+fn prepare_embedded_install_files(emb: EmbeddedPayloadArchive) -> Result<Vec<StagedFile>, String> {
+    if emb.bytes.is_empty() || emb.sha256.trim().is_empty() {
+        return Err("安装程序内置数据无效".to_string());
+    }
+    let actual = sha256_hex(emb.bytes);
+    if !actual.eq_ignore_ascii_case(emb.sha256.trim()) {
+        return Err("安装程序内置归档 SHA-256 校验失败（安装包可能损坏或被篡改）".to_string());
+    }
+    extract_app_tar_gz(emb.bytes, true)
 }
 
 fn prepare_install_files(package_root: &Path, require_manifest: bool) -> Result<Vec<StagedFile>, String> {
@@ -1271,8 +1578,8 @@ fn prepare_install_files(package_root: &Path, require_manifest: bool) -> Result<
         archive_bytes_opt = Some(bytes);
     }
 
-    let archive_bytes = archive_bytes_opt.ok_or_else(|| "缺少 data/app.tar.gz 安装归档".to_string())?;
-    let extracted = extract_app_tar_gz(&archive_bytes)?;
+    let archive_bytes = archive_bytes_opt.ok_or_else(|| "缺少安装数据归档".to_string())?;
+    let extracted = extract_app_tar_gz(&archive_bytes, false)?;
     staged.extend(extracted);
     Ok(staged)
 }
@@ -1360,13 +1667,14 @@ pub fn perform_install_with(
     // 1. Stop any running instance and prepare install directory
     sys.stop_running_processes();
     if let Err(e) = std::fs::create_dir_all(&install_dir) {
+        let hint = format_io_permission_hint(&e);
         steps.push(SetupStepStatus {
             id: "dir".into(),
             label: "创建安装目录".into(),
             state: "error",
             detail: Some(e.to_string()),
         });
-        return fail(steps, format!("无法创建安装目录 {}: {e}", install_dir.display()));
+        return fail(steps, format!("无法创建安装目录 {}{hint}: {e}", install_dir.display()));
     }
     if is_reparse_or_symlink(&install_dir) {
         let msg = "安装目录不能是符号链接或目录联接点".to_string();
@@ -1385,16 +1693,19 @@ pub fn perform_install_with(
         detail: Some(install_dir.to_string_lossy().into_owned()),
     });
 
-    // 2. Verify SHA-256 checksums, unpack data/app.tar.gz, write runtime libs & resources, copy uninstaller
+    // 2. Verify SHA-256 checksums, unpack archive, write runtime libs & resources, copy uninstaller
     let mut installed_files_set = BTreeSet::new();
     let bin_res = (|| -> Result<(), String> {
-        let package_root = payloads
-            .package_root
-            .as_deref()
-            .filter(|dir| !is_reparse_or_symlink(dir) && dir.is_dir())
-            .ok_or_else(|| "未找到同级运行时组件与 data/app.tar.gz 安装包，请先完整解压安装包".to_string())?;
-
-        let staged_files = prepare_install_files(package_root, payloads.require_manifest)?;
+        let staged_files = if let Some(emb) = payloads.embedded_archive {
+            prepare_embedded_install_files(emb)?
+        } else {
+            let package_root = payloads
+                .package_root
+                .as_deref()
+                .filter(|dir| !is_reparse_or_symlink(dir) && dir.is_dir())
+                .ok_or_else(|| "未检测到可用的安装数据，请重新下载完整的 Hide-Go 安装程序".to_string())?;
+            prepare_install_files(package_root, payloads.require_manifest)?
+        };
 
         for file in &staged_files {
             let parts = validate_relative_asset_path(&file.rel)?;
@@ -1767,7 +2078,7 @@ pub fn perform_uninstall_with(
 
         let mut pruned_rels = Vec::new();
         for rel in &known_files {
-            if running_from_install_dir && (rel == &uninst_bin || rel == &engine_lib || rel == &chrome_lib) {
+            if running_from_install_dir && rel == &uninst_bin {
                 continue;
             }
             let Ok(parts) = validate_relative_asset_path(rel) else {
@@ -1782,6 +2093,7 @@ pub fn perform_uninstall_with(
                                 removed_paths.push(target.to_string_lossy().into_owned());
                                 pruned_rels.push(rel.clone());
                             }
+                            Err(_) if running_from_install_dir && (rel == &engine_lib || rel == &chrome_lib) => {}
                             Err(e) => file_errors.push(format!("删除 {} 失败: {e}", target.display())),
                         }
                     } else {
@@ -2248,6 +2560,7 @@ mod tests {
 
         PayloadSource {
             package_root: Some(pkg),
+            embedded_archive: None,
             require_manifest: with_manifest,
             version: "0.2.2",
         }
@@ -2477,10 +2790,10 @@ mod tests {
 
         // Reject path-traversal and unauthorized archive entries
         let traversal_tar = build_raw_ustar_gz("../evil.exe", b"BAD");
-        assert!(extract_app_tar_gz(&traversal_tar).is_err());
+        assert!(extract_app_tar_gz(&traversal_tar, false).is_err());
 
         let unauthorized_tar = build_tar_gz(&[("resources/other/evil.txt", b"BAD", 0o644)]);
-        assert!(extract_app_tar_gz(&unauthorized_tar).is_err());
+        assert!(extract_app_tar_gz(&unauthorized_tar, false).is_err());
     }
 
     #[test]
@@ -2492,6 +2805,7 @@ mod tests {
 
         let missing_dir_source = PayloadSource {
             package_root: None,
+            embedded_archive: None,
             require_manifest: true,
             version: "0.2.2",
         };
@@ -2531,6 +2845,129 @@ mod tests {
             Some(&cfg_path),
         );
         assert!(!manifest_err.ok);
+    }
+
+    #[test]
+    fn embedded_archive_extracts_full_modular_runtime_and_enforces_checksum_and_libs() {
+        let tmp = TempDir::new();
+        let install_dir = tmp.path().join("app");
+        let cfg_path = tmp.path().join("cfg").join("config.json");
+        let ops = MockOps::default();
+
+        let engine_lib = shared_lib_file_name("hide_engine");
+        let chrome_lib = shared_lib_file_name("hide_chrome");
+        let desktop_bin = desktop_bin_name();
+        let daemon_bin = daemon_bin_name();
+
+        let tar_gz = build_tar_gz(&[
+            (desktop_bin, b"DESKTOP_BIN", 0o755),
+            (daemon_bin, b"DAEMON_BIN", 0o755),
+            (&engine_lib, b"ENGINE_DLL", 0o755),
+            (&chrome_lib, b"CHROME_DLL", 0o755),
+            ("resources/ui/index.html", b"<html><head></head></html>", 0o644),
+            ("resources/ui/assets/index.js", b"console.log('ui');", 0o644),
+            ("resources/locales/zh-CN.json", b"{}", 0o644),
+            ("resources/locales/en.json", b"{}", 0o644),
+            ("resources/icons/icon.ico", b"ICO", 0o644),
+        ]);
+        let digest = Box::leak(sha256_hex(&tar_gz).into_boxed_str());
+        let leaked_bytes: &'static [u8] = Box::leak(tar_gz.into_boxed_slice());
+
+        let embedded_src = PayloadSource {
+            package_root: None,
+            embedded_archive: Some(EmbeddedPayloadArchive {
+                bytes: leaked_bytes,
+                sha256: digest,
+            }),
+            require_manifest: true,
+            version: "0.2.5",
+        };
+        assert!(has_install_payload(&embedded_src));
+
+        let ok_res = perform_install_with(
+            &InstallOptions {
+                install_dir: Some(install_dir.to_string_lossy().into_owned()),
+                create_shortcuts: false,
+                create_desktop_shortcut: None,
+                create_start_menu_shortcut: None,
+                add_to_path: false,
+                autostart_daemon: false,
+                language: Some(UiLanguage::En),
+            },
+            &embedded_src,
+            &ops,
+            Some(&cfg_path),
+        );
+        assert!(ok_res.ok, "embedded install failed: {:?}", ok_res.error);
+        assert!(install_dir.join(desktop_bin).is_file());
+        assert!(install_dir.join(daemon_bin).is_file());
+        assert!(install_dir.join(&engine_lib).is_file());
+        assert!(install_dir.join(&chrome_lib).is_file());
+        assert!(install_dir.join("resources/ui/index.html").is_file());
+        assert!(install_dir.join("resources/locales/zh-CN.json").is_file());
+        assert!(install_dir.join("resources/icons/icon.ico").is_file());
+
+        // Bad SHA-256 rejected
+        let bad_sha_src = PayloadSource {
+            package_root: None,
+            embedded_archive: Some(EmbeddedPayloadArchive {
+                bytes: leaked_bytes,
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            }),
+            require_manifest: true,
+            version: "0.2.5",
+        };
+        let bad_sha_dir = tmp.path().join("app-bad-sha");
+        let bad_sha_res = perform_install_with(
+            &InstallOptions {
+                install_dir: Some(bad_sha_dir.to_string_lossy().into_owned()),
+                create_shortcuts: false,
+                create_desktop_shortcut: None,
+                create_start_menu_shortcut: None,
+                add_to_path: false,
+                autostart_daemon: false,
+                language: None,
+            },
+            &bad_sha_src,
+            &ops,
+            Some(&cfg_path),
+        );
+        assert!(!bad_sha_res.ok);
+        assert!(bad_sha_res.error.as_deref().unwrap_or("").contains("SHA-256"));
+
+        // Missing runtime library in archive rejected when embedded
+        let missing_lib_tar = build_tar_gz(&[
+            (desktop_bin, b"DESKTOP_BIN", 0o755),
+            (daemon_bin, b"DAEMON_BIN", 0o755),
+            ("resources/ui/index.html", b"<html><head></head></html>", 0o644),
+        ]);
+        let missing_lib_sha = Box::leak(sha256_hex(&missing_lib_tar).into_boxed_str());
+        let missing_lib_bytes: &'static [u8] = Box::leak(missing_lib_tar.into_boxed_slice());
+        let missing_lib_src = PayloadSource {
+            package_root: None,
+            embedded_archive: Some(EmbeddedPayloadArchive {
+                bytes: missing_lib_bytes,
+                sha256: missing_lib_sha,
+            }),
+            require_manifest: true,
+            version: "0.2.5",
+        };
+        let missing_lib_dir = tmp.path().join("app-missing-lib");
+        let missing_lib_res = perform_install_with(
+            &InstallOptions {
+                install_dir: Some(missing_lib_dir.to_string_lossy().into_owned()),
+                create_shortcuts: false,
+                create_desktop_shortcut: None,
+                create_start_menu_shortcut: None,
+                add_to_path: false,
+                autostart_daemon: false,
+                language: None,
+            },
+            &missing_lib_src,
+            &ops,
+            Some(&cfg_path),
+        );
+        assert!(!missing_lib_res.ok);
     }
 
     #[test]

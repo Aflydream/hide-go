@@ -7,7 +7,8 @@ use crate::{
     installer::{
         configured_language, configured_proxy_port, current_platform, default_install_dir, detect_existing_install,
         discover_package_root, has_install_payload, manifest_path, perform_install, perform_uninstall, same_path,
-        schedule_self_cleanup, validate_install_dir, InstallManifest, InstallOptions, PayloadSource, UninstallOptions,
+        schedule_self_cleanup, validate_install_dir, EmbeddedPayloadArchive, InstallManifest, InstallOptions,
+        PayloadSource, UninstallOptions,
     },
     web_assets::{build_nonce_csp, resolve_resources_dir, UiBundle},
 };
@@ -42,6 +43,16 @@ struct LocaleMessages {
 }
 
 impl LocaleMessages {
+    fn from_embedded(zh_cn_json: &str, en_json: &str) -> Self {
+        let parse = |raw: &str| -> HashMap<String, String> {
+            serde_json::from_str::<HashMap<String, String>>(raw.trim_start_matches('\u{feff}')).unwrap_or_default()
+        };
+        Self {
+            zh_cn: Arc::new(parse(zh_cn_json)),
+            en: Arc::new(parse(en_json)),
+        }
+    }
+
     fn load_from_dir(dir: &Path) -> Self {
         let load_file = |name: &str| -> HashMap<String, String> {
             let p = dir.join(name);
@@ -118,9 +129,17 @@ fn load_setup_ui_bundle(exe_dir: Option<&Path>) -> Result<UiBundle, String> {
     ))
 }
 
-fn payloads_for_exe(exe_dir: Option<&Path>) -> PayloadSource {
+pub struct EmbeddedSetupAssets {
+    pub ui: UiBundle,
+    pub zh_cn_json: &'static str,
+    pub en_json: &'static str,
+    pub payload_archive: Option<EmbeddedPayloadArchive>,
+}
+
+fn payloads_for_exe(exe_dir: Option<&Path>, embedded_archive: Option<EmbeddedPayloadArchive>) -> PayloadSource {
     PayloadSource {
         package_root: discover_package_root(exe_dir),
+        embedded_archive,
         require_manifest: !cfg!(debug_assertions),
         version: env!("CARGO_PKG_VERSION"),
     }
@@ -131,6 +150,7 @@ struct SetupState {
     mode: &'static str,
     token: Arc<String>,
     exe_dir: Option<Arc<PathBuf>>,
+    embedded_archive: Option<EmbeddedPayloadArchive>,
     ui: Arc<UiBundle>,
     chrome: Arc<dyn ChromeHost>,
     locales: LocaleMessages,
@@ -299,6 +319,7 @@ async fn serve_asset(State(state): State<SetupState>, uri: Uri) -> Response {
 
 async fn api_setup_info(State(state): State<SetupState>) -> Response {
     let exe_dir = state.exe_dir.as_deref().cloned();
+    let embedded_archive = state.embedded_archive;
     let chrome = state.chrome.clone();
     match tokio::task::spawn_blocking(move || {
         let existing = detect_existing_install();
@@ -306,7 +327,7 @@ async fn api_setup_info(State(state): State<SetupState>) -> Response {
         let port = configured_proxy_port(cfg_path.as_deref());
         let language = configured_language(cfg_path.as_deref());
         let harnesses = detect_all_harness_profiles(port, &HashMap::new());
-        let payload_source = payloads_for_exe(exe_dir.as_deref());
+        let payload_source = payloads_for_exe(exe_dir.as_deref(), embedded_archive);
         SetupInfoResponse {
             mode: state.mode,
             version: env!("CARGO_PKG_VERSION"),
@@ -354,9 +375,10 @@ async fn api_setup_pick_dir(State(state): State<SetupState>, body: Option<Json<P
 
 async fn api_setup_install(State(state): State<SetupState>, Json(opts): Json<InstallOptions>) -> Response {
     let exe_dir = state.exe_dir.as_deref().cloned();
+    let embedded_archive = state.embedded_archive;
     let chrome = state.chrome.clone();
     match tokio::task::spawn_blocking(move || {
-        let src = payloads_for_exe(exe_dir.as_deref());
+        let src = payloads_for_exe(exe_dir.as_deref(), embedded_archive);
         perform_install(&opts, &src, chrome)
     })
     .await
@@ -442,7 +464,7 @@ async fn api_setup_launch(State(state): State<SetupState>, Json(req): Json<Launc
             return (status, Json(serde_json::json!({"message": msg}))).into_response();
         }
     };
-    match Command::new(&exe).spawn() {
+    match Command::new(&exe).current_dir(&dir).spawn() {
         Ok(_) => {
             let shutdown = state.shutdown.clone();
             tokio::spawn(async move {
@@ -493,26 +515,52 @@ fn setup_webview_data_dir() -> (PathBuf, Option<PathBuf>) {
     }
 }
 
+pub fn localized_setup_message(locale: &str, zh_cn_json: &str, en_json: &str, key: &str) -> String {
+    let locales = LocaleMessages::from_embedded(zh_cn_json, en_json);
+    locales.get(locale, key).to_string()
+}
+
 pub fn run_setup_entry(exe_dir: Option<&Path>, chrome: Arc<dyn ChromeHost>) -> i32 {
+    run_setup_impl(exe_dir, chrome, None)
+}
+
+pub fn run_setup_standalone(exe_dir: Option<&Path>, chrome: Arc<dyn ChromeHost>, embedded: EmbeddedSetupAssets) -> i32 {
+    run_setup_impl(exe_dir, chrome, Some(embedded))
+}
+
+fn run_setup_impl(exe_dir: Option<&Path>, chrome: Arc<dyn ChromeHost>, embedded: Option<EmbeddedSetupAssets>) -> i32 {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .try_init();
 
     let cli = parse_args();
     let silent = cli.silent;
-    if let Err(err) = run(cli, exe_dir, chrome.clone()) {
+    let fallback_locales = match &embedded {
+        Some(emb) => LocaleMessages::from_embedded(emb.zh_cn_json, emb.en_json),
+        None => load_setup_locales(exe_dir),
+    };
+    if let Err(err) = run(cli, exe_dir, chrome.clone(), embedded) {
         tracing::error!("Hide-Go Setup failed: {err}");
         if silent {
             eprintln!("Hide-Go Setup failed: {err}");
         } else {
-            chrome.show_error_dialog("Hide-Go Setup 启动失败", &err.to_string());
+            let sys_locale = chrome.detect_system_locale();
+            let title = fallback_locales.get(sys_locale, "setup.launchErrorTitle");
+            let title = if title.is_empty() { "Hide-Go Setup" } else { &title };
+            chrome.show_error_dialog(title, &err.to_string());
         }
         return 1;
     }
     0
 }
 
-fn run(cli: CliArgs, exe_dir: Option<&Path>, chrome: Arc<dyn ChromeHost>) -> Result<(), Box<dyn std::error::Error>> {
+fn run(
+    cli: CliArgs,
+    exe_dir: Option<&Path>,
+    chrome: Arc<dyn ChromeHost>,
+    embedded: Option<EmbeddedSetupAssets>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let embedded_archive = embedded.as_ref().and_then(|e| e.payload_archive);
     if cli.silent {
         if cli.mode == "uninstall" {
             let out = perform_uninstall(
@@ -531,7 +579,7 @@ fn run(cli: CliArgs, exe_dir: Option<&Path>, chrome: Arc<dyn ChromeHost>) -> Res
             }
             return Ok(());
         } else {
-            let payloads = payloads_for_exe(exe_dir);
+            let payloads = payloads_for_exe(exe_dir, embedded_archive);
             let out = perform_install(
                 &InstallOptions {
                     install_dir: cli.install_dir,
@@ -560,8 +608,13 @@ fn run(cli: CliArgs, exe_dir: Option<&Path>, chrome: Arc<dyn ChromeHost>) -> Res
         }
     }
 
-    let ui = Arc::new(load_setup_ui_bundle(exe_dir)?);
-    let locales = load_setup_locales(exe_dir);
+    let (ui, locales) = match embedded {
+        Some(emb) => (
+            Arc::new(emb.ui),
+            LocaleMessages::from_embedded(emb.zh_cn_json, emb.en_json),
+        ),
+        None => (Arc::new(load_setup_ui_bundle(exe_dir)?), load_setup_locales(exe_dir)),
+    };
     let shutdown = Arc::new(Notify::new());
     let pending_cleanup = Arc::new(Mutex::new(None));
     let ui_seen = Arc::new(AtomicBool::new(false));
@@ -570,6 +623,7 @@ fn run(cli: CliArgs, exe_dir: Option<&Path>, chrome: Arc<dyn ChromeHost>) -> Res
         mode: cli.mode,
         token,
         exe_dir: exe_dir.map(|p| Arc::new(p.to_path_buf())),
+        embedded_archive,
         ui,
         chrome: chrome.clone(),
         locales: locales.clone(),
@@ -693,6 +747,7 @@ mod tests {
             mode: "install",
             token: Arc::new("secret".into()),
             exe_dir: None,
+            embedded_archive: None,
             ui,
             chrome: Arc::new(HeadlessChromeHost),
             locales,
@@ -879,5 +934,28 @@ mod tests {
             assert!(!zh_val.trim().is_empty());
             assert!(!en_val.trim().is_empty());
         }
+    }
+
+    #[test]
+    fn embedded_setup_ui_and_locales_parse_cleanly() {
+        let html = "<!doctype html><html><head><link rel=\"stylesheet\" href=\"/assets/app.css\"><script src=\"/assets/app.js\"></script></head><body></body></html>";
+        let assets: [(&str, &str, &[u8]); 2] = [
+            (
+                "/assets/app.js",
+                "application/javascript; charset=utf-8",
+                b"console.log(1);",
+            ),
+            ("/assets/app.css", "text/css; charset=utf-8", b"body{}"),
+        ];
+        let bundle = UiBundle::from_embedded(html, &assets).expect("valid embedded UI bundle");
+        assert_eq!(bundle.assets.len(), 2);
+        assert!(UiBundle::from_embedded(html, &assets[..1]).is_err());
+
+        let locales = LocaleMessages::from_embedded(
+            r#"{"setup.windowTitle.install":"安装"}"#,
+            r#"{"setup.windowTitle.install":"Setup"}"#,
+        );
+        assert_eq!(locales.get("zh-CN", "setup.windowTitle.install"), "安装");
+        assert_eq!(locales.get("en", "setup.windowTitle.install"), "Setup");
     }
 }

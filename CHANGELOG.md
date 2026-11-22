@@ -2,6 +2,32 @@
 
 All notable changes to Hide-Go are documented in this file.
 
+## [Unreleased]
+
+### Added
+- Built-in update check (`GET /api/updates/check` and `auto_check_updates`, enabled by default) with Settings UI controls and sidebar badge
+- Standalone single-file Windows Setup executable embedding the setup UI, locales, and SHA-256 verified runtime archive
+- Native Win32 API integration for folder picker (`IFileOpenDialog`), shortcuts (`IShellLinkW`), per-user Uninstall registry entries, PE VersionInfo, and application manifests (`asInvoker`, `PerMonitorV2`, `longPathAware`)
+- Optional Authenticode signing step for Windows runtime binaries and Setup executable in the release workflow
+- Copyable OpenAI-compatible (`/codex/v1`) and Anthropic-compatible (`/claude-code`) Base URL endpoints and transport/CA status badges in Integrations
+- Schema-less Protobuf, gRPC (`application/grpc*`), and ConnectRPC (`application/connect+proto`, `application/connect+json`) wire-format outbound desensitization and streaming inbound restoration with full-duplex bidirectional streaming, `gzip`/`deflate` frame support, cross-frame token reassembly, and HTTP/2 trailer preservation
+- Reversible Windows WinInet system proxy chaining (`system_proxy_chain`) with pre-Hide-Go upstream proxy preservation and automatic restoration on disconnect, shutdown, or uninstall
+- `GET /api/mitm/hosts` endpoint and compact Integrations controls for toggling system proxy chaining, managing custom `mitmExtraHosts`, inspecting recently observed `CONNECT` hosts, and surfacing MITM TLS handshake failures in Traffic logs
+
+### Changed
+- Derive outbound placeholders, cover identifiers, and cover comments from per-instance runtime keys and `project_salt`, and strip proxy metadata headers before forwarding
+- Prefilter built-in detectors with a `RegexSet` and speed up vault lookups with a 256-entry root trie table and percent-encoded secret remasking
+- Route outbound HTTP forwarding and `HTTPS CONNECT` / WebSocket tunnels through active environment or Windows system proxies while bypassing loopback/LAN targets and Hide-Go's own listening port
+- Switch OpenAI Codex integration to Base URL reverse-proxy mode (`[model_providers.*].base_url` / `openai_base_url` and `OPENAI_BASE_URL`) without requiring Root CA trust
+- Connect Antigravity via reversible system proxy chaining, IDE proxy config, and Protobuf/gRPC/REST MITM across `cloudcode-pa` and `antigravity-pa` Google API hosts
+- Compact Settings layout using `Segmented` and `Switch` controls
+
+### Fixed
+- Update active `[model_providers.*].base_url` entries in `~/.codex/config.toml` even when top-level `model_provider` is omitted, and chain loopback upstreams through `harness_upstreams` and `allowed_loopback_proxy_targets`
+- Stop Claude Code disconnect from writing `settings.json`'s `ANTHROPIC_BASE_URL` into `~/.hide-go/env.ps1`, and clear conflicting managed env entries on connect
+- Prevent native `<dialog>` `Esc` dismissal from invoking `onClose` twice, and move `@starting-style` rules to top-level CSS
+- Localize Setup launch error dialog titles via OS locale detection instead of hardcoded strings
+
 ## [0.2.4] - 2026-11-21
 
 ### Added

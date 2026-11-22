@@ -105,7 +105,7 @@ export function Policy() {
           >
             <Example
               local={'db = "postgres://admin:Sec99@10.16.8.9/vault"  # /home/alice/titan'}
-              vendor={'db = "postgres://db_user_01:db_pass_placeholder_01@db-01.example.internal:5432/app_schema_01"  # /workspace/user_01/titan'}
+              vendor={'db = "postgres://svc_7k2m9p:q4v8Lx2nR9wB3z@core-4a9c12.db.example:5432/app_8f3e1"  # /opt/work/a7c9e2b1/titan'}
             />
           </RadioCard>
           <RadioCard<PrivacyMode>
@@ -118,7 +118,7 @@ export function Policy() {
           >
             <Example
               local={'fn verify_margin(wallet_secret: &str) // liquidation threshold check'}
-              vendor={'fn orchid_lotus_207(fern_moss_481: &str) // [BotanicalSensor-01] Calibrate greenhouse soil humidity and mist interval'}
+              vendor={'fn orchid_petal_grove(fern_moss_stem: &str) // Check greenhouse soil moisture before misting cycle (#a7b3)'}
             />
           </RadioCard>
         </div>

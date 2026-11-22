@@ -433,13 +433,8 @@ export function Dialog({
       dialog.returnValue = '';
       onCloseRef.current();
     };
-    const handleCancel = (e: Event) => {
-      e.preventDefault();
-      handleClose();
-    };
 
     dialog.addEventListener('close', handleClose);
-    dialog.addEventListener('cancel', handleCancel);
 
     // Progressive-enhancement fallback for click-outside light dismiss where `closedby` is unsupported.
     let cleanupOutside: (() => void) | undefined;
@@ -468,7 +463,6 @@ export function Dialog({
 
     return () => {
       dialog.removeEventListener('close', handleClose);
-      dialog.removeEventListener('cancel', handleCancel);
       cleanupOutside?.();
     };
   }, []);
@@ -688,13 +682,13 @@ export function Kbd({ children }: { children: ReactNode }) {
 
 /* ------------------------------------------------------------------ Layout Helpers */
 
-export function Section({ index, title, description, children }: { index: string; title: string; description: ReactNode; children: ReactNode }) {
+export function Section({ index, title, description, children }: { index: string; title: string; description?: ReactNode; children: ReactNode }) {
   return (
     <section className="grid grid-cols-1 gap-x-10 gap-y-4 border-b border-line py-7 last:border-b-0 lg:grid-cols-[260px_minmax(0,1fr)]">
       <div>
         <p className="tabular font-mono text-2xs text-fg-subtle">{index}</p>
         <h2 className="mt-1 text-sm font-semibold text-fg">{title}</h2>
-        <div className="mt-1.5 text-xs leading-5 text-fg-subtle">{description}</div>
+        {description && <div className="mt-1.5 text-xs leading-5 text-fg-subtle">{description}</div>}
       </div>
       <div className="min-w-0">{children}</div>
     </section>

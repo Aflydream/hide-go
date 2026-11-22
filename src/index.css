@@ -21,8 +21,8 @@
 }
 
 /*
- * Design tokens — Dual-mode "查验台" (Warm Paper Light + Precision Obsidian Ink Dark).
- * Follows modern-web-guidance (`dark-mode` + `dark-mode-toggle`) and ui-ux-pro-max contrast standards (>= 4.5:1 text, >= 3:1 controls).
+ * Design tokens — Dual-mode palette (Warm Paper Light + Precision Obsidian Ink Dark).
+ * Meets WCAG AA contrast targets (>= 4.5:1 text, >= 3:1 controls) and keys off `color-scheme`.
  * Values are RGB channels so Tailwind alpha modifiers work (bg-brand/10).
  */
 @layer base {
@@ -196,12 +196,6 @@
     backdrop-filter: blur(2px);
   }
 
-  @starting-style {
-    dialog[open]::backdrop {
-      background-color: rgb(9 13 20 / 0);
-    }
-  }
-
   dialog.hg-dialog {
     opacity: 0;
     color: inherit;
@@ -218,21 +212,10 @@
     dialog.hg-dialog[open] {
       transform: scale(1) translateY(0);
     }
-    @starting-style {
-      dialog.hg-dialog[open] {
-        transform: scale(0.97) translateY(4px);
-      }
-    }
   }
 
   dialog.hg-dialog[open] {
     opacity: 1;
-  }
-
-  @starting-style {
-    dialog.hg-dialog[open] {
-      opacity: 0;
-    }
   }
 
   @keyframes hg-indeterminate {
@@ -279,6 +262,23 @@
     }
     :focus-visible {
       outline: 2px solid Highlight;
+    }
+  }
+}
+
+@starting-style {
+  dialog[open]::backdrop {
+    background-color: rgb(9 13 20 / 0);
+  }
+  dialog.hg-dialog[open] {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @starting-style {
+    dialog.hg-dialog[open] {
+      transform: scale(0.97) translateY(4px);
     }
   }
 }

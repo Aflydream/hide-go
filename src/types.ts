@@ -62,6 +62,37 @@ export interface HideConfig {
   toolCallSecretPolicy: ToolCallSecretPolicy;
   customRules: CustomRule[];
   language?: UiLanguage;
+  autoCheckUpdates?: boolean;
+  systemProxyChain?: boolean;
+  mitmExtraHosts?: string[];
+  mitmBypassHosts?: string[];
+}
+
+export interface ObservedConnectHost {
+  host: string;
+  port: number;
+  mitm: boolean;
+  tlsFailed: boolean;
+  count: number;
+  lastSeenAt: string;
+}
+
+export interface MitmHostsResponse {
+  mitmExtraHosts: string[];
+  mitmBypassHosts: string[];
+  systemProxyChain: boolean;
+  systemProxySupported: boolean;
+  systemProxyActive: boolean;
+  observedHosts: ObservedConnectHost[];
+}
+
+export interface UpdateCheckResult {
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+  releaseUrl: string;
+  publishedAt?: string | null;
+  checkedAt: string;
 }
 
 export interface TrafficSummary {

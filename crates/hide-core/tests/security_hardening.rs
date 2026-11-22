@@ -239,8 +239,8 @@ fn s03_cross_vendor_placeholder_oracle_cannot_restore_other_scope_secrets() {
     assert!(!masked_a.contains("VendorASuperSecret1234567890"));
     let placeholder_a = masked_a
         .split_whitespace()
-        .find(|w| w.starts_with("sk-sem-"))
-        .expect("expected keyed sk-sem placeholder")
+        .find(|w| w.starts_with("sk-ant-"))
+        .expect("expected keyed API key placeholder")
         .to_string();
 
     // Vendor B probes by echoing Vendor A's placeholder in both outbound & inbound paths.
@@ -598,7 +598,14 @@ fn s07_corrupted_harness_backup_disconnect_scrubs_dead_routes() {
         }
     }
 
-    for kind in harnesses {
+    for kind in [
+        HarnessKind::ClaudeCode,
+        HarnessKind::Codex,
+        HarnessKind::Cursor,
+        HarnessKind::Qoder,
+        HarnessKind::Antigravity,
+        HarnessKind::GrokBuild,
+    ] {
         let _ = disconnect_harness_with_deps(&host, cfg_path.clone(), kind);
     }
 
@@ -743,8 +750,8 @@ async fn s08_same_harness_subdomain_scope_sharing_and_cross_harness_isolation() 
             let content = parsed["messages"][0]["content"].as_str().unwrap_or("");
             let ph = content
                 .split_whitespace()
-                .find(|w| w.starts_with("sk-sem-"))
-                .expect("expected masked sk-sem placeholder in api2.cursor.sh payload")
+                .find(|w| w.starts_with("sk-ant-"))
+                .expect("expected masked API key placeholder in api2.cursor.sh payload")
                 .to_string();
             *captured_ref.lock().unwrap() = Some(ph.clone());
             json!({
@@ -781,12 +788,15 @@ async fn s08_same_harness_subdomain_scope_sharing_and_cross_harness_isolation() 
     })
     .await;
 
-    let mut state = GatewayState::new(HideConfig::default()).with_ca(gateway_ca.clone());
-    state.http_client = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(upstream_ca.ca_cert_pem().as_bytes()).unwrap())
-        .proxy(reqwest::Proxy::all(format!("http://{mock_proxy_addr}")).unwrap())
-        .build()
-        .unwrap();
+    let state = GatewayState::new(HideConfig::default())
+        .with_ca(gateway_ca.clone())
+        .with_custom_http_client(
+            reqwest::Client::builder()
+                .add_root_certificate(reqwest::Certificate::from_pem(upstream_ca.ca_cert_pem().as_bytes()).unwrap())
+                .proxy(reqwest::Proxy::all(format!("http://{mock_proxy_addr}")).unwrap())
+                .build()
+                .unwrap(),
+        );
     let gw_addr = serve_gateway(state).await;
 
     let proxy_client = reqwest::Client::builder()
@@ -898,12 +908,15 @@ async fn s09_port_8443_and_loopback_allowlist_vs_strict_403_blocks() {
     cfg.mitm_extra_hosts = vec!["mcp.example.com".to_string()];
     cfg.allowed_loopback_proxy_targets = vec![format!("127.0.0.1:{}", local_mcp_addr.port())];
 
-    let mut state = GatewayState::new(cfg).with_ca(gateway_ca.clone());
-    state.http_client = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(upstream_ca.ca_cert_pem().as_bytes()).unwrap())
-        .proxy(reqwest::Proxy::all(format!("http://{mock_ext_proxy}")).unwrap())
-        .build()
-        .unwrap();
+    let state = GatewayState::new(cfg)
+        .with_ca(gateway_ca.clone())
+        .with_custom_http_client(
+            reqwest::Client::builder()
+                .add_root_certificate(reqwest::Certificate::from_pem(upstream_ca.ca_cert_pem().as_bytes()).unwrap())
+                .proxy(reqwest::Proxy::all(format!("http://{mock_ext_proxy}")).unwrap())
+                .build()
+                .unwrap(),
+        );
     let gw_addr = serve_gateway(state.clone()).await;
 
     // Try dynamically pushing self-port into `allowed_loopback_proxy_targets` — self-port must stay blocked!

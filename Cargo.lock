@@ -1171,6 +1171,7 @@ dependencies = [
  "serde_json",
  "tao",
  "tracing",
+ "windows",
  "windows-sys 0.61.2",
  "wry",
 ]
@@ -1241,6 +1242,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows",
 ]
 
 [[package]]
@@ -1262,7 +1264,9 @@ dependencies = [
 name = "hide-setup"
 version = "0.2.4"
 dependencies = [
- "hide-launcher",
+ "hide-chrome",
+ "hide-engine",
+ "ring",
  "winresource",
 ]
 

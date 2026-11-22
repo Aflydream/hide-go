@@ -21,6 +21,8 @@ const SHARED_PROXY_VARS: &[&str] = &[
     "NO_PROXY",
     "NODE_EXTRA_CA_CERTS",
     "SSL_CERT_FILE",
+    "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
+    "REQUESTS_CA_BUNDLE",
 ];
 const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1";
 const VSCODE_HTTP_NO_PROXY: &[&str] = &["localhost", "127.0.0.1", "::1", ".local"];
@@ -155,6 +157,10 @@ struct HarnessBackup {
     wrote_config_upstream: bool,
     #[serde(default)]
     prev_config_upstream: Option<String>,
+    #[serde(default)]
+    added_loopback_target: Option<String>,
+    #[serde(default)]
+    enabled_system_proxy_chain: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -212,7 +218,7 @@ const SPECS: &[HarnessSpec] = &[
         local_appdata_paths: &["Programs/OpenAI/Codex/bin/codex.exe", "Programs/OpenAI/Codex"],
         mac_apps: &["/Applications/Codex.app"],
         registry_keywords: &["openai codex", "codex"],
-        requires_ca_trust: true,
+        requires_ca_trust: false,
     },
     HarnessSpec {
         kind: HarnessKind::Antigravity,
@@ -1476,6 +1482,70 @@ fn remove_toml_key(raw: &str, target_section: &[&str], target_key: &str) -> Stri
     }
 }
 
+fn list_toml_model_provider_urls(raw: &str) -> Vec<(String, String)> {
+    let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
+    let mut section: Vec<String> = Vec::new();
+    let mut multiline_delim: Option<&str> = None;
+    let mut found = Vec::new();
+    for line in raw.lines() {
+        if let Some(delim) = multiline_delim {
+            if line.contains(delim) {
+                multiline_delim = None;
+            }
+            continue;
+        }
+        let code = strip_toml_comment(line).trim();
+        if code.is_empty() {
+            continue;
+        }
+        if let Some(header) = parse_toml_table_header(code) {
+            section = header;
+            continue;
+        }
+        if let Some((_, v)) = code.split_once('=') {
+            let vt = v.trim();
+            if let Some(delim) = ["\"\"\"", "'''"].iter().copied().find(|d| vt.starts_with(d)) {
+                let after = &vt[delim.len()..];
+                if !after.contains(delim) {
+                    multiline_delim = Some(delim);
+                }
+                continue;
+            }
+        }
+        if section.len() == 2 && section[0] == "model_providers" {
+            if let Some((k, v)) = code.split_once('=') {
+                let key = k.trim().trim_matches('"').trim_matches('\'');
+                if key == "base_url" {
+                    if let Some(val) = parse_toml_string_literal(v) {
+                        found.push((section[1].clone(), val));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Resolve which `[model_providers.<name>]` section in `~/.codex/config.toml` should be managed:
+/// explicit top-level `model_provider` first, otherwise an existing `[model_providers.*]` table
+/// defining `base_url` (preferring `"custom"`, then `"openai"`, then the first listed provider).
+fn resolve_codex_target_provider(raw: &str) -> Option<String> {
+    if let Some(explicit) = read_toml_string_key(raw, &[], "model_provider")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(explicit);
+    }
+    let providers = list_toml_model_provider_urls(raw);
+    if let Some((name, _)) = providers.iter().find(|(n, _)| n == "custom") {
+        return Some(name.clone());
+    }
+    if let Some((name, _)) = providers.iter().find(|(n, _)| n == "openai") {
+        return Some(name.clone());
+    }
+    providers.into_iter().next().map(|(n, _)| n)
+}
+
 fn normalize_codex_upstream(raw_url: &str) -> (String, bool) {
     let trimmed = raw_url.trim().trim_end_matches('/');
     if let Some(stripped) = trimmed.strip_suffix("/v1") {
@@ -1583,17 +1653,19 @@ fn check_configured(
             if let Some(home) = host.home_dir() {
                 let toml_path = home.join(".codex").join("config.toml");
                 if let Ok(raw) = std::fs::read_to_string(&toml_path) {
-                    let provider = read_toml_string_key(&raw, &[], "model_provider");
-                    let provider_url = provider
-                        .as_deref()
-                        .and_then(|p| read_toml_string_key(&raw, &["model_providers", p], "base_url"));
-                    let top_url = read_toml_string_key(&raw, &[], "openai_base_url");
-                    if provider_url
-                        .as_deref()
-                        .is_some_and(|u| points_to_local_gateway(u, "/codex", proxy_port))
-                        || top_url
+                    if let Some(provider) = resolve_codex_target_provider(&raw) {
+                        if read_toml_string_key(&raw, &["model_providers", &provider], "base_url")
                             .as_deref()
                             .is_some_and(|u| points_to_local_gateway(u, "/codex", proxy_port))
+                        {
+                            return (true, Some(toml_path.to_string_lossy().into_owned()));
+                        }
+                        // Active `[model_providers.<p>]` exists in config.toml and does NOT route via Hide-Go.
+                        return (false, None);
+                    }
+                    if read_toml_string_key(&raw, &[], "openai_base_url")
+                        .as_deref()
+                        .is_some_and(|u| points_to_local_gateway(u, "/codex", proxy_port))
                     {
                         return (true, Some(toml_path.to_string_lossy().into_owned()));
                     }
@@ -1863,29 +1935,61 @@ fn ensure_ca_ready_for_harness(
     })
 }
 
+fn extract_loopback_authority(raw_url: &str, own_proxy_port: u16) -> Option<String> {
+    let parsed = reqwest::Url::parse(raw_url.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?.trim_matches(['[', ']']);
+    if !crate::connect::is_loopback_host_str(host) {
+        return None;
+    }
+    let port = parsed.port_or_known_default()?;
+    if port == 0 || (own_proxy_port != 0 && port == own_proxy_port) {
+        return None;
+    }
+    if host.contains(':') {
+        Some(format!("[{host}]:{port}"))
+    } else {
+        Some(format!("{host}:{port}"))
+    }
+}
+
 fn update_config_upstream(
     config_path: Option<&Path>,
     slug: &str,
     route_prefix: &str,
     proxy_port: u16,
     new_upstream: Option<String>,
-) -> Result<(bool, Option<String>), String> {
+) -> Result<(bool, Option<String>, Option<String>), String> {
     let Some(path) = config_path else {
-        return Ok((false, None));
+        return Ok((false, None, None));
     };
     let Some(upstream) =
         new_upstream.filter(|u| !u.is_empty() && !points_to_hidego_gateway(u, route_prefix, proxy_port))
     else {
-        return Ok((false, None));
+        return Ok((false, None, None));
     };
     let mut cfg = HideConfig::load_or_create(path);
+    let added_loopback = extract_loopback_authority(&upstream, proxy_port).and_then(|target| {
+        if cfg
+            .allowed_loopback_proxy_targets
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&target))
+        {
+            None
+        } else {
+            cfg.allowed_loopback_proxy_targets.push(target.clone());
+            Some(target)
+        }
+    });
     let prev = cfg.harness_upstreams.insert(slug.to_string(), upstream);
     cfg.save(path).map_err(|e| format!("保存 HideConfig 失败: {e}"))?;
-    Ok((true, prev))
+    Ok((true, prev, added_loopback))
 }
 
 fn restore_config_upstream(config_path: Option<&Path>, slug: &str, backup: &HarnessBackup) -> Result<(), String> {
-    if !backup.wrote_config_upstream {
+    if !backup.wrote_config_upstream && backup.added_loopback_target.is_none() && !backup.enabled_system_proxy_chain {
         return Ok(());
     }
     let Some(path) = config_path else {
@@ -1895,15 +1999,37 @@ fn restore_config_upstream(config_path: Option<&Path>, slug: &str, backup: &Harn
         return Ok(());
     }
     let mut cfg = HideConfig::load_or_create(path);
-    match &backup.prev_config_upstream {
-        Some(prev) => {
-            cfg.harness_upstreams.insert(slug.to_string(), prev.clone());
-        }
-        None => {
-            cfg.harness_upstreams.remove(slug);
+    if backup.wrote_config_upstream {
+        match &backup.prev_config_upstream {
+            Some(prev) => {
+                cfg.harness_upstreams.insert(slug.to_string(), prev.clone());
+            }
+            None => {
+                cfg.harness_upstreams.remove(slug);
+            }
         }
     }
+    if let Some(target) = &backup.added_loopback_target {
+        cfg.allowed_loopback_proxy_targets
+            .retain(|existing| !existing.eq_ignore_ascii_case(target));
+    }
+    if backup.enabled_system_proxy_chain {
+        cfg.system_proxy_chain = false;
+    }
     cfg.save(path).map_err(|e| format!("恢复 HideConfig 失败: {e}"))
+}
+
+fn enable_config_system_proxy_chain(config_path: Option<&Path>) -> Result<bool, String> {
+    let Some(path) = config_path else {
+        return Ok(false);
+    };
+    let mut cfg = HideConfig::load_or_create(path);
+    if cfg.system_proxy_chain {
+        return Ok(false);
+    }
+    cfg.system_proxy_chain = true;
+    cfg.save(path).map_err(|e| format!("保存 HideConfig 失败: {e}"))?;
+    Ok(true)
 }
 
 const fn vscode_terminal_env_key() -> &'static str {
@@ -2080,11 +2206,15 @@ fn restore_harness_env_vars(host: &dyn HostAdapter, backup: &HarnessBackup) -> R
             None => host.user_env_remove(name)?,
         }
     }
-    if let Some(legacy_var) = &backup.env_var {
-        if !backup.prev_env_vars.contains_key(legacy_var) {
-            match &backup.prev_value {
-                Some(v) => host.user_env_set(legacy_var, v)?,
-                None => host.user_env_remove(legacy_var)?,
+    // Only apply legacy single-var restoration for env-only backups (never for file-backed harnesses
+    // like Claude Code whose `ANTHROPIC_BASE_URL` lives inside `settings.json`).
+    if backup.files.is_empty() {
+        if let Some(legacy_var) = &backup.env_var {
+            if !backup.prev_env_vars.contains_key(legacy_var) {
+                match &backup.prev_value {
+                    Some(v) => host.user_env_set(legacy_var, v)?,
+                    None => host.user_env_remove(legacy_var)?,
+                }
             }
         }
     }
@@ -2229,11 +2359,22 @@ pub fn connect_harness_with_deps(
                 .cloned();
 
             let claude_url = format!("{proxy_url}/claude-code");
+            let managed_env_anthropic = host.user_env_get("ANTHROPIC_BASE_URL");
+            let effective_prev_anthropic = prev_anthropic
+                .as_deref()
+                .filter(|u| !u.trim().is_empty() && !points_to_hidego_gateway(u, &route_prefix, proxy_port))
+                .or_else(|| {
+                    managed_env_anthropic
+                        .as_deref()
+                        .filter(|u| !u.trim().is_empty() && !points_to_hidego_gateway(u, &route_prefix, proxy_port))
+                })
+                .map(str::to_string);
+
             if is_fresh_connect {
                 backup.had_file = had_file;
                 backup.had_env_object = had_env_object;
                 backup.prev_value = prev_anthropic.clone();
-                backup.env_var = Some("ANTHROPIC_BASE_URL".to_string());
+                backup.env_var = None;
 
                 let mut prev_keys = HashMap::new();
                 prev_keys.insert(
@@ -2259,23 +2400,23 @@ pub fn connect_harness_with_deps(
                     prev_keys,
                 });
 
-                if let Some(prev) = prev_anthropic
-                    .as_deref()
-                    .filter(|u| !points_to_hidego_gateway(u, &route_prefix, proxy_port))
-                {
-                    match update_config_upstream(
-                        config_path.as_deref(),
-                        slug,
-                        &route_prefix,
-                        proxy_port,
-                        Some(prev.to_string()),
-                    ) {
-                        Ok((wrote, prev_cfg)) => {
+                if let Some(prev) = effective_prev_anthropic {
+                    match update_config_upstream(config_path.as_deref(), slug, &route_prefix, proxy_port, Some(prev)) {
+                        Ok((wrote, prev_cfg, added_loopback)) => {
                             backup.wrote_config_upstream = wrote;
                             backup.prev_config_upstream = prev_cfg;
+                            backup.added_loopback_target = added_loopback;
                         }
                         Err(e) => return fail_with_rollback(&backup, e),
                     }
+                }
+            }
+
+            // Clear any conflicting `ANTHROPIC_BASE_URL` in Hide-Go's managed env script so shells
+            // do not bypass `~/.claude/settings.json` with a direct upstream URL.
+            if managed_env_anthropic.is_some() {
+                if let Err(e) = host.user_env_remove("ANTHROPIC_BASE_URL") {
+                    return fail_with_rollback(&backup, e);
                 }
             }
 
@@ -2328,7 +2469,7 @@ pub fn connect_harness_with_deps(
                 String::new()
             };
 
-            let provider = read_toml_string_key(&raw_toml, &[], "model_provider");
+            let provider = resolve_codex_target_provider(&raw_toml);
             let orig_toml_url = if let Some(p) = provider.as_deref() {
                 read_toml_string_key(&raw_toml, &["model_providers", p], "base_url")
             } else {
@@ -2401,9 +2542,10 @@ pub fn connect_harness_with_deps(
                 });
                 if let Some(up) = upstream_to_save {
                     match update_config_upstream(config_path.as_deref(), slug, &route_prefix, proxy_port, Some(up)) {
-                        Ok((wrote, prev_cfg)) => {
+                        Ok((wrote, prev_cfg, added_loopback)) => {
                             backup.wrote_config_upstream = wrote;
                             backup.prev_config_upstream = prev_cfg;
+                            backup.added_loopback_target = added_loopback;
                         }
                         Err(e) => return fail_with_rollback(&backup, e),
                     }
@@ -2411,7 +2553,17 @@ pub fn connect_harness_with_deps(
             }
 
             let updated_toml = match provider.as_deref() {
-                Some(p) => set_toml_string_key(&raw_toml, &["model_providers", p], "base_url", &codex_local_url),
+                Some(p) => {
+                    let mut next =
+                        set_toml_string_key(&raw_toml, &["model_providers", p], "base_url", &codex_local_url);
+                    if read_toml_string_key(&next, &[], "openai_base_url")
+                        .as_deref()
+                        .is_some_and(|u| points_to_hidego_gateway(u, &route_prefix, proxy_port))
+                    {
+                        next = remove_toml_key(&next, &[], "openai_base_url");
+                    }
+                    next
+                }
                 None => set_toml_string_key(&raw_toml, &[], "openai_base_url", &codex_local_url),
             };
             if let Err(e) = write_atomic_secure(&toml_path, updated_toml.as_bytes()) {
@@ -2422,42 +2574,28 @@ pub fn connect_harness_with_deps(
             if let Err(e) = set_harness_env_var(host, &mut backup, "OPENAI_BASE_URL", &codex_local_url) {
                 return fail_with_rollback(&backup, e);
             }
-            if let Some(bundle) = ca_bundle_path.as_deref() {
-                if let Err(e) = set_harness_env_var(host, &mut backup, "CODEX_CA_CERTIFICATE", bundle) {
-                    return fail_with_rollback(&backup, e);
-                }
+            if host.user_env_get("CODEX_CA_CERTIFICATE").is_some() {
+                let _ = host.user_env_remove("CODEX_CA_CERTIFICATE");
             }
-            if let Err(e) = apply_shared_proxy_and_ca_leases(
-                host,
-                &mut backup,
-                slug,
-                &proxy_url,
-                ca_cert_path.as_deref(),
-                ca_bundle_path.as_deref(),
-            ) {
-                return fail_with_rollback(&backup, e);
-            }
-            targets_summary.push("Managed Env (OPENAI_BASE_URL, HTTPS_PROXY, CODEX_CA_CERTIFICATE)".to_string());
+            targets_summary.push("Managed Env (OPENAI_BASE_URL)".to_string());
         }
         HarnessKind::Antigravity => {
             let candidates = antigravity_settings_candidates(host);
-            let mut matched_paths: Vec<PathBuf> = candidates
+            let mut targets: Vec<PathBuf> = candidates
                 .iter()
                 .filter(|p| p.exists() || p.parent().and_then(Path::parent).is_some_and(Path::exists))
                 .cloned()
                 .collect();
-            if matched_paths.is_empty() && !candidates.is_empty() {
-                if let Some(first) = candidates.first() {
-                    if first.parent().and_then(Path::parent).is_some_and(Path::exists) {
-                        matched_paths.push(first.clone());
-                    }
+            if targets.is_empty() {
+                if let Some(first) = candidates.into_iter().next() {
+                    targets.push(first);
                 }
             }
             let updates = [
                 ("http.proxy", Value::String(proxy_url.clone())),
                 ("http.proxySupport", Value::String("override".to_string())),
             ];
-            for (idx, path) in matched_paths.iter().enumerate() {
+            for (idx, path) in targets.iter().enumerate() {
                 let entry = match apply_vscode_settings_file(
                     path,
                     slug,
@@ -2485,7 +2623,15 @@ pub fn connect_harness_with_deps(
             ) {
                 return fail_with_rollback(&backup, e);
             }
-            targets_summary.push("Managed Env (HTTPS_PROXY, NODE_EXTRA_CA_CERTS)".to_string());
+            match enable_config_system_proxy_chain(config_path.as_deref()) {
+                Ok(enabled_now) => {
+                    if is_fresh_connect {
+                        backup.enabled_system_proxy_chain = enabled_now;
+                    }
+                }
+                Err(e) => return fail_with_rollback(&backup, e),
+            }
+            targets_summary.push("System Proxy Chain + Managed Env (HTTPS_PROXY, NODE_EXTRA_CA_CERTS)".to_string());
         }
         HarnessKind::Zcode => {
             if let Err(e) = set_harness_env_var(host, &mut backup, "ZCODE_HTTP_PROXY", &proxy_url) {
@@ -2661,6 +2807,8 @@ fn build_vscode_terminal_env(
     }
     if let Some(bundle) = ca_bundle_path {
         out.push(("SSL_CERT_FILE", bundle.to_string()));
+        out.push(("GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", bundle.to_string()));
+        out.push(("REQUESTS_CA_BUNDLE", bundle.to_string()));
     }
     out
 }
@@ -2726,6 +2874,8 @@ fn apply_shared_proxy_and_ca_leases(
     }
     if let Some(bundle) = ca_bundle_path {
         pairs.push(("SSL_CERT_FILE", bundle));
+        pairs.push(("GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", bundle));
+        pairs.push(("REQUESTS_CA_BUNDLE", bundle));
     }
     acquire_shared_env_vars(host, backup, slug, &pairs)
 }
@@ -3092,31 +3242,26 @@ fn scrub_hidego_artifacts_on_corrupt_backup(host: &dyn HostAdapter, config_path:
             if let Some(home) = host.home_dir() {
                 let toml_path = home.join(".codex").join("config.toml");
                 if let Ok(raw) = std::fs::read_to_string(&toml_path) {
-                    let provider = read_toml_string_key(&raw, &[], "model_provider");
-                    let next = match provider.as_deref() {
-                        Some(p) => {
-                            if read_toml_string_key(&raw, &["model_providers", p], "base_url")
-                                .as_deref()
-                                .is_some_and(|u| looks_like_hidego_local_url(u, Some("/codex")))
-                            {
-                                Some(remove_toml_key(&raw, &["model_providers", p], "base_url"))
-                            } else {
-                                None
-                            }
+                    let mut current = raw;
+                    let mut changed = false;
+                    if let Some(p) = resolve_codex_target_provider(&current) {
+                        if read_toml_string_key(&current, &["model_providers", &p], "base_url")
+                            .as_deref()
+                            .is_some_and(|u| looks_like_hidego_local_url(u, Some("/codex")))
+                        {
+                            current = remove_toml_key(&current, &["model_providers", &p], "base_url");
+                            changed = true;
                         }
-                        None => {
-                            if read_toml_string_key(&raw, &[], "openai_base_url")
-                                .as_deref()
-                                .is_some_and(|u| looks_like_hidego_local_url(u, Some("/codex")))
-                            {
-                                Some(remove_toml_key(&raw, &[], "openai_base_url"))
-                            } else {
-                                None
-                            }
-                        }
-                    };
-                    if let Some(cleaned) = next {
-                        let _ = write_atomic_secure(&toml_path, cleaned.as_bytes());
+                    }
+                    if read_toml_string_key(&current, &[], "openai_base_url")
+                        .as_deref()
+                        .is_some_and(|u| looks_like_hidego_local_url(u, Some("/codex")))
+                    {
+                        current = remove_toml_key(&current, &[], "openai_base_url");
+                        changed = true;
+                    }
+                    if changed {
+                        let _ = write_atomic_secure(&toml_path, current.as_bytes());
                     }
                 }
             }
@@ -3167,7 +3312,12 @@ fn scrub_hidego_artifacts_on_corrupt_backup(host: &dyn HostAdapter, config_path:
     if let Some(path) = config_path {
         if path.exists() {
             let mut cfg = HideConfig::load_or_create(path);
-            if cfg.harness_upstreams.remove(slug).is_some() {
+            let mut changed = cfg.harness_upstreams.remove(slug).is_some();
+            if kind == HarnessKind::Antigravity && cfg.system_proxy_chain {
+                cfg.system_proxy_chain = false;
+                changed = true;
+            }
+            if changed {
                 let _ = cfg.save(path);
             }
         }
@@ -3219,6 +3369,7 @@ pub fn connect_all_detected_with_deps(
 
 /// Restore every harness currently backed up by Hide-Go (used during uninstall).
 pub fn disconnect_all_managed() -> Vec<HarnessActionResult> {
+    let _ = crate::system_proxy::restore_system_proxy();
     disconnect_all_managed_with_deps(&RealHostAdapter, HideConfig::default_path())
 }
 
@@ -3447,11 +3598,12 @@ mod tests {
         assert!(edited.contains("# user codex config"));
         assert!(edited.contains("base_url = \"http://127.0.0.1:18787/codex/v1\" # keep comment"));
         assert!(edited.contains("wire_api = \"responses\""));
-        assert!(host.env.borrow().contains_key("CODEX_CA_CERTIFICATE"));
         assert_eq!(
-            host.env.borrow().get("HTTPS_PROXY").map(String::as_str),
-            Some("http://127.0.0.1:18787")
+            host.env.borrow().get("OPENAI_BASE_URL").map(String::as_str),
+            Some("http://127.0.0.1:18787/codex/v1")
         );
+        assert!(!host.env.borrow().contains_key("CODEX_CA_CERTIFICATE"));
+        assert!(!host.env.borrow().contains_key("HTTPS_PROXY"));
 
         let cfg = HideConfig::load_or_create(&tmp.path().join("hide-go").join("config.json"));
         assert_eq!(
@@ -3462,15 +3614,128 @@ mod tests {
         let profiles = detect_all_harness_profiles_with(&host, 18787, &HashMap::new());
         let codex = profiles.iter().find(|p| p.kind == HarnessKind::Codex).unwrap();
         assert!(codex.configured);
-        assert!(codex.requires_ca_trust);
+        assert!(!codex.requires_ca_trust);
 
         let disc = disconnect_isolated(&host, HarnessKind::Codex);
         assert!(disc.ok && !disc.connected);
         assert_eq!(std::fs::read_to_string(&toml_path).unwrap(), original_toml);
+        assert!(!host.env.borrow().contains_key("OPENAI_BASE_URL"));
         assert!(!host.env.borrow().contains_key("CODEX_CA_CERTIFICATE"));
         assert!(!host.env.borrow().contains_key("HTTPS_PROXY"));
         let cfg_after = HideConfig::load_or_create(&tmp.path().join("hide-go").join("config.json"));
         assert!(!cfg_after.harness_upstreams.contains_key("codex"));
+    }
+
+    #[test]
+    fn codex_without_top_model_provider_updates_custom_provider_and_loopback_target() {
+        let tmp = TempDir::new();
+        let host = MockHost::new(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        let toml_path = tmp.path().join(".codex").join("config.toml");
+        let original_toml = concat!(
+            "model = \"gpt-5.4\"\n",
+            "openai_base_url = \"http://127.0.0.1:18787/codex/v1\"\n\n",
+            "[model_providers.custom]\n",
+            "name = \"custom\"\n",
+            "base_url = \"http://127.0.0.1:15721/v1\"\n",
+            "wire_api = \"responses\"\n",
+        );
+        std::fs::write(&toml_path, original_toml).unwrap();
+
+        // Initially NOT configured because `[model_providers.custom].base_url` still bypasses Hide-Go.
+        let before = detect_all_harness_profiles_with(&host, 18787, &HashMap::new());
+        assert!(!before.iter().find(|p| p.kind == HarnessKind::Codex).unwrap().configured);
+
+        let ca = Arc::new(MockCaTrustAdapter::new());
+        let conn = connect_isolated(&host, ca, HarnessKind::Codex, 18787);
+        assert!(conn.ok && conn.connected, "{}", conn.message);
+
+        let edited = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(
+            edited.contains("base_url = \"http://127.0.0.1:18787/codex/v1\""),
+            "{edited}"
+        );
+        assert!(
+            !edited.contains("openai_base_url = \"http://127.0.0.1:18787/codex/v1\""),
+            "{edited}"
+        );
+
+        let cfg = HideConfig::load_or_create(&tmp.path().join("hide-go").join("config.json"));
+        assert_eq!(
+            cfg.harness_upstreams.get("codex").map(String::as_str),
+            Some("http://127.0.0.1:15721")
+        );
+        assert!(
+            cfg.allowed_loopback_proxy_targets
+                .iter()
+                .any(|t| t == "127.0.0.1:15721"),
+            "{:?}",
+            cfg.allowed_loopback_proxy_targets
+        );
+
+        let after_conn = detect_all_harness_profiles_with(&host, 18787, &HashMap::new());
+        assert!(
+            after_conn
+                .iter()
+                .find(|p| p.kind == HarnessKind::Codex)
+                .unwrap()
+                .configured
+        );
+
+        let disc = disconnect_isolated(&host, HarnessKind::Codex);
+        assert!(disc.ok && !disc.connected);
+        let restored = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(
+            restored.contains("base_url = \"http://127.0.0.1:15721/v1\""),
+            "{restored}"
+        );
+        let cfg_after = HideConfig::load_or_create(&tmp.path().join("hide-go").join("config.json"));
+        assert!(!cfg_after.harness_upstreams.contains_key("codex"));
+        assert!(cfg_after.allowed_loopback_proxy_targets.is_empty());
+    }
+
+    #[test]
+    fn claude_code_connect_and_disconnect_never_pollutes_managed_env_with_upstream_url() {
+        let tmp = TempDir::new();
+        let host = MockHost::new(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        let settings_path = tmp.path().join(".claude").join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://anyrouter.top","HTTPS_PROXY":"http://127.0.0.1:18765"}}"#,
+        )
+        .unwrap();
+        // Simulate a stale poisoned entry in managed env.ps1 before connect.
+        host.env
+            .borrow_mut()
+            .insert("ANTHROPIC_BASE_URL".to_string(), "https://anyrouter.top".to_string());
+
+        let ca = Arc::new(MockCaTrustAdapter::new());
+        let conn = connect_isolated(&host, ca, HarnessKind::ClaudeCode, 18787);
+        assert!(conn.ok && conn.connected);
+        assert!(
+            !host.env.borrow().contains_key("ANTHROPIC_BASE_URL"),
+            "stale managed ANTHROPIC_BASE_URL should be cleared on connect"
+        );
+        let settings: Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:18787/claude-code"
+        );
+        let cfg = HideConfig::load_or_create(&tmp.path().join("hide-go").join("config.json"));
+        assert_eq!(
+            cfg.harness_upstreams.get("claude-code").map(String::as_str),
+            Some("https://anyrouter.top")
+        );
+
+        let disc = disconnect_isolated(&host, HarnessKind::ClaudeCode);
+        assert!(disc.ok && !disc.connected);
+        let restored: Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(restored["env"]["ANTHROPIC_BASE_URL"], "https://anyrouter.top");
+        assert!(
+            !host.env.borrow().contains_key("ANTHROPIC_BASE_URL"),
+            "disconnect must never write settings.json ANTHROPIC_BASE_URL into managed env"
+        );
     }
 
     #[test]
@@ -3567,7 +3832,10 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".grok")).unwrap();
 
         let ca = Arc::new(MockCaTrustAdapter::new());
-        assert!(connect_isolated(&host, ca.clone(), HarnessKind::Antigravity, 18787).ok);
+        let ag_res = connect_isolated(&host, ca.clone(), HarnessKind::Antigravity, 18787);
+        assert!(ag_res.ok && ag_res.connected, "{}", ag_res.message);
+        let cfg_after = HideConfig::load_or_create(&tmp.path().join("hide-go").join("config.json"));
+        assert!(cfg_after.system_proxy_chain);
         assert!(connect_isolated(&host, ca.clone(), HarnessKind::Zcode, 18787).ok);
         assert!(connect_isolated(&host, ca.clone(), HarnessKind::GrokBuild, 18787).ok);
 
@@ -3582,13 +3850,10 @@ mod tests {
         );
 
         let profiles = detect_all_harness_profiles_with(&host, 18787, &HashMap::new());
-        assert!(
-            profiles
-                .iter()
-                .find(|p| p.kind == HarnessKind::Antigravity)
-                .unwrap()
-                .configured
-        );
+        let ag_profile = profiles.iter().find(|p| p.kind == HarnessKind::Antigravity).unwrap();
+        assert!(ag_profile.configured);
+        assert_eq!(ag_profile.auto_connect_mode, AutoConnectMode::ConfigFile);
+        assert!(ag_profile.requires_ca_trust);
         assert!(
             profiles
                 .iter()
@@ -3605,6 +3870,8 @@ mod tests {
         );
 
         disconnect_all_managed_with_deps(&host, Some(tmp.path().join("hide-go").join("config.json")));
+        let cfg_restored = HideConfig::load_or_create(&tmp.path().join("hide-go").join("config.json"));
+        assert!(!cfg_restored.system_proxy_chain);
         assert!(!host.env.borrow().contains_key("ZCODE_HTTP_PROXY"));
         assert!(!host.env.borrow().contains_key("GROK_XAI_API_BASE_URL"));
         assert!(!host.env.borrow().contains_key("HTTPS_PROXY"));

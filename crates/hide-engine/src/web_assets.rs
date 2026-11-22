@@ -225,6 +225,34 @@ impl UiBundle {
         Ok(Self { html, assets })
     }
 
+    pub fn from_embedded(
+        html: &'static str,
+        embedded_assets: &[(&'static str, &'static str, &'static [u8])],
+    ) -> Result<Self, String> {
+        if !html.contains("</head>") {
+            return Err("Embedded UI HTML is missing </head>".to_string());
+        }
+        let linked = parse_linked_assets(html)?;
+        let mut assets = HashMap::with_capacity(embedded_assets.len());
+        for &(url, content_type, bytes) in embedded_assets {
+            assets.insert(url.to_string(), (content_type, bytes.to_vec()));
+        }
+        for (url, expected_mime) in linked {
+            match assets.get(&url) {
+                Some(&(actual_mime, ref data)) if !data.is_empty() => {
+                    if actual_mime != expected_mime {
+                        return Err(format!("Embedded asset {url} has unexpected MIME type {actual_mime}"));
+                    }
+                }
+                _ => return Err(format!("Missing embedded UI asset {url}")),
+            }
+        }
+        Ok(Self {
+            html: html.to_string(),
+            assets,
+        })
+    }
+
     pub fn render_html(&self, sys_locale: &str, nonce: &str, token_var: &str, token: &str) -> String {
         let token_json = serde_json::to_string(token)
             .expect("admin token must serialize as JSON string")

@@ -44,7 +44,7 @@ function matchesAction(action: string, filter: ActionFilter) {
     case 'blocked':
       return tone.tone === 'warn';
     case 'passed':
-      return action === 'passed';
+      return action === 'passed' || action === 'protobuf-passed' || action === 'protobuf-audited';
     case 'error':
       return tone.tone === 'danger';
   }

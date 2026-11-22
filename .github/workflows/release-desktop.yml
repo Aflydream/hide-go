@@ -46,21 +46,21 @@ jobs:
           - os: ubuntu-latest
             pkg_os: linux
             target: x86_64-unknown-linux-gnu
-            package_dir: Hide-Go-Setup-linux-x86_64
-            archive_name: Hide-Go-Setup-linux-x86_64.tar.gz
-            archive_format: tar.gz
+            artifact_group: Hide-Go-Setup-linux-x86_64
+            artifact_name: Hide-Go-Setup-linux-x86_64.tar.gz
+            artifact_format: tar.gz
           - os: macos-latest
             pkg_os: macos
             target: aarch64-apple-darwin
-            package_dir: Hide-Go-Setup-macos-arm64
-            archive_name: Hide-Go-Setup-macos-arm64.tar.gz
-            archive_format: tar.gz
+            artifact_group: Hide-Go-Setup-macos-arm64
+            artifact_name: Hide-Go-Setup-macos-arm64.tar.gz
+            artifact_format: tar.gz
           - os: windows-latest
             pkg_os: windows
             target: x86_64-pc-windows-msvc
-            package_dir: Hide-Go-Setup-windows-x64
-            archive_name: Hide-Go-Setup-windows-x64.zip
-            archive_format: zip
+            artifact_group: Hide-Go-Setup-windows-x64
+            artifact_name: Hide-Go-Setup-windows-x64.exe
+            artifact_format: exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -79,15 +79,76 @@ jobs:
           npm ci
           npm run build
       - name: Build shared runtime libraries and launchers
-        run: cargo build --release --locked -p hide-chrome -p hide-engine -p hide-go-desktop -p hide-daemon -p hide-setup --target ${{ matrix.target }}
-      - name: Package setup archive and checksum
-        run: node scripts/package-setup.mjs --target "${{ matrix.target }}" --os "${{ matrix.pkg_os }}" --package-dir "${{ matrix.package_dir }}" --archive "${{ matrix.archive_name }}" --format "${{ matrix.archive_format }}"
+        run: cargo build --release --locked -p hide-chrome -p hide-engine -p hide-go-desktop -p hide-daemon --target ${{ matrix.target }}
+      - name: Sign Windows runtime binaries
+        if: matrix.os == 'windows-latest' && env.WINDOWS_CERT_PFX_BASE64 != ''
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe not found on Windows runner" }
+          $pfxPath = Join-Path $env:RUNNER_TEMP "hide-go-cert.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          try {
+            $relDir = "target/${{ matrix.target }}/release"
+            $targets = @(
+              (Join-Path $relDir "hide_chrome.dll"),
+              (Join-Path $relDir "hide_engine.dll"),
+              (Join-Path $relDir "hide-go-desktop.exe"),
+              (Join-Path $relDir "hide-go-daemon.exe")
+            )
+            foreach ($f in $targets) {
+              if (-not (Test-Path $f)) { throw "Missing binary to sign: $f" }
+              if ($env:WINDOWS_CERT_PASSWORD) {
+                & $signtool sign /f $pfxPath /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $f
+              } else {
+                & $signtool sign /f $pfxPath /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $f
+              }
+              if ($LASTEXITCODE -ne 0) { throw "signtool failed for $f with exit code $LASTEXITCODE" }
+            }
+          } finally {
+            Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+          }
+      - name: Stage embedded payload archive
+        run: node scripts/package-setup.mjs --mode stage-payload --os "${{ matrix.pkg_os }}" --target "${{ matrix.target }}" --out "target/pkg/app-${{ matrix.pkg_os }}.tar.gz"
+      - name: Build standalone installer
+        env:
+          HIDE_GO_EMBED_PAYLOAD_ARCHIVE: target/pkg/app-${{ matrix.pkg_os }}.tar.gz
+        run: cargo build --release --locked -p hide-setup --target ${{ matrix.target }}
+      - name: Package setup release artifact and checksum
+        run: node scripts/package-setup.mjs --mode release-setup --os "${{ matrix.pkg_os }}" --target "${{ matrix.target }}" --out "${{ matrix.artifact_name }}" --format "${{ matrix.artifact_format }}"
+      - name: Sign Windows standalone installer and refresh checksum
+        if: matrix.os == 'windows-latest' && env.WINDOWS_CERT_PFX_BASE64 != ''
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe not found on Windows runner" }
+          $pfxPath = Join-Path $env:RUNNER_TEMP "hide-go-cert.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          try {
+            $exe = "${{ matrix.artifact_name }}"
+            if ($env:WINDOWS_CERT_PASSWORD) {
+              & $signtool sign /f $pfxPath /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exe
+            } else {
+              & $signtool sign /f $pfxPath /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exe
+            }
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed for $exe with exit code $LASTEXITCODE" }
+            $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+            [IO.File]::WriteAllText("$exe.sha256", "$hash  $exe`n", (New-Object System.Text.UTF8Encoding($false)))
+          } finally {
+            Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+          }
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.package_dir }}
+          name: ${{ matrix.artifact_group }}
           path: |
-            ${{ matrix.archive_name }}
-            ${{ matrix.archive_name }}.sha256
+            ${{ matrix.artifact_name }}
+            ${{ matrix.artifact_name }}.sha256
 
   release:
     # Releases are cut only from version tags, so every binary matches its tagged source.

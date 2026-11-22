@@ -6,10 +6,12 @@ import type {
   HarnessKind,
   HarnessProfile,
   HideConfig,
+  MitmHostsResponse,
   RuleValidation,
   TrafficAuditRecord,
   TrafficCategory,
   TrafficSummary,
+  UpdateCheckResult,
   VaultEntry,
 } from '../types';
 
@@ -108,6 +110,7 @@ export const api = {
     const res = await authorizedFetch('/api/ca/cert');
     return await res.blob();
   },
+  getMitmHosts: () => request<MitmHostsResponse>('/api/mitm/hosts'),
   vault: () => request<VaultEntry[]>('/api/vault'),
   clearVault: () => request<void>('/api/vault', { method: 'DELETE' }),
   simulate: (harness: HarnessKind, category: TrafficCategory, customPayload?: string) =>
@@ -117,4 +120,6 @@ export const api = {
     }),
   validateRule: (pattern: string, sample?: string) =>
     request<RuleValidation>('/api/rules/validate', { method: 'POST', body: JSON.stringify({ pattern, sample }) }),
+  checkUpdates: (force = false) =>
+    request<UpdateCheckResult>(`/api/updates/check${force ? '?force=true' : ''}`),
 };

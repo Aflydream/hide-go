@@ -191,6 +191,10 @@ fn default_upstream_idle_timeout_secs() -> u64 {
     DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS
 }
 
+fn default_auto_check_updates() -> bool {
+    true
+}
+
 /// Interface language preference persisted in `config.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum UiLanguage {
@@ -241,6 +245,10 @@ pub struct HideConfig {
     pub upstream_idle_timeout_secs: u64,
     #[serde(default)]
     pub auto_trust_ca: bool,
+    #[serde(default = "default_auto_check_updates")]
+    pub auto_check_updates: bool,
+    #[serde(default)]
+    pub system_proxy_chain: bool,
     #[serde(default)]
     pub harness_upstreams: HashMap<String, String>,
 }
@@ -282,6 +290,8 @@ impl Default for HideConfig {
             allowed_loopback_proxy_targets: Vec::new(),
             upstream_idle_timeout_secs: default_upstream_idle_timeout_secs(),
             auto_trust_ca: false,
+            auto_check_updates: default_auto_check_updates(),
+            system_proxy_chain: false,
             harness_upstreams: HashMap::new(),
         }
     }

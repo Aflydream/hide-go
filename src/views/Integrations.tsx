@@ -1,19 +1,19 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { ArrowsClockwise, ArrowRight, CheckCircle, DownloadSimple, LinkBreak, LinkSimple, Play, ShieldCheck, Terminal } from '@phosphor-icons/react';
+import { ArrowsClockwise, ArrowRight, CheckCircle, DownloadSimple, LinkBreak, LinkSimple, Play, Plus, ShieldCheck, Terminal, X } from '@phosphor-icons/react';
 import { useStore } from '../store';
 import { api } from '../lib/api';
-import { Badge, Button, Callout, CopyButton, Segmented, Skeleton, cx, useToast } from '../components/ui';
+import { Badge, Button, Callout, CopyButton, Segmented, Skeleton, Switch, cx, inputClass, useToast } from '../components/ui';
 import { formatCount, proxyBase } from '../lib/format';
 import { localizeHarnessIntegrationNote, localizeHarnessTargets, translate, useI18n, type Locale } from '../lib/i18n';
-import type { CaStatus, HarnessKind, HarnessProfile } from '../types';
+import type { CaStatus, HarnessKind, HarnessProfile, MitmHostsResponse } from '../types';
 import { useSimulate } from './SimulateDialog';
 
 type Shell = 'bash' | 'powershell';
 
 const FALLBACK_TARGETS: Partial<Record<HarnessProfile['kind'], string[]>> = {
   'claude-code': ['~/.claude/settings.json'],
-  codex: ['~/.codex/config.toml', '环境变量 HTTPS_PROXY / NODE_EXTRA_CA_CERTS'],
-  antigravity: ['Antigravity IDE/User/settings.json', '环境变量 HTTPS_PROXY / NODE_EXTRA_CA_CERTS'],
+  codex: ['~/.codex/config.toml ([model_providers.*].base_url)', '环境变量 OPENAI_BASE_URL'],
+  antigravity: ['系统代理链（运行期接管，退出自动还原）', 'Antigravity User/settings.json', '环境变量 HTTPS_PROXY / NODE_EXTRA_CA_CERTS'],
   zcode: ['环境变量 ZCODE_HTTP_PROXY / ZCODE_AGENT_CA_CERT / HTTPS_PROXY / NODE_EXTRA_CA_CERTS'],
   qoder: ['Qoder/User/settings.json', 'QoderCN/User/settings.json', '环境变量 NODE_EXTRA_CA_CERTS'],
   cursor: ['Cursor/User/settings.json', '环境变量 NODE_EXTRA_CA_CERTS'],
@@ -45,23 +45,43 @@ function describeAutoConnectMode(profile: HarnessProfile, locale: Locale): strin
 function CaTrustCard({
   caStatus,
   caError,
+  mitmHosts,
+  savingConfig,
   busy,
   exporting,
   onTrust,
   onUntrust,
   onExport,
   onRetry,
+  onToggleSystemProxy,
+  onAddMitmHost,
+  onRemoveMitmHost,
 }: {
   caStatus: CaStatus | null;
   caError: string | null;
+  mitmHosts: MitmHostsResponse | null;
+  savingConfig: boolean;
   busy: boolean;
   exporting: boolean;
   onTrust: () => void;
   onUntrust: () => void;
   onExport: () => void;
   onRetry: () => void;
+  onToggleSystemProxy: (enabled: boolean) => void;
+  onAddMitmHost: (host: string) => void;
+  onRemoveMitmHost: (host: string) => void;
 }) {
   const { t } = useI18n();
+  const [hostInput, setHostInput] = useState('');
+  const extraHosts = mitmHosts?.mitmExtraHosts ?? [];
+  const observedHosts = mitmHosts?.observedHosts ?? [];
+
+  const submitHost = () => {
+    const clean = hostInput.trim().toLowerCase();
+    if (!clean) return;
+    onAddMitmHost(clean);
+    setHostInput('');
+  };
   return (
     <section aria-label={t('integrations.caSectionAria')} className="mx-auto max-w-3xl px-8 pt-6">
       <div className="rounded-md border border-line bg-surface-2 px-4 py-3.5">
@@ -165,6 +185,8 @@ function CaTrustCard({
               {', '}
               <code className="font-mono text-fg-muted">generativelanguage.googleapis.com</code>
               {', '}
+              <code className="font-mono text-fg-muted">cloudcode-pa.googleapis.com</code>
+              {', '}
               <code className="font-mono text-fg-muted">api2.cursor.sh</code>
               {', '}
               <code className="font-mono text-fg-muted">*.qoder.*</code>
@@ -172,6 +194,101 @@ function CaTrustCard({
               <code className="font-mono text-fg-muted">api.x.ai</code>
               {t('integrations.caHostsAfter')}
             </p>
+            {mitmHosts?.systemProxySupported && (
+              <div className="flex items-center justify-between gap-3 border-t border-line pt-2 text-xs">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="truncate text-fg-muted">{t('integrations.sysProxyLabel')}</span>
+                  <Badge tone={mitmHosts.systemProxyActive ? 'brand' : 'neutral'} dot>
+                    {t(mitmHosts.systemProxyActive ? 'integrations.sysProxyActive' : 'integrations.sysProxyInactive')}
+                  </Badge>
+                </div>
+                <Switch
+                  checked={mitmHosts.systemProxyChain}
+                  disabled={savingConfig}
+                  label={t('integrations.sysProxyLabel')}
+                  onChange={onToggleSystemProxy}
+                />
+              </div>
+            )}
+            <div className="space-y-2 border-t border-line pt-2 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-fg-subtle">{t('integrations.customMitmHostsLabel')}</span>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    value={hostInput}
+                    onChange={(e) => setHostInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        submitHost();
+                      }
+                    }}
+                    placeholder={t('integrations.customMitmHostPlaceholder')}
+                    className={cx(inputClass, 'h-7 w-56 font-mono text-xs')}
+                  />
+                  <Button size="sm" variant="secondary" icon={<Plus size={12} />} disabled={savingConfig || !hostInput.trim()} onClick={submitHost}>
+                    {t('integrations.addHostBtn')}
+                  </Button>
+                </div>
+              </div>
+              {extraHosts.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {extraHosts.map((h) => (
+                    <span
+                      key={h}
+                      className="inline-flex items-center gap-1 rounded border border-line bg-surface px-2 py-0.5 font-mono text-2xs text-fg"
+                    >
+                      {h}
+                      <button
+                        type="button"
+                        aria-label={t('integrations.removeHostAria', { host: h })}
+                        onClick={() => onRemoveMitmHost(h)}
+                        disabled={savingConfig}
+                        className="cursor-pointer text-fg-subtle hover:text-danger disabled:opacity-50"
+                      >
+                        <X size={11} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="space-y-1.5 border-t border-line pt-2">
+                <span className="text-fg-subtle">{t('integrations.observedHostsLabel')}</span>
+                {observedHosts.length === 0 ? (
+                  <p className="text-2xs text-fg-subtle">{t('integrations.observedEmpty')}</p>
+                ) : (
+                  <div className="flex flex-wrap gap-1.5">
+                    {observedHosts.slice(0, 12).map((item) => {
+                      const alreadyExtra = extraHosts.some((e) => e.toLowerCase() === item.host.toLowerCase());
+                      return (
+                        <span
+                          key={`${item.host}:${item.port}`}
+                          className="inline-flex items-center gap-1.5 rounded border border-line bg-surface px-2 py-0.5 text-2xs"
+                        >
+                          <code className="font-mono text-fg-muted">{item.host}</code>
+                          {item.tlsFailed ? (
+                            <Badge tone="danger">{t('integrations.observedTlsFailed')}</Badge>
+                          ) : item.mitm ? (
+                            <Badge tone="brand">{t('integrations.observedMitmBadge')}</Badge>
+                          ) : !alreadyExtra ? (
+                            <button
+                              type="button"
+                              disabled={savingConfig}
+                              onClick={() => onAddMitmHost(item.host)}
+                              className="inline-flex cursor-pointer items-center gap-0.5 font-medium text-brand hover:underline disabled:opacity-50"
+                            >
+                              <Plus size={10} />
+                              {t('integrations.observedAddMitm')}
+                            </button>
+                          ) : null}
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
             {caStatus && (
               <div className="space-y-1 border-t border-line pt-2 text-xs">
                 <div className="flex items-center justify-between gap-3">
@@ -293,6 +410,15 @@ function ToolDetail({
       <header className="pb-5">
         <div className="flex flex-wrap items-center gap-2">
           <h2 className="text-lg font-semibold text-fg">{profile.name}</h2>
+          {profile.autoConnectMode === 'manual' ? (
+            <Badge tone="neutral">{t('integrations.transportLimited')}</Badge>
+          ) : profile.requiresCaTrust ? (
+            <Badge tone={caStatus?.installedInOsStore ? 'brand' : 'warn'}>
+              {t(caStatus?.installedInOsStore ? 'integrations.transportMitmTrusted' : 'integrations.transportMitmUntrusted')}
+            </Badge>
+          ) : (
+            <Badge tone="brand">{t('integrations.transportBaseUrl')}</Badge>
+          )}
           {profile.installed ? (
             <Badge tone="brand">{t('integrations.badgeInstalled')}</Badge>
           ) : (
@@ -351,17 +477,19 @@ function ToolDetail({
         index="01"
         title={t('integrations.blockConnectTitle')}
         aside={
-          profile.autoConnectMode !== 'manual' && (
+          (profile.autoConnectMode !== 'manual' || profile.configured) && (
             <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                variant={profile.configured ? 'secondary' : 'primary'}
-                icon={<LinkSimple size={14} />}
-                disabled={connecting}
-                onClick={handleConnect}
-              >
-                {t(profile.configured ? 'integrations.reapplyConfig' : 'integrations.autoConnect')}
-              </Button>
+              {profile.autoConnectMode !== 'manual' && (
+                <Button
+                  size="sm"
+                  variant={profile.configured ? 'secondary' : 'primary'}
+                  icon={<LinkSimple size={14} />}
+                  disabled={connecting}
+                  onClick={handleConnect}
+                >
+                  {t(profile.configured ? 'integrations.reapplyConfig' : 'integrations.autoConnect')}
+                </Button>
+              )}
               {profile.configured && (
                 <Button size="sm" icon={<LinkBreak size={14} />} disabled={connecting} onClick={handleDisconnect}>
                   {t('integrations.disconnect')}
@@ -508,7 +636,7 @@ function ToolDetail({
 }
 
 export function Integrations() {
-  const { harnesses, refreshHarnesses, config, logs, params, navigate } = useStore();
+  const { harnesses, refreshHarnesses, config, saveConfig, saving, logs, params, navigate } = useStore();
   const { t } = useI18n();
   const toast = useToast();
   const [shell, setShell] = useState<Shell>(() => (/win/i.test(navigator.platform) ? 'powershell' : 'bash'));
@@ -516,14 +644,16 @@ export function Integrations() {
   const [connectingAll, setConnectingAll] = useState(false);
   const [caStatus, setCaStatus] = useState<CaStatus | null>(null);
   const [caError, setCaError] = useState<string | null>(null);
+  const [mitmHosts, setMitmHosts] = useState<MitmHostsResponse | null>(null);
   const [caBusy, setCaBusy] = useState(false);
   const [exportingCert, setExportingCert] = useState(false);
   const selected = harnesses.find((h) => h.kind === params.get('tool')) ?? harnesses[0] ?? null;
 
   const refreshCaStatus = useCallback(async () => {
     try {
-      const next = await api.getCaStatus();
-      setCaStatus(next);
+      const [nextCa, nextHosts] = await Promise.all([api.getCaStatus(), api.getMitmHosts().catch(() => null)]);
+      setCaStatus(nextCa);
+      if (nextHosts) setMitmHosts(nextHosts);
       setCaError(null);
     } catch (e) {
       setCaError((e as Error).message);
@@ -663,6 +793,38 @@ export function Integrations() {
     }
   };
 
+  const handleToggleSystemProxy = async (enabled: boolean) => {
+    const ok = await saveConfig({ ...config, systemProxyChain: enabled });
+    if (ok) {
+      await refreshCaStatus();
+    }
+  };
+
+  const handleAddMitmHost = async (rawHost: string) => {
+    const clean = rawHost.trim().toLowerCase().replace(/^https?:\/\//, '').split('/')[0]?.split(':')[0] ?? '';
+    if (!clean) return;
+    const prev = config.mitmExtraHosts ?? [];
+    if (prev.some((h) => h.toLowerCase() === clean)) return;
+    const ok = await saveConfig(
+      { ...config, mitmExtraHosts: [...prev, clean] },
+      t('integrations.mitmHostAdded', { host: clean }),
+    );
+    if (ok) {
+      await refreshCaStatus();
+    }
+  };
+
+  const handleRemoveMitmHost = async (host: string) => {
+    const prev = config.mitmExtraHosts ?? [];
+    const ok = await saveConfig(
+      { ...config, mitmExtraHosts: prev.filter((h) => h.toLowerCase() !== host.toLowerCase()) },
+      t('integrations.mitmHostRemoved', { host }),
+    );
+    if (ok) {
+      await refreshCaStatus();
+    }
+  };
+
   return (
     <div className="grid h-full min-h-0 grid-cols-[280px_minmax(0,1fr)]">
       <nav aria-label={t('integrations.navAria')} className="flex min-h-0 flex-col border-r border-line bg-surface">
@@ -741,13 +903,35 @@ export function Integrations() {
         <CaTrustCard
           caStatus={caStatus}
           caError={caError}
+          mitmHosts={mitmHosts}
+          savingConfig={saving}
           busy={caBusy}
           exporting={exportingCert}
           onTrust={handleTrustCa}
           onUntrust={handleUntrustCa}
           onExport={handleExportCert}
           onRetry={refreshCaStatus}
+          onToggleSystemProxy={handleToggleSystemProxy}
+          onAddMitmHost={handleAddMitmHost}
+          onRemoveMitmHost={handleRemoveMitmHost}
         />
+        <section aria-label={t('integrations.compatTitle')} className="mx-auto max-w-3xl px-8 pt-3">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-line bg-surface-2 px-4 py-2.5 text-xs">
+            <span className="font-medium text-fg">{t('integrations.compatTitle')}</span>
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="inline-flex items-center gap-1.5">
+                <span className="text-fg-subtle">{t('integrations.compatOpenAi')}</span>
+                <code className="font-mono text-brand">{`${proxyBase(config.proxyPort)}/codex/v1`}</code>
+                <CopyButton compact text={`${proxyBase(config.proxyPort)}/codex/v1`} label={t('integrations.copyEntry')} />
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <span className="text-fg-subtle">{t('integrations.compatAnthropic')}</span>
+                <code className="font-mono text-brand">{`${proxyBase(config.proxyPort)}/claude-code`}</code>
+                <CopyButton compact text={`${proxyBase(config.proxyPort)}/claude-code`} label={t('integrations.copyEntry')} />
+              </span>
+            </div>
+          </div>
+        </section>
         <ToolDetail
           key={selected.kind}
           profile={selected}
