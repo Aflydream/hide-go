@@ -37,6 +37,7 @@ struct DesensitizeCtx<'a> {
     scope: Option<&'a str>,
     matcher: Option<Arc<Matcher>>,
     findings: &'a mut Vec<LeakFinding>,
+    mutated: bool,
 }
 
 impl<'a> DesensitizeCtx<'a> {
@@ -85,13 +86,19 @@ impl SemanticDesensitizer {
             scope,
             matcher: None,
             findings: &mut findings,
+            mutated: false,
         };
         let trimmed = payload.trim();
         if trimmed.starts_with(['{', '[', '"']) {
             if let Ok(mut json_val) = serde_json::from_str::<Value>(trimmed) {
                 Self::desensitize_json_value_depth(&mut json_val, &mut dctx, 0);
+                let transformed_payload = if dctx.mutated || !findings.is_empty() {
+                    reserialize_like(trimmed, &json_val)
+                } else {
+                    payload.to_string()
+                };
                 return DesensitizeResult {
-                    transformed_payload: reserialize_like(trimmed, &json_val),
+                    transformed_payload,
                     findings,
                 };
             }
@@ -106,7 +113,11 @@ impl SemanticDesensitizer {
     fn desensitize_json_value_depth(val: &mut Value, dctx: &mut DesensitizeCtx<'_>, depth: usize) {
         if depth >= MAX_JSON_DEPTH {
             if let Value::String(s) = val {
-                *s = Self::desensitize_text_ctx(s, dctx);
+                let next = Self::desensitize_text_ctx(s, dctx);
+                if next != *s {
+                    dctx.mutated = true;
+                    *s = next;
+                }
             }
             return;
         }
@@ -118,7 +129,22 @@ impl SemanticDesensitizer {
                     if map.get("type").and_then(Value::as_str) == Some("thinking") {
                         if let Some(Value::String(t)) = map.get_mut("thinking") {
                             let matcher = dctx.current_matcher();
-                            *t = matcher.reseal(t);
+                            let resealed = matcher.reseal(t);
+                            if resealed != *t {
+                                dctx.mutated = true;
+                                *t = resealed;
+                            }
+                        }
+                    } else if map.get("thought").and_then(Value::as_bool) == Some(true)
+                        && (map.contains_key("thoughtSignature") || map.contains_key("thought_signature"))
+                    {
+                        if let Some(Value::String(t)) = map.get_mut("text") {
+                            let matcher = dctx.current_matcher();
+                            let resealed = matcher.reseal(t);
+                            if resealed != *t {
+                                dctx.mutated = true;
+                                *t = resealed;
+                            }
                         }
                     }
                     return;
@@ -134,7 +160,11 @@ impl SemanticDesensitizer {
                         continue;
                     }
                     let sensitive_field = protect_secrets && is_sensitive_secret_key(&key);
-                    let key = Self::desensitize_text_ctx(&key, dctx);
+                    let new_key = Self::desensitize_text_ctx(&key, dctx);
+                    if new_key != key {
+                        dctx.mutated = true;
+                    }
+                    let key = new_key;
                     let secret = match &value {
                         Value::String(raw)
                             if sensitive_field
@@ -161,6 +191,7 @@ impl SemanticDesensitizer {
                             Some(&value),
                             dctx,
                         );
+                        dctx.mutated = true;
                         value = Value::String(token);
                     } else {
                         Self::desensitize_json_value_depth(&mut value, dctx, depth + 1);
@@ -175,12 +206,22 @@ impl SemanticDesensitizer {
                 let st = s.trim();
                 if st.starts_with(['{', '[']) && depth + 1 < MAX_JSON_DEPTH {
                     if let Ok(mut inner) = serde_json::from_str::<Value>(st) {
+                        let prev_mutated = dctx.mutated;
+                        dctx.mutated = false;
                         Self::desensitize_json_value_depth(&mut inner, dctx, depth + 1);
-                        *s = reserialize_like(st, &inner);
+                        let inner_mutated = dctx.mutated;
+                        dctx.mutated = prev_mutated || inner_mutated;
+                        if inner_mutated {
+                            *s = reserialize_like(st, &inner);
+                        }
                         return;
                     }
                 }
-                *s = Self::desensitize_text_ctx(s, dctx);
+                let next = Self::desensitize_text_ctx(s, dctx);
+                if next != *s {
+                    dctx.mutated = true;
+                    *s = next;
+                }
             }
             _ => {}
         }
@@ -210,6 +251,7 @@ impl SemanticDesensitizer {
             for span in &mut spans {
                 Self::extend_to_token_boundary(text, span, dctx.config);
             }
+            spans.retain(|s| !existing.iter().any(|&(a, b)| s.start < b && a < s.end));
 
             let mut out = String::with_capacity(text.len());
             let mut last = 0;
@@ -236,6 +278,9 @@ impl SemanticDesensitizer {
             existing
         };
         let (remasked, remask_hits) = matcher.remask_secrets(&after_regex, &remask_existing);
+        if did_replace_spans || !remask_hits.is_empty() {
+            dctx.mutated = true;
+        }
         for (raw_secret, token, count) in remask_hits {
             Self::record_finding(
                 dctx.findings,
@@ -323,7 +368,12 @@ impl SemanticDesensitizer {
             Some(value) => vault.get_or_insert_json_value_scoped_unique(scope, value, &category_key, generator),
             None => vault.get_or_insert_scoped_unique(scope, raw_val, &category_key, generator),
         };
-        if inserted_new {
+        let mut alias_inserted = false;
+        if kind == FindingKind::ProjectPath {
+            alias_inserted =
+                register_windows_path_restore_aliases(vault, scope, raw_val, &replacement_token, &category_key);
+        }
+        if inserted_new || alias_inserted {
             dctx.invalidate_matcher();
         }
 
@@ -387,7 +437,14 @@ impl SemanticDesensitizer {
                 format!("{role}-{host_tag}.{tld}")
             }
             FindingKind::ProjectPath => {
-                let dir_tag = encode_from_digest(digest, 8, LOWER_ALNUM, b"pp");
+                let mut dir_tag = encode_from_digest(digest, 8, LOWER_ALNUM, b"pp");
+                if !dir_tag.bytes().any(|b| b.is_ascii_digit()) {
+                    dir_tag.pop();
+                    dir_tag.push((b'0' + (digest[30] % 10)) as char);
+                } else if !dir_tag.bytes().any(|b| b.is_ascii_lowercase()) {
+                    dir_tag.pop();
+                    dir_tag.push((b'a' + (digest[31] % 26)) as char);
+                }
                 if let Some(drive) = raw_val
                     .chars()
                     .next()
@@ -435,6 +492,55 @@ impl SemanticDesensitizer {
             }
         }
     }
+}
+
+fn register_windows_path_restore_aliases(
+    vault: &PrivacyVault,
+    scope: Option<&str>,
+    raw_val: &str,
+    token: &str,
+    category: &str,
+) -> bool {
+    let bytes = token.as_bytes();
+    if bytes.len() < 4 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return false;
+    }
+    if raw_val.len() < 3 || !raw_val.as_bytes()[0].is_ascii_alphabetic() || raw_val.as_bytes()[1] != b':' {
+        return false;
+    }
+    let drive = bytes[0] as char;
+    let alt_drive = if drive.is_ascii_uppercase() {
+        drive.to_ascii_lowercase()
+    } else {
+        drive.to_ascii_uppercase()
+    };
+    let tok_rest = &token[2..];
+    let raw_rest = &raw_val[2..];
+    let tok_slash = tok_rest.replace("\\\\", "/").replace('\\', "/");
+    let raw_slash = raw_rest.replace("\\\\", "/").replace('\\', "/");
+    let tok_back = tok_slash.replace('/', "\\");
+    let raw_back = raw_slash.replace('/', "\\");
+    let tok_dback = tok_slash.replace('/', "\\\\");
+    let raw_dback = raw_slash.replace('/', "\\\\");
+
+    let mut inserted = false;
+    for d in [drive, alt_drive] {
+        for (t_body, r_body) in [
+            (&tok_slash, &raw_slash),
+            (&tok_back, &raw_back),
+            (&tok_dback, &raw_dback),
+        ] {
+            let alias_tok = format!("{d}:{t_body}");
+            if alias_tok == token {
+                continue;
+            }
+            let alias_real = format!("{d}:{r_body}");
+            if vault.register_restore_alias_scoped(scope, &alias_tok, &alias_real, category) {
+                inserted = true;
+            }
+        }
+    }
+    inserted
 }
 
 fn format_api_key_token(raw_val: &str, digest: &[u8; 32]) -> String {
@@ -818,5 +924,55 @@ mod tests {
             .restore(&out1, None, true)
             .0;
         assert_eq!(restored, sample);
+    }
+
+    #[test]
+    fn untouched_json_stays_byte_identical_and_cloud_code_fields_and_path_aliases_work() {
+        let cfg = HideConfig::default();
+        let vault = PrivacyVault::new();
+
+        // 1. Clean JSON with non-alphabetical keys stays byte-identical (no key sorting churn)
+        let clean = r#"{"z_key":1,"a_key":"hello world"}"#;
+        let clean_res = SemanticDesensitizer::process_with_scope(clean, &cfg, &vault, Some("harness:antigravity"));
+        assert!(clean_res.findings.is_empty());
+        assert_eq!(clean_res.transformed_payload, clean);
+
+        // 2. Cloud Code envelope preserves `project`, `requestId`, `functionCall.name`, and reseals signed thoughts
+        vault.insert_explicit("sk-real-key-9876543210", "sk-masked-token-112233", "ApiKey");
+        let cc_req = r#"{"project":"my-internal.corp.internal","requestId":"req-123","request":{"contents":[{"role":"model","parts":[{"thought":true,"text":"considering sk-real-key-9876543210","thoughtSignature":"sig-xyz"},{"functionCall":{"name":"write_file","args":{"path":"E:\\Aflydream\\1AI\\hidegoqo\\src\\main.rs"}}}]}]}}"#;
+        let cc_res = SemanticDesensitizer::process_with_scope(cc_req, &cfg, &vault, None);
+        let parsed: Value = serde_json::from_str(&cc_res.transformed_payload).unwrap();
+        assert_eq!(parsed["project"], "my-internal.corp.internal");
+        assert_eq!(parsed["requestId"], "req-123");
+        assert_eq!(
+            parsed["request"]["contents"][0]["parts"][0]["text"],
+            "considering sk-masked-token-112233"
+        );
+        assert_eq!(
+            parsed["request"]["contents"][0]["parts"][1]["functionCall"]["name"],
+            "write_file"
+        );
+        let masked_path = parsed["request"]["contents"][0]["parts"][1]["functionCall"]["args"]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!masked_path.contains("Aflydream"), "masked_path={masked_path}");
+
+        // 3. Restoring Windows path works across `/` and lowercase drive letter variants!
+        let slash_variant = masked_path.replace('\\', "/").replacen("E:", "e:", 1);
+        let m = vault.matcher();
+        assert_eq!(
+            m.restore(&slash_variant, None, true).0,
+            "e:/Aflydream/1AI/hidegoqo/src/main.rs"
+        );
+
+        // 4. Generated `work/<tag>` placeholder is recognized even in a fresh vault (no double-masking)
+        let fresh_vault = PrivacyVault::new();
+        let rescan = SemanticDesensitizer::process_with_scope(&masked_path, &cfg, &fresh_vault, None);
+        assert!(
+            rescan.findings.is_empty(),
+            "placeholder path must not double-mask: {:?}",
+            rescan.findings
+        );
     }
 }

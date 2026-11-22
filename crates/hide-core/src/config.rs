@@ -396,6 +396,9 @@ pub struct TrafficAuditRecord {
     pub truncated: bool,
     /// Detected sensitive project items in this request
     pub findings: Vec<LeakFinding>,
+    /// Telemetry and bulk-upload audit signals detected for this request
+    #[serde(default)]
+    pub audit_signals: Vec<crate::audit::AuditSignal>,
     /// Number of tokens/identifiers mapped and restored
     pub restored_count: usize,
     /// Credential placeholders deliberately left unresolved inside tool-call arguments
@@ -421,6 +424,8 @@ pub struct TrafficAuditSummary {
     pub response_bytes: usize,
     pub finding_count: usize,
     pub top_severity: Option<String>,
+    #[serde(default)]
+    pub audit_signals: Vec<crate::audit::AuditSignal>,
     pub restored_count: usize,
     pub withheld_count: usize,
 }
@@ -449,6 +454,7 @@ impl From<&TrafficAuditRecord> for TrafficAuditSummary {
             response_bytes: r.response_bytes,
             finding_count: r.findings.iter().map(|f| f.count).sum(),
             top_severity: r.findings.iter().map(|f| f.severity.clone()).max_by_key(|s| rank(s)),
+            audit_signals: r.audit_signals.clone(),
             restored_count: r.restored_count,
             withheld_count: r.withheld_count,
         }

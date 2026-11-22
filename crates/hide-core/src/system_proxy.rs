@@ -11,6 +11,7 @@ use crate::upstream_proxy::{is_self_proxy, parse_proxy_server};
 use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,16 @@ static CHAINED_CACHE: Lazy<RwLock<Option<ChainedProxyCacheEntry>>> = Lazy::new(|
 const CHAINED_CACHE_TTL: Duration = Duration::from_secs(2);
 
 const DEFAULT_SYSTEM_PROXY_OVERRIDES: &[&str] = &["localhost", "127.*", "[::1]", "<local>"];
+const DEFAULT_ENV_NO_PROXY: &str = "localhost,127.0.0.1,::1";
+const MANAGED_USER_ENV_KEYS: &[&str] = &[
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+];
 
 /// Snapshot of OS WinInet proxy settings.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -30,7 +41,7 @@ pub struct WinInetSnapshot {
     pub proxy_override: Option<String>,
 }
 
-/// Persisted backup of the pre-Hide-Go OS system proxy settings.
+/// Persisted backup of the pre-Hide-Go OS system proxy and user environment settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemProxyBackup {
@@ -39,6 +50,8 @@ pub struct SystemProxyBackup {
     pub proxy_override: Option<String>,
     pub chained_upstream_proxy: Option<String>,
     pub active_port: u16,
+    #[serde(default)]
+    pub user_env_backup: BTreeMap<String, Option<String>>,
 }
 
 /// Abstract OS system-proxy adapter so tests run completely isolated from the host registry.
@@ -46,6 +59,12 @@ pub trait SystemProxyAdapter {
     fn supported(&self) -> bool;
     fn read_current(&self) -> Result<WinInetSnapshot, String>;
     fn write_snapshot(&self, snap: &WinInetSnapshot) -> Result<(), String>;
+    fn read_user_env(&self, _keys: &[&str]) -> Result<BTreeMap<String, Option<String>>, String> {
+        Ok(BTreeMap::new())
+    }
+    fn write_user_env(&self, _updates: &BTreeMap<String, Option<String>>) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Production Windows WinInet system-proxy adapter.
@@ -69,6 +88,10 @@ mod wininet_ffi {
     const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
 
     const INTERNET_SETTINGS_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    const ENVIRONMENT_SUBKEY: &str = "Environment";
+    const HWND_BROADCAST: *mut c_void = 0xffffusize as *mut c_void;
+    const WM_SETTINGCHANGE: u32 = 0x001A;
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
 
     #[link(name = "advapi32")]
     extern "system" {
@@ -103,6 +126,40 @@ mod wininet_ffi {
     extern "system" {
         fn InternetSetOptionW(hinternet: *mut c_void, dwoption: u32, lpbuffer: *mut c_void, dwbufferlength: u32)
             -> i32;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn SendMessageTimeoutW(
+            hwnd: *mut c_void,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+            fuflags: u32,
+            utimeout: u32,
+            lpdwresult: *mut usize,
+        ) -> isize;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
+    }
+
+    static CTRL_HANDLER_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    unsafe extern "system" fn console_ctrl_restore_handler(_ctrl_type: u32) -> i32 {
+        let _ = super::restore_system_proxy();
+        0
+    }
+
+    pub fn ensure_console_ctrl_restore_handler() {
+        if !CTRL_HANDLER_INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            // SAFETY: `console_ctrl_restore_handler` has `extern "system"` ABI matching PHANDLER_ROUTINE.
+            unsafe {
+                let _ = SetConsoleCtrlHandler(Some(console_ctrl_restore_handler), 1);
+            }
+        }
     }
 
     struct KeyGuard(Hkey);
@@ -263,6 +320,54 @@ mod wininet_ffi {
         }
         Ok(())
     }
+
+    pub fn read_user_env_values(keys: &[&str]) -> Result<std::collections::BTreeMap<String, Option<String>>, String> {
+        let subkey = to_wide(ENVIRONMENT_SUBKEY);
+        let mut hkey: Hkey = std::ptr::null_mut();
+        // SAFETY: opens HKCU\Environment for reading.
+        let st = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
+        if st != 0 || hkey.is_null() {
+            return Err(format!("RegOpenKeyExW(Environment read) failed with Win32 error {st}"));
+        }
+        let _guard = KeyGuard(hkey);
+        let mut out = std::collections::BTreeMap::new();
+        for &key in keys {
+            out.insert(key.to_string(), read_sz(hkey, key));
+        }
+        Ok(out)
+    }
+
+    pub fn write_user_env_values(updates: &std::collections::BTreeMap<String, Option<String>>) -> Result<(), String> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let subkey = to_wide(ENVIRONMENT_SUBKEY);
+        let mut hkey: Hkey = std::ptr::null_mut();
+        // SAFETY: opens HKCU\Environment for writing.
+        let st = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_SET_VALUE, &mut hkey) };
+        if st != 0 || hkey.is_null() {
+            return Err(format!("RegOpenKeyExW(Environment write) failed with Win32 error {st}"));
+        }
+        let _guard = KeyGuard(hkey);
+        for (key, val) in updates {
+            write_sz(hkey, key, val.as_deref())?;
+        }
+        let env_wide = to_wide("Environment");
+        let mut result: usize = 0;
+        // SAFETY: broadcasts WM_SETTINGCHANGE("Environment") so explorer and newly spawned apps pick up updated user env.
+        unsafe {
+            let _ = SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0,
+                env_wide.as_ptr() as isize,
+                SMTO_ABORTIFHUNG,
+                1000,
+                &mut result,
+            );
+        }
+        Ok(())
+    }
 }
 
 impl SystemProxyAdapter for RealSystemProxyAdapter {
@@ -289,6 +394,30 @@ impl SystemProxyAdapter for RealSystemProxyAdapter {
         #[cfg(not(windows))]
         {
             let _ = snap;
+            Ok(())
+        }
+    }
+
+    fn read_user_env(&self, keys: &[&str]) -> Result<BTreeMap<String, Option<String>>, String> {
+        #[cfg(windows)]
+        {
+            wininet_ffi::read_user_env_values(keys)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = keys;
+            Ok(BTreeMap::new())
+        }
+    }
+
+    fn write_user_env(&self, updates: &BTreeMap<String, Option<String>>) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            wininet_ffi::write_user_env_values(updates)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = updates;
             Ok(())
         }
     }
@@ -347,6 +476,60 @@ pub fn activate_system_proxy(proxy_port: u16) -> Result<Option<String>, String> 
     activate_system_proxy_with(&RealSystemProxyAdapter, &path, proxy_port)
 }
 
+fn merge_env_no_proxy(existing: Option<&str>) -> String {
+    let mut entries: Vec<String> = existing
+        .unwrap_or_default()
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    for req in DEFAULT_ENV_NO_PROXY.split(',') {
+        if !entries.iter().any(|e| e.eq_ignore_ascii_case(req)) {
+            entries.push(req.to_string());
+        }
+    }
+    entries.join(",")
+}
+
+fn value_looks_like_hidego_env(key: &str, value: &str, active_port: u16) -> bool {
+    let trimmed = value.trim();
+    match key {
+        "HTTPS_PROXY" | "HTTP_PROXY" => parse_proxy_server(trimmed).is_some_and(|u| is_self_proxy(&u, active_port)),
+        "NO_PROXY" => trimmed.eq_ignore_ascii_case(DEFAULT_ENV_NO_PROXY) || trimmed.contains("127.0.0.1"),
+        "SSL_CERT_FILE" | "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH" | "NODE_EXTRA_CA_CERTS" | "REQUESTS_CA_BUNDLE" => {
+            let lower = trimmed.to_ascii_lowercase();
+            lower.contains("hide-go-ca.crt") || lower.contains("hide-go-ca-bundle.pem")
+        }
+        _ => false,
+    }
+}
+
+fn build_managed_user_env_updates(proxy_port: u16, prior_no_proxy: Option<&str>) -> BTreeMap<String, Option<String>> {
+    let proxy_url = format!("http://127.0.0.1:{proxy_port}");
+    let mut updates = BTreeMap::new();
+    updates.insert("HTTPS_PROXY".to_string(), Some(proxy_url.clone()));
+    updates.insert("HTTP_PROXY".to_string(), Some(proxy_url));
+    updates.insert("NO_PROXY".to_string(), Some(merge_env_no_proxy(prior_no_proxy)));
+    if let Some(ca_dir) = crate::ca::CaManager::default_ca_dir() {
+        let cert = ca_dir.join("hide-go-ca.crt");
+        let bundle = ca_dir.join("hide-go-ca-bundle.pem");
+        if cert.is_file() {
+            updates.insert(
+                "NODE_EXTRA_CA_CERTS".to_string(),
+                Some(cert.to_string_lossy().into_owned()),
+            );
+        }
+        if bundle.is_file() {
+            let bstr = bundle.to_string_lossy().into_owned();
+            updates.insert("SSL_CERT_FILE".to_string(), Some(bstr.clone()));
+            updates.insert("GRPC_DEFAULT_SSL_ROOTS_FILE_PATH".to_string(), Some(bstr.clone()));
+            updates.insert("REQUESTS_CA_BUNDLE".to_string(), Some(bstr));
+        }
+    }
+    updates
+}
+
 pub fn activate_system_proxy_with(
     adapter: &dyn SystemProxyAdapter,
     backup_path: &Path,
@@ -357,6 +540,7 @@ pub fn activate_system_proxy_with(
     }
     let _guard = SYS_PROXY_LOCK.lock();
     let cur = adapter.read_current()?;
+    let cur_env = adapter.read_user_env(MANAGED_USER_ENV_KEYS).unwrap_or_default();
     let existing = load_backup(backup_path);
 
     let already_hidego = snapshot_points_to_port(&cur, proxy_port)
@@ -364,9 +548,27 @@ pub fn activate_system_proxy_with(
             .as_ref()
             .is_some_and(|b| snapshot_points_to_port(&cur, b.active_port));
 
+    let mut user_env_backup = existing.as_ref().map(|b| b.user_env_backup.clone()).unwrap_or_default();
+    let prev_port = existing.as_ref().map(|b| b.active_port).unwrap_or(proxy_port);
+    for &key in MANAGED_USER_ENV_KEYS {
+        user_env_backup.entry(key.to_string()).or_insert_with(|| {
+            let val = cur_env.get(key).cloned().flatten();
+            match val {
+                Some(ref v)
+                    if value_looks_like_hidego_env(key, v, proxy_port)
+                        || value_looks_like_hidego_env(key, v, prev_port) =>
+                {
+                    None
+                }
+                other => other,
+            }
+        });
+    }
+
     let backup = if already_hidego {
         if let Some(mut prev) = existing {
             prev.active_port = proxy_port;
+            prev.user_env_backup = user_env_backup;
             save_backup(backup_path, &prev)?;
             prev
         } else {
@@ -377,6 +579,7 @@ pub fn activate_system_proxy_with(
                 proxy_override: cur.proxy_override.clone(),
                 chained_upstream_proxy: None,
                 active_port: proxy_port,
+                user_env_backup,
             };
             save_backup(backup_path, &fresh)?;
             fresh
@@ -396,6 +599,7 @@ pub fn activate_system_proxy_with(
             proxy_override: cur.proxy_override.clone(),
             chained_upstream_proxy,
             active_port: proxy_port,
+            user_env_backup,
         };
         save_backup(backup_path, &fresh)?;
         fresh
@@ -407,6 +611,11 @@ pub fn activate_system_proxy_with(
         proxy_override: Some(merge_proxy_override(backup.proxy_override.as_deref())),
     };
     adapter.write_snapshot(&next_snap)?;
+    let prior_no_proxy = backup.user_env_backup.get("NO_PROXY").and_then(|v| v.as_deref());
+    let env_updates = build_managed_user_env_updates(proxy_port, prior_no_proxy);
+    if let Err(err) = adapter.write_user_env(&env_updates) {
+        tracing::warn!("failed to write managed user proxy environment variables: {err}");
+    }
     invalidate_chained_cache();
     Ok(backup.chained_upstream_proxy)
 }
@@ -432,6 +641,22 @@ pub fn restore_system_proxy_with(adapter: &dyn SystemProxyAdapter, backup_path: 
                 proxy_server: backup.proxy_server,
                 proxy_override: backup.proxy_override,
             })?;
+        }
+        if !backup.user_env_backup.is_empty() {
+            let cur_env = adapter.read_user_env(MANAGED_USER_ENV_KEYS).unwrap_or_default();
+            let mut restores = BTreeMap::new();
+            for (key, orig_val) in &backup.user_env_backup {
+                if let Some(cur_val) = cur_env.get(key).and_then(|v| v.as_deref()) {
+                    if value_looks_like_hidego_env(key, cur_val, backup.active_port) {
+                        restores.insert(key.clone(), orig_val.clone());
+                    }
+                }
+            }
+            if !restores.is_empty() {
+                if let Err(err) = adapter.write_user_env(&restores) {
+                    tracing::warn!("failed to restore managed user environment variables: {err}");
+                }
+            }
         }
     }
     let _ = std::fs::remove_file(backup_path);
@@ -491,10 +716,14 @@ pub struct SystemProxyRuntimeGuard {
 
 impl SystemProxyRuntimeGuard {
     pub fn start(enabled: bool, proxy_port: u16) -> Self {
+        #[cfg(windows)]
+        wininet_ffi::ensure_console_ctrl_restore_handler();
         if enabled && proxy_port > 0 {
             if let Err(err) = activate_system_proxy(proxy_port) {
                 tracing::warn!("system proxy activation failed on startup: {err}");
             }
+        } else if let Err(err) = restore_system_proxy() {
+            tracing::warn!("stale system proxy recovery failed on startup: {err}");
         }
         Self { active: true }
     }
@@ -517,12 +746,14 @@ mod tests {
 
     struct MockSystemProxy {
         snap: RefCell<WinInetSnapshot>,
+        env: RefCell<BTreeMap<String, String>>,
     }
 
     impl MockSystemProxy {
         fn new(snap: WinInetSnapshot) -> Self {
             Self {
                 snap: RefCell::new(snap),
+                env: RefCell::new(BTreeMap::new()),
             }
         }
     }
@@ -538,6 +769,24 @@ mod tests {
             *self.snap.borrow_mut() = snap.clone();
             Ok(())
         }
+        fn read_user_env(&self, keys: &[&str]) -> Result<BTreeMap<String, Option<String>>, String> {
+            let map = self.env.borrow();
+            Ok(keys.iter().map(|&k| (k.to_string(), map.get(k).cloned())).collect())
+        }
+        fn write_user_env(&self, updates: &BTreeMap<String, Option<String>>) -> Result<(), String> {
+            let mut map = self.env.borrow_mut();
+            for (k, v) in updates {
+                match v {
+                    Some(val) => {
+                        map.insert(k.clone(), val.clone());
+                    }
+                    None => {
+                        map.remove(k);
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 
     #[test]
@@ -549,14 +798,23 @@ mod tests {
             proxy_override: Some("localhost;192.168.*;<local>".to_string()),
         };
         let mock = MockSystemProxy::new(orig.clone());
+        mock.env
+            .borrow_mut()
+            .insert("NO_PROXY".to_string(), "corp.internal".to_string());
 
-        // 1. Fresh activation captures 127.0.0.1:7897 and switches WinInet to 127.0.0.1:18787
+        // 1. Fresh activation captures 127.0.0.1:7897 and switches WinInet + User Env to 127.0.0.1:18787
         let chained = activate_system_proxy_with(&mock, &tmp, 18787).unwrap();
         assert_eq!(chained.as_deref(), Some("http://127.0.0.1:7897/"));
         let active = mock.read_current().unwrap();
         assert_eq!(active.proxy_enable, 1);
         assert_eq!(active.proxy_server.as_deref(), Some("127.0.0.1:18787"));
         assert!(active.proxy_override.as_deref().unwrap().contains("127.*"));
+        assert_eq!(
+            mock.env.borrow().get("HTTPS_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:18787")
+        );
+        assert!(mock.env.borrow().get("NO_PROXY").unwrap().contains("corp.internal"));
+        assert!(mock.env.borrow().get("NO_PROXY").unwrap().contains("127.0.0.1"));
 
         // 2. Simulated crash + restart on new port 18788 MUST NOT overwrite backup with 127.0.0.1:18787
         let chained2 = activate_system_proxy_with(&mock, &tmp, 18788).unwrap();
@@ -565,10 +823,20 @@ mod tests {
             mock.read_current().unwrap().proxy_server.as_deref(),
             Some("127.0.0.1:18788")
         );
+        assert_eq!(
+            mock.env.borrow().get("HTTPS_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:18788")
+        );
 
-        // 3. Restore returns exact pre-Hide-Go settings
+        // 3. Restore returns exact pre-Hide-Go settings (WinInet + User Env)
         assert!(restore_system_proxy_with(&mock, &tmp).unwrap());
         assert_eq!(mock.read_current().unwrap(), orig);
+        assert!(!mock.env.borrow().contains_key("HTTPS_PROXY"));
+        assert!(!mock.env.borrow().contains_key("HTTP_PROXY"));
+        assert_eq!(
+            mock.env.borrow().get("NO_PROXY").map(String::as_str),
+            Some("corp.internal")
+        );
         assert!(!tmp.exists());
     }
 

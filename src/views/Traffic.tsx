@@ -8,6 +8,7 @@ import {
   describeAction,
   formatBytes,
   formatLatency,
+  getAuditSignalLabel,
   getCategoryLabel,
   getFindingLabel,
   getHarnessLabel,
@@ -15,7 +16,7 @@ import {
   getSeverityLabel,
 } from '../lib/format';
 import { useI18n } from '../lib/i18n';
-import type { HarnessKind, Severity, TrafficAuditRecord, TrafficCategory } from '../types';
+import type { AuditSignal, HarnessKind, Severity, TrafficAuditRecord, TrafficCategory, TrafficSummary } from '../types';
 import { Badge, Button, Callout, ConfirmDialog, EmptyState, Skeleton, Switch, Tabs, cx, inputClass, useToast } from '../components/ui';
 import { CodeView, buildMatcher } from '../components/CodeView';
 
@@ -32,9 +33,34 @@ export function SeverityBadge({ severity, count }: { severity: Severity | null; 
 }
 
 type DetailTab = 'request' | 'response' | 'findings' | 'meta';
-type ActionFilter = 'all' | 'masked' | 'blocked' | 'passed' | 'error';
+type ActionFilter = 'all' | 'masked' | 'blocked' | 'passed' | 'telemetry' | 'bulk-upload' | 'error';
 
-function matchesAction(action: string, filter: ActionFilter) {
+function hasTelemetrySignal(r: Pick<TrafficSummary, 'category' | 'auditSignals'>) {
+  return (
+    r.category === 'telemetry' ||
+    Boolean(r.auditSignals?.some((s) => s.kind === 'telemetry-endpoint' || s.kind === 'telemetry-payload'))
+  );
+}
+
+function hasBulkUploadSignal(r: Pick<TrafficSummary, 'category' | 'auditSignals'>) {
+  return (
+    r.category === 'codebase-indexing' ||
+    Boolean(
+      r.auditSignals?.some(
+        (s) => s.kind === 'archive-upload' || s.kind === 'bulk-codebase-upload' || s.kind === 'large-outbound-payload',
+      ),
+    )
+  );
+}
+
+function signalTone(sig: AuditSignal): 'danger' | 'warn' | 'info' {
+  if (sig.severity === 'high') return 'danger';
+  if (sig.severity === 'warn') return 'warn';
+  return 'info';
+}
+
+function matchesAction(r: TrafficSummary, filter: ActionFilter) {
+  const action = r.actionTaken;
   const tone = describeAction(action, 'en');
   switch (filter) {
     case 'all':
@@ -42,9 +68,13 @@ function matchesAction(action: string, filter: ActionFilter) {
     case 'masked':
       return tone.tone === 'brand';
     case 'blocked':
-      return tone.tone === 'warn';
+      return action === 'telemetry-blocked' || action === 'chaff-injected';
     case 'passed':
       return action === 'passed' || action === 'protobuf-passed' || action === 'protobuf-audited';
+    case 'telemetry':
+      return hasTelemetrySignal(r);
+    case 'bulk-upload':
+      return hasBulkUploadSignal(r);
     case 'error':
       return tone.tone === 'danger';
   }
@@ -53,7 +83,7 @@ function matchesAction(action: string, filter: ActionFilter) {
 const selectClass = cx(inputClass, 'h-8 cursor-pointer pr-7');
 
 export function Traffic() {
-  const { logs, logsLoading, params, navigate, refreshLogs, openSimulator, vault } = useStore();
+  const { config, status, logs, logsLoading, params, navigate, refreshLogs, openSimulator, vault } = useStore();
   const { locale, t } = useI18n();
   const toast = useToast();
   const [query, setQuery] = useState('');
@@ -72,7 +102,7 @@ export function Traffic() {
         (harness === 'all' || r.harness === harness) &&
         (category === 'all' || r.category === category) &&
         (!hideSimulated || !r.simulated) &&
-        matchesAction(r.actionTaken, action) &&
+        matchesAction(r, action) &&
         (!q ||
           r.endpoint.toLowerCase().includes(q) ||
           getHarnessLabel(r.harness, locale).toLowerCase().includes(q) ||
@@ -145,6 +175,8 @@ export function Traffic() {
           <option value="masked">{t('traffic.actionMasked')}</option>
           <option value="blocked">{t('traffic.actionBlocked')}</option>
           <option value="passed">{t('traffic.actionPassed')}</option>
+          <option value="telemetry">{t('traffic.actionTelemetry')}</option>
+          <option value="bulk-upload">{t('traffic.actionBulkUpload')}</option>
           <option value="error">{t('traffic.actionError')}</option>
         </select>
         <label className="ml-1 flex cursor-pointer items-center gap-2 text-xs text-fg-muted">
@@ -178,6 +210,39 @@ export function Traffic() {
           </Button>
         </div>
       </div>
+
+      {(config?.mode === 'audit-only' || (status?.telemetryDetected ?? 0) > 0 || (status?.bulkUploadDetected ?? 0) > 0) && (
+        <div className="flex flex-wrap items-center gap-2 border-b border-line bg-surface-2 px-6 py-1.5 text-xs">
+          <span
+            className={cx(
+              'font-medium',
+              (status?.telemetryDetected ?? 0) > 0 || (status?.bulkUploadDetected ?? 0) > 0 ? 'text-warn' : 'text-fg-muted',
+            )}
+          >
+            {(status?.telemetryDetected ?? 0) > 0 || (status?.bulkUploadDetected ?? 0) > 0
+              ? t('traffic.auditStripSummary', {
+                  telemetry: status?.telemetryDetected ?? 0,
+                  uploads: status?.bulkUploadDetected ?? 0,
+                })
+              : t('traffic.auditStripClean')}
+          </span>
+          {status?.harnessAudit
+            ?.filter((h) => h.telemetryEvents > 0 || h.bulkUploadEvents > 0 || h.sensitiveExfilEvents > 0)
+            .map((h) => (
+              <button
+                key={h.harness}
+                type="button"
+                onClick={() => setHarness(h.harness)}
+                className="inline-flex cursor-pointer items-center gap-1 rounded border border-line bg-surface px-2 py-0.5 text-2xs text-fg-muted hover:border-line-strong hover:text-fg"
+              >
+                <span className="font-medium text-fg">{getHarnessLabel(h.harness, locale)}</span>
+                {h.telemetryEvents > 0 && <Badge tone="warn">{t('traffic.actionTelemetry')} {h.telemetryEvents}</Badge>}
+                {h.bulkUploadEvents > 0 && <Badge tone="warn">{t('traffic.actionBulkUpload')} {h.bulkUploadEvents}</Badge>}
+                {h.sensitiveExfilEvents > 0 && <Badge tone="danger">{getAuditSignalLabel('sensitive-data-exfil', locale)} {h.sensitiveExfilEvents}</Badge>}
+              </button>
+            ))}
+        </div>
+      )}
 
       <div className="grid min-h-0 flex-1 grid-cols-[minmax(420px,5fr)_minmax(0,7fr)]">
         <div className="min-h-0 overflow-y-auto border-r border-line bg-surface">
@@ -243,6 +308,11 @@ export function Traffic() {
                         <div className="flex items-center gap-1.5">
                           <span className="truncate font-medium text-fg">{getHarnessLabel(r.harness, locale)}</span>
                           <span className="shrink-0 text-2xs text-fg-subtle">{getCategoryLabel(r.category, locale)}</span>
+                          {r.auditSignals && r.auditSignals.length > 0 && (
+                            <Badge tone={signalTone(r.auditSignals[r.auditSignals.length - 1]!)} className="shrink-0">
+                              {getAuditSignalLabel(r.auditSignals[r.auditSignals.length - 1]!.kind, locale)}
+                            </Badge>
+                          )}
                           {r.simulated && <span className="shrink-0 text-2xs text-info">{t('overview.simulatedTag')}</span>}
                         </div>
                         <p className="truncate font-mono text-2xs text-fg-subtle" title={r.endpoint}>
@@ -396,6 +466,16 @@ function RecordDetail({
             <dd className="tabular font-mono text-fg-muted">{record.restoredCount}</dd>
           </div>
         </dl>
+        {record.auditSignals && record.auditSignals.length > 0 && (
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            <span className="text-2xs text-fg-subtle">{t('traffic.auditSignalsLabel')}:</span>
+            {record.auditSignals.map((sig, idx) => (
+              <Badge key={`${sig.kind}-${idx}`} tone={signalTone(sig)} title={sig.detail}>
+                {getAuditSignalLabel(sig.kind, locale)}
+              </Badge>
+            ))}
+          </div>
+        )}
       </header>
 
       <Tabs

@@ -11,7 +11,14 @@ pub fn is_structural_key(key: &str) -> bool {
         "id" | "type"
             | "role"
             | "model"
+            | "modelVersion"
             | "object"
+            | "project"
+            | "requestId"
+            | "traceId"
+            | "responseId"
+            | "sessionId"
+            | "session_id"
             | "tool_use_id"
             | "tool_call_id"
             | "call_id"
@@ -43,15 +50,22 @@ pub fn is_schema_key(key: &str) -> bool {
         key,
         "tools"
             | "functions"
+            | "functionDeclarations"
+            | "function_declarations"
             | "tool_choice"
             | "function_call"
             | "response_format"
             | "input_schema"
             | "parameters"
+            | "parametersJsonSchema"
             | "generationConfig"
             | "generation_config"
+            | "thinkingConfig"
+            | "thinking_config"
             | "safetySettings"
             | "toolConfig"
+            | "clientMetadata"
+            | "enabledCreditTypes"
             | "metadata"
             | "stop"
             | "stop_sequences"
@@ -70,15 +84,22 @@ pub fn is_api_schema_container_key(key: &str) -> bool {
         key,
         "tools"
             | "functions"
+            | "functionDeclarations"
+            | "function_declarations"
             | "tool_choice"
             | "function_call"
             | "response_format"
             | "input_schema"
             | "parameters"
+            | "parametersJsonSchema"
             | "generationConfig"
             | "generation_config"
+            | "thinkingConfig"
+            | "thinking_config"
             | "safetySettings"
             | "toolConfig"
+            | "clientMetadata"
+            | "enabledCreditTypes"
             | "stop"
             | "stop_sequences"
             | "reasoning"
@@ -96,6 +117,7 @@ pub fn is_tool_call_object(map: &Map<String, Value>) -> bool {
         || map.contains_key("tool_call_id")
         || map.contains_key("call_id")
         || (map.contains_key("name") && map.contains_key("arguments"))
+        || (map.contains_key("name") && map.contains_key("args"))
         || (map.contains_key("name") && map.contains_key("input"))
         || (map.contains_key("name") && map.contains_key("response"))
 }
@@ -108,6 +130,12 @@ pub fn is_opaque_block(map: &Map<String, Value>) -> bool {
         .get("inlineData")
         .or_else(|| map.get("inline_data"))
         .is_some_and(Value::is_object)
+    {
+        return true;
+    }
+    if map.get("thought").and_then(Value::as_bool) == Some(true)
+        && (map.get("thoughtSignature").is_some_and(Value::is_string)
+            || map.get("thought_signature").is_some_and(Value::is_string))
     {
         return true;
     }

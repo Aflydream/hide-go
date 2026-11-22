@@ -515,6 +515,37 @@ fn is_benchmark_ipv4(s: &str) -> bool {
     )
 }
 
+fn looks_like_generated_tag(tag: &str, expected_len: usize, lower_only: bool) -> bool {
+    if tag.len() != expected_len {
+        return false;
+    }
+    let mut has_digit = false;
+    let mut has_alpha = false;
+    for b in tag.bytes() {
+        if b.is_ascii_digit() {
+            has_digit = true;
+        } else if b.is_ascii_lowercase() || (!lower_only && b.is_ascii_uppercase()) {
+            has_alpha = true;
+        } else {
+            return false;
+        }
+    }
+    has_digit && has_alpha
+}
+
+fn is_work_tag_path(s: &str) -> bool {
+    for prefix in ["/opt/work/", "\\work\\", "\\\\work\\\\", "/work/"] {
+        if let Some(idx) = s.find(prefix) {
+            let rest = &s[idx + prefix.len()..];
+            let seg = rest.split(['/', '\\']).next().unwrap_or("");
+            if looks_like_generated_tag(seg, 8, true) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Check if a value is already a Hide-Go placeholder token
 pub fn is_placeholder_token(val: &str) -> bool {
     let trimmed = val.trim();
@@ -522,10 +553,24 @@ pub fn is_placeholder_token(val: &str) -> bool {
         || trimmed.starts_with("⟦HIDE-CIPHER::")
         || trimmed.starts_with("sk-sem-")
         || trimmed.contains("db_pass_placeholder_")
+        || trimmed.contains(".db.example:")
         || trimmed.contains("/workspace/user_")
         || trimmed.contains("workspace/user_")
         || trimmed.contains("workspace\\user_")
         || trimmed.contains("workspace\\\\user_")
+        || is_work_tag_path(trimmed)
+        || trimmed
+            .strip_prefix("key_ref_")
+            .is_some_and(|t| looks_like_generated_tag(t, 20, false))
+        || trimmed
+            .strip_prefix("sec_")
+            .is_some_and(|t| looks_like_generated_tag(t, 18, false))
+        || trimmed
+            .strip_prefix("tok_")
+            .is_some_and(|t| looks_like_generated_tag(t, 24, false))
+        || trimmed
+            .strip_prefix("ref_")
+            .is_some_and(|t| looks_like_generated_tag(t, 10, true))
         || trimmed.ends_with(".example.internal")
         || trimmed.ends_with("@sandbox.example.org")
         || trimmed.starts_with("git-ref-placeholder-")
@@ -684,8 +729,24 @@ fn is_non_secret_env_token(raw: &str, is_quoted: bool) -> bool {
 
 fn is_placeholder_windows_workspace(raw: &str, tail: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
-    (lower.ends_with(":\\workspace") || lower.ends_with(":\\\\workspace") || lower.ends_with(":/workspace"))
-        && (tail.starts_with("\\user_") || tail.starts_with("\\\\user_") || tail.starts_with("/user_"))
+    let legacy =
+        (lower.ends_with(":\\workspace") || lower.ends_with(":\\\\workspace") || lower.ends_with(":/workspace"))
+            && (tail.starts_with("\\user_") || tail.starts_with("\\\\user_") || tail.starts_with("/user_"));
+    if legacy {
+        return true;
+    }
+    if lower.ends_with(":\\work") || lower.ends_with(":\\\\work") || lower.ends_with(":/work") {
+        let rest = tail
+            .strip_prefix("\\\\")
+            .or_else(|| tail.strip_prefix('\\'))
+            .or_else(|| tail.strip_prefix('/'))
+            .unwrap_or("");
+        let seg = rest.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or("");
+        if looks_like_generated_tag(seg, 8, true) {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_system_windows_dir(raw: &str) -> bool {

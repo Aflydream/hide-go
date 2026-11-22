@@ -33,6 +33,7 @@ const FILE_EDIT_KEYS: &[&str] = &[
     "new_code",
     "old_code",
     "insert_text",
+    "target",
 ];
 
 fn is_file_edit_key(key: &str) -> bool {
@@ -102,7 +103,12 @@ pub fn restore_response(matcher: &Matcher, text: &str, policy: ToolCallSecretPol
     }
     match serde_json::from_str::<Value>(text) {
         Ok(mut value) => {
-            let (n, w) = restore_value(matcher, &mut value, policy);
+            let mut n = 0usize;
+            if let Value::Array(items) = &mut value {
+                n += restore_gemini_chunk_array(matcher, items);
+            }
+            let (vn, w) = restore_value(matcher, &mut value, policy);
+            n += vn;
             if n == 0 {
                 return (text.to_string(), 0, w);
             }
@@ -110,6 +116,76 @@ pub fn restore_response(matcher: &Matcher, text: &str, policy: ToolCallSecretPol
         }
         Err(_) => matcher.restore(text, None, true),
     }
+}
+
+/// Reassemble and restore placeholders split across adjacent elements of a non-SSE Gemini or
+/// Cloud Code streaming JSON array (`[{"response":{"candidates":[...]}}, ...]`).
+fn restore_gemini_chunk_array(matcher: &Matcher, items: &mut [Value]) -> usize {
+    use std::collections::BTreeMap;
+
+    let mut groups: BTreeMap<(u64, u64, bool), Vec<(usize, String)>> = BTreeMap::new();
+    for (item_idx, item) in items.iter().enumerate() {
+        for (candidates_opt, base_ptr) in [
+            (item.get("candidates").and_then(Value::as_array), "/candidates"),
+            (
+                item.pointer("/response/candidates").and_then(Value::as_array),
+                "/response/candidates",
+            ),
+        ] {
+            let Some(candidates) = candidates_opt else {
+                continue;
+            };
+            for (pos, cand) in candidates.iter().enumerate() {
+                let cand_idx = cand.get("index").and_then(Value::as_u64).unwrap_or(pos as u64);
+                let Some(parts) = cand.pointer("/content/parts").and_then(Value::as_array) else {
+                    continue;
+                };
+                let mut text_ord = 0u64;
+                let mut thought_ord = 0u64;
+                for (p_idx, part) in parts.iter().enumerate() {
+                    if part.get("text").and_then(Value::as_str).is_some() {
+                        let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
+                        let ord = if is_thought {
+                            let o = thought_ord;
+                            thought_ord += 1;
+                            o
+                        } else {
+                            let o = text_ord;
+                            text_ord += 1;
+                            o
+                        };
+                        groups
+                            .entry((cand_idx, ord, is_thought))
+                            .or_default()
+                            .push((item_idx, format!("{base_ptr}/{pos}/content/parts/{p_idx}/text")));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut total_restored = 0usize;
+    for slots in groups.values() {
+        if slots.len() < 2 {
+            continue;
+        }
+        let mut joined = String::new();
+        for (item_idx, ptr) in slots {
+            if let Some(s) = items[*item_idx].pointer(ptr).and_then(Value::as_str) {
+                joined.push_str(s);
+            }
+        }
+        let (restored, count, _) = matcher.restore(&joined, None, true);
+        if count > 0 {
+            total_restored += count;
+            for (slot_pos, (item_idx, ptr)) in slots.iter().enumerate() {
+                if let Some(target) = items[*item_idx].pointer_mut(ptr) {
+                    *target = Value::String(if slot_pos == 0 { restored.clone() } else { String::new() });
+                }
+            }
+        }
+    }
+    total_restored
 }
 
 /// Restore a parsed response document in place.
@@ -182,15 +258,20 @@ fn walk(m: &Matcher, value: &mut Value, ctx: Ctx, withheld: &mut usize, depth: u
             }
             let own_tool_name = map.get("name").and_then(Value::as_str).map(str::to_owned);
             let effective_tool_name = own_tool_name.as_deref().or(ctx.tool_name);
+            let has_media_sibling =
+                map.contains_key("media_type") || map.contains_key("mimeType") || map.contains_key("mime_type");
+            let has_args_sibling = map.contains_key("args");
             let mut count = 0;
             for (key, mut item) in std::mem::take(map) {
-                if (is_structural_key(&key) || key == "signature" || key == "data") && item.is_string() {
+                let is_opaque_data = key == "data" && (block_type == "base64" || has_media_sibling);
+                if (is_structural_key(&key) || key == "signature" || is_opaque_data) && item.is_string() {
                     map.insert(key, item);
                     continue;
                 }
                 let is_tool_name_field = key == "name"
                     && item.is_string()
                     && (ctx.tool
+                        || has_args_sibling
                         || matches!(
                             block_type.as_str(),
                             "tool_use" | "server_tool_use" | "custom_tool_call" | "function_call" | "mcp_call"
@@ -408,5 +489,24 @@ mod tests {
             parsed["content"][2]["input"]["code_edit"],
             "KEY=sk-ant-real-key-123456789"
         );
+    }
+
+    #[test]
+    fn cloud_code_json_array_restores_placeholder_split_across_chunks() {
+        let v = vault();
+        let body = json!([
+            {"response": {"candidates": [{"content": {"role": "model", "parts": [{"text": "key: sk-sem-place"}]}}]}},
+            {"response": {"candidates": [{"content": {"role": "model", "parts": [{"text": "holder-key-0001!"}]}}]}}
+        ]);
+        let (out, restored, withheld) =
+            restore_response(&v.matcher(), &body.to_string(), ToolCallSecretPolicy::FileEditsOnly);
+        assert_eq!(restored, 1);
+        assert_eq!(withheld, 0);
+        let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
+        let joined: String = arr
+            .iter()
+            .filter_map(|item| item.pointer("/response/candidates/0/content/parts/0/text")?.as_str())
+            .collect();
+        assert_eq!(joined, "key: sk-ant-real-key-123456789!");
     }
 }

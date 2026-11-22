@@ -197,14 +197,10 @@ impl DesktopBridge {
             tracing::info!("Hide-Go headless desktop console started (set HIDE_GO_ADMIN_TOKEN to pin API auth)");
         }
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                tokio::select! {
-                    _ = shutdown.notified() => {}
-                    _ = tokio::signal::ctrl_c() => {}
-                }
-            })
-            .await?;
+        let server_fut = axum::serve(listener, app).with_graceful_shutdown(async move {
+            wait_for_shutdown_signal(shutdown).await;
+        });
+        let _ = server_fut.await;
         Ok(())
     }
 
@@ -258,16 +254,28 @@ impl DesktopBridge {
                 let ui_url = format!("http://{addr}/");
                 tracing::info!("Hide-Go Standalone Desktop App running at {}", ui_url);
                 let _ = tx.send(Ok(ui_url));
-                if let Err(e) = axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        tokio::select! {
-                            _ = shutdown_server.notified() => {}
-                            _ = tokio::signal::ctrl_c() => {}
-                        }
-                    })
+                let drain_notify = Arc::new(Notify::new());
+                let drain_trigger = drain_notify.clone();
+                let serve_task = tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, app)
+                        .with_graceful_shutdown(async move {
+                            drain_notify.notified().await;
+                        })
+                        .await
+                    {
+                        tracing::error!("desktop gateway server error: {e}");
+                    }
+                });
+                wait_for_shutdown_signal(shutdown_server).await;
+                drain_trigger.notify_one();
+                // Bound graceful drain so long-lived keep-alive/SSE/gRPC tunnels never block exit
+                // or delay SystemProxyRuntimeGuard restoration.
+                let mut serve_task = serve_task;
+                if tokio::time::timeout(std::time::Duration::from_millis(1500), &mut serve_task)
                     .await
+                    .is_err()
                 {
-                    tracing::error!("desktop gateway server error: {e}");
+                    serve_task.abort();
                 }
             });
         });
@@ -304,6 +312,8 @@ impl DesktopBridge {
             });
             let _ = server_thread.join();
         } else {
+            // Restore OS proxy/env immediately as the window closes, then stop the gateway.
+            let _ = hide_core::system_proxy::restore_system_proxy();
             shutdown.notify_one();
             let _ = server_thread.join();
         }
@@ -314,6 +324,24 @@ impl DesktopBridge {
             self.chrome.terminate_other_processes();
         }
         Ok(())
+    }
+}
+
+async fn wait_for_shutdown_signal(shutdown: Arc<Notify>) {
+    #[cfg(unix)]
+    {
+        if let Ok(mut sigterm) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            tokio::select! {
+                _ = shutdown.notified() => {}
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+            return;
+        }
+    }
+    tokio::select! {
+        _ = shutdown.notified() => {}
+        _ = tokio::signal::ctrl_c() => {}
     }
 }
 

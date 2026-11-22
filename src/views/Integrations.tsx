@@ -267,6 +267,12 @@ function CaTrustCard({
                           className="inline-flex items-center gap-1.5 rounded border border-line bg-surface px-2 py-0.5 text-2xs"
                         >
                           <code className="font-mono text-fg-muted">{item.host}</code>
+                          {item.riskKind === 'telemetry' && (
+                            <Badge tone="warn">{t('integrations.observedTelemetryBadge')}</Badge>
+                          )}
+                          {item.riskKind === 'upload-storage' && (
+                            <Badge tone="warn">{t('integrations.observedUploadBadge')}</Badge>
+                          )}
                           {item.tlsFailed ? (
                             <Badge tone="danger">{t('integrations.observedTlsFailed')}</Badge>
                           ) : item.mitm ? (

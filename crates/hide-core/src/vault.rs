@@ -553,7 +553,7 @@ impl Matcher {
         let mut copied = 0usize;
         while pos < bytes.len() {
             let cur_b = bytes[pos];
-            let hit = self.pct_secrets.iter().find(|&(pair_idx, pct)| {
+            let hit = self.pct_secrets.iter().find(|&(_pair_idx, pct)| {
                 let pct_bytes = pct.as_bytes();
                 if pct_bytes[0] != cur_b
                     || existing_ranges
@@ -563,9 +563,26 @@ impl Matcher {
                 {
                     return false;
                 }
-                let p = &self.pairs[*pair_idx];
-                is_valid_token_boundary_with_left(text, pos, pct, None)
-                    || !p.original.as_bytes()[0].is_ascii_alphanumeric()
+                let left_ok = if pos == 0 {
+                    true
+                } else {
+                    let prev = bytes[pos - 1];
+                    !prev.is_ascii_alphanumeric() && prev != b'_' && prev != b'%'
+                };
+                let end = pos + pct_bytes.len();
+                let right_ok = if end >= bytes.len() {
+                    true
+                } else {
+                    let next = bytes[end];
+                    // After percent-encoded URL segments, allow URL delimiters (&, #, /, ?, =, whitespace, quotes).
+                    // Reject continuation of an unencoded identifier unless the pct token ends with an escape (%XX).
+                    let ends_with_pct_escape = pct_bytes.len() >= 3
+                        && pct_bytes[pct_bytes.len() - 3] == b'%'
+                        && pct_bytes[pct_bytes.len() - 2].is_ascii_hexdigit()
+                        && pct_bytes[pct_bytes.len() - 1].is_ascii_hexdigit();
+                    ends_with_pct_escape || (!next.is_ascii_alphanumeric() && next != b'_')
+                };
+                left_ok && right_ok
             });
             if let Some(&(pair_idx, ref pct)) = hit {
                 let p = &self.pairs[pair_idx];
@@ -626,9 +643,11 @@ impl Matcher {
                 .map(|v| self.restore_json_value_depth(v, allow_secret, depth + 1))
                 .sum(),
             Value::String(text) => {
-                if let Some(original) = self.json_values.get(text.as_str()) {
-                    *value = original.clone();
-                    return 1;
+                if allow_secret {
+                    if let Some(original) = self.json_values.get(text.as_str()) {
+                        *value = original.clone();
+                        return 1;
+                    }
                 }
                 let trimmed = text.trim_start();
                 if depth + 1 < MAX_JSON_DEPTH && (trimmed.starts_with('{') || trimmed.starts_with('[')) {
@@ -1214,6 +1233,45 @@ impl PrivacyVault {
         entries
     }
 
+    /// Register a restoration-only alias token (e.g. Windows forward-slash or alternate drive-case
+    /// variant of an existing `ProjectPath` token) without overwriting an existing token mapping.
+    pub fn register_restore_alias_scoped(
+        &self,
+        scope: Option<&str>,
+        alias_token: &str,
+        real_value: &str,
+        category: &str,
+    ) -> bool {
+        if alias_token.is_empty() || real_value.is_empty() || alias_token == real_value {
+            return false;
+        }
+        let mut guard = self.inner.write();
+        if guard.token_to_real.contains_key(alias_token) {
+            return false;
+        }
+        guard.tick += 1;
+        let tick = guard.tick;
+        let secret = is_secret_category(category);
+        guard.token_to_real.insert(
+            alias_token.to_string(),
+            VaultEntry {
+                token: alias_token.to_string(),
+                original_masked: mask_preview(real_value),
+                original_raw: real_value.to_string(),
+                category: category.to_string(),
+                hit_count: 1,
+                secret,
+                last_used: tick,
+                scope: scope.map(str::to_string),
+            },
+        );
+        guard.generation += 1;
+        if guard.token_to_real.len() > MAX_VAULT_ENTRIES {
+            evict_least_recent(&mut guard, alias_token);
+        }
+        true
+    }
+
     pub fn clear(&self) {
         let mut guard = self.inner.write();
         guard.source_to_token.clear();
@@ -1226,6 +1284,9 @@ impl PrivacyVault {
             key_guard.0 = generate_ephemeral_key();
         }
         guard.generation += 1;
+        drop(guard);
+        *self.matcher.lock() = None;
+        self.scoped_matchers.lock().clear();
     }
 }
 
@@ -1265,6 +1326,11 @@ fn commit_vault_entry(
 }
 
 fn evict_least_recent(guard: &mut VaultInner, keep: &str) {
+    let over_hard = guard.token_to_real.len() > HARD_MAX_VAULT_ENTRIES;
+    // Fast bail-out when between MAX_VAULT_ENTRIES and HARD_MAX_VAULT_ENTRIES with only secret entries.
+    if !over_hard && !guard.token_to_real.values().any(|e| !e.secret && e.token != keep) {
+        return;
+    }
     // Prefer evicting non-secret entries so credentials stay restorable across long sessions.
     let mut non_secret: Vec<(u64, String)> = guard
         .token_to_real
@@ -1275,15 +1341,16 @@ fn evict_least_recent(guard: &mut VaultInner, keep: &str) {
     non_secret.sort();
     let mut evicted: HashSet<String> = non_secret.into_iter().take(EVICT_BATCH).map(|(_, t)| t).collect();
 
-    if evicted.is_empty() && guard.token_to_real.len() > HARD_MAX_VAULT_ENTRIES {
+    if over_hard && evicted.len() < EVICT_BATCH {
+        let remaining = EVICT_BATCH - evicted.len();
         let mut all_oldest: Vec<(u64, String)> = guard
             .token_to_real
             .values()
-            .filter(|e| e.token != keep)
+            .filter(|e| e.token != keep && !evicted.contains(&e.token))
             .map(|e| (e.last_used, e.token.clone()))
             .collect();
         all_oldest.sort();
-        evicted.extend(all_oldest.into_iter().take(EVICT_BATCH).map(|(_, t)| t));
+        evicted.extend(all_oldest.into_iter().take(remaining).map(|(_, t)| t));
     }
 
     if evicted.is_empty() {
@@ -1535,5 +1602,27 @@ mod tests {
         let text = "中文前缀—tok_alpha_99——⟦HIDE-CIPHER::⠀⠁⟧结尾";
         let m = vault.matcher();
         assert_eq!(m.restore(text, None, true).0, "中文前缀—密钥A——密钥B结尾");
+    }
+
+    #[test]
+    fn clear_drops_cached_matchers_and_json_values_respect_allow_secret() {
+        let vault = PrivacyVault::new();
+        let (tok, _) =
+            vault.get_or_insert_json_value_scoped_unique(Some("s1"), &serde_json::json!(998877), "EnvSecret", |_| {
+                "sec_num_token_001".to_string()
+            });
+        let m_before = vault.matcher_for_scope(Some("s1"));
+        let mut withheld_doc = serde_json::json!({"pin": tok});
+        assert_eq!(m_before.restore_json_value(&mut withheld_doc, false), 0);
+        assert_eq!(withheld_doc["pin"], "sec_num_token_001");
+
+        let mut allowed_doc = serde_json::json!({"pin": "sec_num_token_001"});
+        assert_eq!(m_before.restore_json_value(&mut allowed_doc, true), 1);
+        assert_eq!(allowed_doc["pin"], 998877);
+
+        vault.clear();
+        assert!(vault.matcher.lock().is_none());
+        assert!(vault.scoped_matchers.lock().is_empty());
+        assert!(vault.matcher_for_scope(Some("s1")).is_empty());
     }
 }

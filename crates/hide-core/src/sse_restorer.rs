@@ -58,7 +58,12 @@ enum Key {
         content_index: u64,
         field: &'static str,
     },
-    Gemini(u64, u64, &'static str),
+    Gemini {
+        candidate: u64,
+        ordinal: u64,
+        field: &'static str,
+        wrapped: bool,
+    },
 }
 
 // JSON fragments must NOT pass through a plain-text restorer: replacement values
@@ -104,7 +109,7 @@ impl End {
             (Self::All, _) => true,
             (Self::Chat(a), Key::Chat(b, _, _)) => a == b,
             (Self::Anthropic(a), Key::Anthropic(b, _)) => a == b,
-            (Self::Gemini(a), Key::Gemini(b, _, _)) => a == b,
+            (Self::Gemini(a), Key::Gemini { candidate: b, .. }) => a == b,
             (
                 Self::Responses {
                     item_id,
@@ -556,12 +561,22 @@ impl Key {
                 "delta": {"type": match *field { "text" => "text_delta", "thinking" => "thinking_delta", _ => "input_json_delta" },
                     (*field): text}
             }),
-            Self::Gemini(index, _part_position, field) => {
+            Self::Gemini {
+                candidate: index,
+                field,
+                wrapped,
+                ..
+            } => {
                 let mut part = json!({"text": text});
                 if *field == "thought" {
                     part["thought"] = json!(true);
                 }
-                envelope["candidates"] = json!([{"index": index, "content": {"role": "model", "parts": [part]}}]);
+                let candidates = json!([{"index": index, "content": {"role": "model", "parts": [part]}}]);
+                if *wrapped {
+                    envelope["response"] = json!({"candidates": candidates});
+                } else {
+                    envelope["candidates"] = candidates;
+                }
                 envelope
             }
             Self::Responses {
@@ -643,24 +658,45 @@ fn targets(value: &Value, kind: &str) -> io::Result<Vec<Target>> {
             )?;
         }
     }
-    if let Some(candidates) = value.get("candidates").and_then(Value::as_array) {
-        for (position, candidate) in candidates.iter().enumerate() {
-            let candidate_index = optional_index(candidate, "index")?.unwrap_or(position as u64);
-            if let Some(parts) = candidate.pointer("/content/parts").and_then(Value::as_array) {
-                for (part_position, part) in parts.iter().enumerate() {
-                    if part.get("text").is_some_and(Value::is_string) {
-                        let field = if part.get("thought").and_then(Value::as_bool) == Some(true) {
-                            "thought"
-                        } else {
-                            "text"
-                        };
-                        add(
-                            Key::Gemini(candidate_index, part_position as u64, field),
-                            format!("/candidates/{position}/content/parts/{part_position}/text"),
-                            false,
-                            false,
-                            true,
-                        )?;
+    for (candidates_opt, base_ptr, wrapped) in [
+        (value.get("candidates").and_then(Value::as_array), "/candidates", false),
+        (
+            value.pointer("/response/candidates").and_then(Value::as_array),
+            "/response/candidates",
+            true,
+        ),
+    ] {
+        if let Some(candidates) = candidates_opt {
+            for (position, candidate) in candidates.iter().enumerate() {
+                let candidate_index = optional_index(candidate, "index")?.unwrap_or(position as u64);
+                if let Some(parts) = candidate.pointer("/content/parts").and_then(Value::as_array) {
+                    let mut text_ordinal = 0u64;
+                    let mut thought_ordinal = 0u64;
+                    for (part_position, part) in parts.iter().enumerate() {
+                        if part.get("text").is_some_and(Value::is_string) {
+                            let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
+                            let (field, ordinal) = if is_thought {
+                                let ord = thought_ordinal;
+                                thought_ordinal += 1;
+                                ("thought", ord)
+                            } else {
+                                let ord = text_ordinal;
+                                text_ordinal += 1;
+                                ("text", ord)
+                            };
+                            add(
+                                Key::Gemini {
+                                    candidate: candidate_index,
+                                    ordinal,
+                                    field,
+                                    wrapped,
+                                },
+                                format!("{base_ptr}/{position}/content/parts/{part_position}/text"),
+                                false,
+                                false,
+                                true,
+                            )?;
+                        }
                     }
                 }
             }
@@ -669,7 +705,10 @@ fn targets(value: &Value, kind: &str) -> io::Result<Vec<Target>> {
     let response_field = match kind {
         "response.output_text.delta" => Some(("output_text", false, false)),
         "response.reasoning_summary_text.delta" => Some(("reasoning_summary_text", false, false)),
+        "response.reasoning_text.delta" => Some(("reasoning_text", false, false)),
+        "response.audio_transcript.delta" => Some(("audio_transcript", false, false)),
         "response.refusal.delta" => Some(("refusal", false, false)),
+        "response.code_interpreter_call_code.delta" => Some(("code_interpreter_call_code", false, false)),
         "response.function_call_arguments.delta" => Some(("function_call_arguments", true, true)),
         "response.mcp_call_arguments.delta" => Some(("mcp_call_arguments", true, true)),
         "response.custom_tool_call_input.delta" => Some(("custom_tool_call_input", true, false)),
@@ -703,7 +742,13 @@ fn endings(value: &Value, kind: &str) -> io::Result<Vec<End>> {
             }
         }
     }
-    if let Some(candidates) = value.get("candidates").and_then(Value::as_array) {
+    for candidates in [
+        value.get("candidates").and_then(Value::as_array),
+        value.pointer("/response/candidates").and_then(Value::as_array),
+    ]
+    .into_iter()
+    .flatten()
+    {
         for (position, candidate) in candidates.iter().enumerate() {
             if nonnull(candidate, "finishReason") {
                 ends.push(End::Gemini(
@@ -722,7 +767,10 @@ fn endings(value: &Value, kind: &str) -> io::Result<Vec<End>> {
         "content_block_stop" => ends.push(End::Anthropic(index(value, "index")?)),
         "response.output_text.done"
         | "response.reasoning_summary_text.done"
+        | "response.reasoning_text.done"
+        | "response.audio_transcript.done"
         | "response.refusal.done"
+        | "response.code_interpreter_call_code.done"
         | "response.function_call_arguments.done"
         | "response.mcp_call_arguments.done"
         | "response.custom_tool_call_input.done"
@@ -732,7 +780,10 @@ fn endings(value: &Value, kind: &str) -> io::Result<Vec<End>> {
             let field = match kind {
                 "response.output_text.done" | "response.content_part.done" => Some("output_text"),
                 "response.reasoning_summary_text.done" => Some("reasoning_summary_text"),
+                "response.reasoning_text.done" => Some("reasoning_text"),
+                "response.audio_transcript.done" => Some("audio_transcript"),
                 "response.refusal.done" => Some("refusal"),
+                "response.code_interpreter_call_code.done" => Some("code_interpreter_call_code"),
                 "response.function_call_arguments.done" => Some("function_call_arguments"),
                 "response.mcp_call_arguments.done" => Some("mcp_call_arguments"),
                 "response.custom_tool_call_input.done" => Some("custom_tool_call_input"),
@@ -799,11 +850,28 @@ fn is_length_truncation_event(value: &Value, kind: &str) -> bool {
             cs.iter()
                 .any(|c| c.get("finishReason").and_then(Value::as_str) == Some("MAX_TOKENS"))
         })
+        || value
+            .pointer("/response/candidates")
+            .and_then(Value::as_array)
+            .is_some_and(|cs| {
+                cs.iter()
+                    .any(|c| c.get("finishReason").and_then(Value::as_str) == Some("MAX_TOKENS"))
+            })
 }
 
 fn chat_envelope(value: &Value) -> Value {
     let mut envelope = json!({});
-    for field in ["id", "object", "created", "model", "system_fingerprint", "service_tier"] {
+    for field in [
+        "id",
+        "object",
+        "created",
+        "model",
+        "system_fingerprint",
+        "service_tier",
+        "traceId",
+        "responseId",
+        "modelVersion",
+    ] {
         if let Some(v) = value.get(field) {
             envelope[field] = v.clone();
         }
@@ -1274,6 +1342,106 @@ mod tests {
             .collect();
         assert_eq!(text, "a real-secret b");
         assert_eq!(values(&out).last().unwrap()["candidates"][0]["finishReason"], "STOP");
+    }
+
+    #[test]
+    fn cloud_code_wrapped_response_stream_restores_split_key_and_thought_transition() {
+        let vault = PrivacyVault::new();
+        vault.insert_explicit(
+            "sk-wuehbfybhsbchj4564sceuajnchskr",
+            "sk-JJx3Ba1m2lUentN1vqsQNaMLY2bZ",
+            "ApiKey",
+        );
+        let mut r = SseRestorer::new(vault);
+        let input = frame(json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {"text": "thinking about sk-JJx3", "thought": true},
+                            {"text": "sk-JJx3"}
+                        ]
+                    }
+                }]
+            },
+            "traceId": "trace-cc-1"
+        })) + &frame(json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "Ba1m2lUentN1vqs"}]
+                    }
+                }]
+            },
+            "traceId": "trace-cc-1"
+        })) + &frame(json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "QNaMLY2bZ\n这看起来像一个 API 密钥"}]
+                    },
+                    "finishReason": "STOP"
+                }]
+            },
+            "traceId": "trace-cc-1"
+        }));
+
+        let mut out = r.push_bytes(input.as_bytes()).unwrap();
+        let (tail, total) = r.finish().unwrap();
+        out.push_str(&tail);
+
+        let events = values(&out);
+        let visible_text: String = events
+            .iter()
+            .flat_map(|v| {
+                v["response"]["candidates"][0]["content"]["parts"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter(|p| p.get("thought").and_then(Value::as_bool) != Some(true))
+            .filter_map(|p| p["text"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            visible_text,
+            "sk-wuehbfybhsbchj4564sceuajnchskr\n这看起来像一个 API 密钥"
+        );
+        assert!(!out.contains("sk-JJx3Ba1m2lUentN1vqsQNaMLY2bZ"));
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn cloud_code_wrapped_tail_flush_preserves_response_envelope_at_eof() {
+        let vault = PrivacyVault::new();
+        vault.insert_explicit("sk-real-secret-value-123456", "sk-placeholder-value-abcdef", "ApiKey");
+        let mut r = SseRestorer::new(vault);
+        let input = frame(json!({
+            "response": {
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "prefix sk-place"}]}
+                }]
+            },
+            "traceId": "trace-tail-1"
+        }));
+        let mut out = r.push_bytes(input.as_bytes()).unwrap();
+        let (tail, _total) = r.finish().unwrap();
+        out.push_str(&tail);
+        let events = values(&out);
+        assert!(events.iter().all(|v| v.pointer("/response/candidates").is_some()));
+        let text: String = events
+            .iter()
+            .flat_map(|v| {
+                v["response"]["candidates"][0]["content"]["parts"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|p| p["text"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(text, "prefix sk-place");
     }
 
     #[test]

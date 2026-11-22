@@ -1676,14 +1676,26 @@ fn check_configured(
             }
         }
         HarnessKind::Antigravity => {
-            for path in antigravity_settings_candidates(host) {
-                if check_vscode_proxy_file(&path, proxy_port, false) {
-                    return (true, Some(path.to_string_lossy().into_owned()));
+            let sys_proxy_ok = if cfg!(windows) {
+                host.backup_dir()
+                    .and_then(|d| d.parent().map(|p| p.join("config.json")))
+                    .filter(|p| p.is_file())
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .and_then(|raw| serde_json::from_str::<HideConfig>(&raw).ok())
+                    .is_none_or(|c| c.system_proxy_chain)
+            } else {
+                true
+            };
+            if sys_proxy_ok {
+                for path in antigravity_settings_candidates(host) {
+                    if check_vscode_proxy_file(&path, proxy_port, false) {
+                        return (true, Some(path.to_string_lossy().into_owned()));
+                    }
                 }
-            }
-            if backup_file_path(host, HarnessKind::Antigravity).is_some_and(|p| p.exists()) {
-                if let Some(via) = check_env_either(host, "HTTPS_PROXY", "", proxy_port) {
-                    return (true, Some(via));
+                if backup_file_path(host, HarnessKind::Antigravity).is_some_and(|p| p.exists()) {
+                    if let Some(via) = check_env_either(host, "HTTPS_PROXY", "", proxy_port) {
+                        return (true, Some(via));
+                    }
                 }
             }
         }
@@ -2625,13 +2637,13 @@ pub fn connect_harness_with_deps(
             }
             match enable_config_system_proxy_chain(config_path.as_deref()) {
                 Ok(enabled_now) => {
-                    if is_fresh_connect {
-                        backup.enabled_system_proxy_chain = enabled_now;
+                    if is_fresh_connect || enabled_now {
+                        backup.enabled_system_proxy_chain = backup.enabled_system_proxy_chain || enabled_now;
                     }
                 }
                 Err(e) => return fail_with_rollback(&backup, e),
             }
-            targets_summary.push("System Proxy Chain + Managed Env (HTTPS_PROXY, NODE_EXTRA_CA_CERTS)".to_string());
+            targets_summary.push("System Proxy + User Env (HTTPS_PROXY, CA)".to_string());
         }
         HarnessKind::Zcode => {
             if let Err(e) = set_harness_env_var(host, &mut backup, "ZCODE_HTTP_PROXY", &proxy_url) {

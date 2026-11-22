@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
 pub mod all_hide;
+pub mod audit;
 pub mod ca;
 pub mod config;
 pub mod connect;

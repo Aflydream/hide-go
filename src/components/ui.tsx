@@ -214,9 +214,22 @@ const TONE: Record<Tone, string> = {
   neutral: 'text-fg-muted bg-surface-3 border-line-strong',
 };
 
-export function Badge({ tone = 'neutral', children, className, dot }: { tone?: Tone; children: ReactNode; className?: string; dot?: boolean }) {
+export function Badge({
+  tone = 'neutral',
+  children,
+  className,
+  dot,
+  title,
+}: {
+  tone?: Tone;
+  children: ReactNode;
+  className?: string;
+  dot?: boolean;
+  title?: string;
+}) {
   return (
     <span
+      title={title}
       className={cx(
         'inline-flex h-5 shrink-0 items-center gap-1 whitespace-nowrap rounded-sm border px-1.5 text-2xs font-medium',
         TONE[tone],

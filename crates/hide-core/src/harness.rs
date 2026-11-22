@@ -394,7 +394,10 @@ pub fn detect_harness_and_category(path: &str, user_agent: Option<&str>, body: &
         HarnessKind::Generic
     };
 
-    let segments: Vec<&str> = path_lower.split(['/', '?', ':']).filter(|s| !s.is_empty()).collect();
+    let segments: Vec<&str> = path_lower
+        .split(['/', '?', ':', '.'])
+        .filter(|s| !s.is_empty())
+        .collect();
     let has_segment = |names: &[&str]| segments.iter().any(|s| names.contains(s));
 
     let category = if is_inference_endpoint(&path_lower) {

@@ -50,10 +50,14 @@ const EXACT_AI_MITM_HOSTS: &[&str] = &[
     "api.openai.com",
     "generativelanguage.googleapis.com",
     "cloudcode-pa.googleapis.com",
+    "daily-cloudcode-pa.googleapis.com",
+    "autopush-cloudcode-pa.googleapis.com",
+    "staging-cloudcode-pa.googleapis.com",
     "cloudaicompanion.googleapis.com",
     "daily-cloudcode-pa.sandbox.googleapis.com",
     "autopush-cloudcode-pa.sandbox.googleapis.com",
     "antigravity-pa.googleapis.com",
+    "jetski-webchannel.googleapis.com",
     "aiplatform.googleapis.com",
     "api2.cursor.sh",
     "api3.cursor.sh",
@@ -171,6 +175,15 @@ fn is_builtin_ai_wildcard(host: &str) -> bool {
         }
     }
     false
+}
+
+/// Returns `true` if `host` matches Hide-Go's built-in AI API MITM host list.
+pub fn is_builtin_ai_mitm_host(host: &str) -> bool {
+    let norm = normalize_host(host);
+    if norm.is_empty() || norm.contains('*') || NEVER_MITM_EXACT_HOSTS.contains(&norm.as_str()) {
+        return false;
+    }
+    EXACT_AI_MITM_HOSTS.contains(&norm.as_str()) || is_builtin_ai_wildcard(&norm)
 }
 
 /// Decide whether a destination hostname should undergo selective TLS MITM.
@@ -660,17 +673,48 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
         };
 
         let on_upgrade = hyper::upgrade::on(req);
+        let audit_state = state.clone();
+        let audit_host = host.clone();
+        let started_at = std::time::Instant::now();
         tokio::spawn(async move {
             let _permit = permit;
             match on_upgrade.await {
                 Ok(upgraded) => {
                     let mut client_io = TokioIo::new(upgraded);
-                    if let Err(err) = tokio::io::copy_bidirectional(&mut client_io, &mut upstream).await {
-                        tracing::debug!("TCP passthrough closed for {host}:{port}: {err}");
+                    match tokio::io::copy_bidirectional(&mut client_io, &mut upstream).await {
+                        Ok((to_upstream, to_client)) => {
+                            let signals = crate::audit::inspect_connect_tunnel_audit(&audit_host, to_upstream);
+                            if !signals.is_empty() {
+                                audit_state.record_passthrough_tunnel_audit(
+                                    &audit_host,
+                                    port,
+                                    to_upstream,
+                                    to_client,
+                                    started_at.elapsed().as_millis() as u64,
+                                    signals,
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::debug!("TCP passthrough closed for {audit_host}:{port}: {err}");
+                            if crate::audit::classify_host_risk(&audit_host) == crate::audit::HostRiskKind::Telemetry {
+                                let signals = crate::audit::inspect_connect_tunnel_audit(&audit_host, 0);
+                                if !signals.is_empty() {
+                                    audit_state.record_passthrough_tunnel_audit(
+                                        &audit_host,
+                                        port,
+                                        0,
+                                        0,
+                                        started_at.elapsed().as_millis() as u64,
+                                        signals,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 Err(err) => {
-                    tracing::debug!("CONNECT upgrade failed for {host}:{port}: {err}");
+                    tracing::debug!("CONNECT upgrade failed for {audit_host}:{port}: {err}");
                 }
             }
         });
@@ -1126,7 +1170,9 @@ mod tests {
             "API.OPENAI.COM",
             "generativelanguage.googleapis.com",
             "cloudcode-pa.googleapis.com",
+            "daily-cloudcode-pa.googleapis.com",
             "daily-cloudcode-pa.sandbox.googleapis.com",
+            "jetski-webchannel.googleapis.com",
             "us-central1-aiplatform.googleapis.com",
             "api2.cursor.sh",
             "api3.cursorapi.com",

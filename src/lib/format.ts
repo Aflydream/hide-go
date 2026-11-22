@@ -1,4 +1,4 @@
-import type { CoverTheme, FindingKind, HarnessKind, PrivacyMode, Severity, ToolCallSecretPolicy, TrafficCategory } from '../types';
+import type { AuditSignalKind, CoverTheme, FindingKind, HarnessKind, PrivacyMode, Severity, ToolCallSecretPolicy, TrafficCategory } from '../types';
 import { LOCALE_META, translate, type Locale, type MessageKey } from './i18n';
 
 export const HARNESS_ORDER: HarnessKind[] = ['claude-code', 'codex', 'antigravity', 'zcode', 'qoder', 'cursor', 'grok-build'];
@@ -112,6 +112,19 @@ export function getSeverityLabel(severity: Severity, locale: Locale): string {
   return SEVERITY_KEYS[severity] ? translate(locale, SEVERITY_KEYS[severity]) : severity;
 }
 
+const AUDIT_SIGNAL_KEYS: Record<AuditSignalKind, MessageKey> = {
+  'telemetry-endpoint': 'auditSignal.telemetryEndpoint',
+  'telemetry-payload': 'auditSignal.telemetryPayload',
+  'archive-upload': 'auditSignal.archiveUpload',
+  'bulk-codebase-upload': 'auditSignal.bulkCodebaseUpload',
+  'large-outbound-payload': 'auditSignal.largeOutboundPayload',
+  'sensitive-data-exfil': 'auditSignal.sensitiveDataExfil',
+};
+
+export function getAuditSignalLabel(kind: AuditSignalKind, locale: Locale): string {
+  return AUDIT_SIGNAL_KEYS[kind] ? translate(locale, AUDIT_SIGNAL_KEYS[kind]) : kind;
+}
+
 /** Human description of what the gateway did with a request. */
 export function describeAction(
   action: string,
@@ -132,6 +145,12 @@ export function describeAction(
   }
   if (action === 'telemetry-blocked') {
     return { label: translate(locale, 'action.telemetryBlocked'), tone: 'warn' };
+  }
+  if (action === 'telemetry-audited') {
+    return { label: translate(locale, 'action.telemetryAudited'), tone: 'warn' };
+  }
+  if (action === 'upload-audited') {
+    return { label: translate(locale, 'action.uploadAudited'), tone: 'warn' };
   }
   if (action === 'chaff-injected') {
     return { label: translate(locale, 'action.chaffInjected'), tone: 'warn' };

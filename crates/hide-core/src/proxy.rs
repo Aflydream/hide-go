@@ -211,6 +211,7 @@ pub struct ObservedConnectHost {
     pub port: u16,
     pub mitm: bool,
     pub tls_failed: bool,
+    pub risk_kind: crate::audit::HostRiskKind,
     pub count: u64,
     pub last_seen_at: String,
     #[serde(skip)]
@@ -522,10 +523,12 @@ impl GatewayState {
                 map.remove(&oldest_key);
             }
         }
+        let norm_host = host.trim().to_ascii_lowercase();
         map.insert(
             key,
             ObservedConnectHost {
-                host: host.trim().to_ascii_lowercase(),
+                risk_kind: crate::audit::classify_host_risk(&norm_host),
+                host: norm_host,
                 port,
                 mitm,
                 tls_failed,
@@ -569,6 +572,67 @@ impl GatewayState {
             withheld_count: 0,
             upstream_vendor: Some(host.to_string()),
         }));
+    }
+
+    /// Surface a raw TCP passthrough `CONNECT` tunnel when telemetry or bulk upload signals
+    /// are detected (so audit-only mode reports background telemetry and upload storage activity).
+    pub fn record_passthrough_tunnel_audit(
+        &self,
+        host: &str,
+        port: u16,
+        bytes_sent: u64,
+        bytes_received: u64,
+        latency_ms: u64,
+        audit_signals: Vec<crate::audit::AuditSignal>,
+    ) {
+        let harness = detect_harness_for_host(host).unwrap_or(HarnessKind::Generic);
+        let cfg = self.get_config();
+        let endpoint = if port == 443 {
+            format!("https://{host}")
+        } else {
+            format!("https://{host}:{port}")
+        };
+        let is_telemetry = crate::audit::has_telemetry_signal(&audit_signals);
+        let category = if is_telemetry {
+            TrafficCategory::Telemetry
+        } else {
+            TrafficCategory::CodebaseIndexing
+        };
+        let summary = audit_signals
+            .iter()
+            .map(|s| s.detail.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let req_note = format!("[encrypted CONNECT passthrough to {host}:{port} — {bytes_sent} B sent]");
+        let resp_note = format!("[encrypted tunnel summary: {summary}; {bytes_received} B received]");
+        let mut rec = build_record(RecordInput {
+            harness,
+            category,
+            method: "CONNECT".to_string(),
+            endpoint,
+            mode: cfg.mode,
+            action_taken: if is_telemetry {
+                "telemetry-audited".to_string()
+            } else {
+                "upload-audited".to_string()
+            },
+            status: 200,
+            start: Instant::now(),
+            simulated: false,
+            local_request: &req_note,
+            vendor_request: &req_note,
+            vendor_response: &resp_note,
+            local_response: &resp_note,
+            findings: Vec::new(),
+            restored_count: 0,
+            withheld_count: 0,
+            upstream_vendor: Some(host.to_string()),
+        });
+        rec.request_bytes = bytes_sent.min(usize::MAX as u64) as usize;
+        rec.response_bytes = bytes_received.min(usize::MAX as u64) as usize;
+        rec.latency_ms = latency_ms.max(1);
+        rec.audit_signals = audit_signals;
+        self.push_record(rec);
     }
 
     pub fn get_config(&self) -> HideConfig {
@@ -852,7 +916,12 @@ pub fn transform_outbound_scoped(
         }
         PrivacyMode::AutoDesensitize => {
             let res = SemanticDesensitizer::process_with_scope(raw_request, cfg, vault, scope);
-            (res.transformed_payload, "desensitized".to_string(), res.findings)
+            let action = if res.findings.is_empty() && res.transformed_payload == raw_request {
+                "passed"
+            } else {
+                "desensitized"
+            };
+            (res.transformed_payload, action.to_string(), res.findings)
         }
         PrivacyMode::AllHide => {
             let out = AllHideEngine::process_with_scope(raw_request, category, cfg, vault, scope);
@@ -947,6 +1016,31 @@ fn build_record(i: RecordInput) -> TrafficAuditRecord {
     let upstream_vendor = i
         .upstream_vendor
         .unwrap_or_else(|| GatewayState::vendor_for_harness(i.harness).to_string());
+    let finding_total: usize = i.findings.iter().map(|f| f.count).sum();
+    let inferred_host = reqwest::Url::parse(&i.endpoint)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .or_else(|| {
+            if upstream_vendor.contains('.') && !upstream_vendor.contains(' ') {
+                Some(upstream_vendor.clone())
+            } else {
+                None
+            }
+        });
+    let audit_signals = if i.action_taken == "tls-handshake-failed" {
+        Vec::new()
+    } else {
+        crate::audit::inspect_http_audit_signals(
+            inferred_host.as_deref(),
+            &i.endpoint,
+            None,
+            None,
+            i.local_request.as_bytes(),
+            Some(i.local_request),
+            i.category,
+            finding_total,
+        )
+    };
     TrafficAuditRecord {
         id: Uuid::new_v4().to_string(),
         timestamp: Local::now().format("%H:%M:%S%.3f").to_string(),
@@ -968,6 +1062,7 @@ fn build_record(i: RecordInput) -> TrafficAuditRecord {
         local_restored_response: cap_payload(i.local_response, &mut truncated),
         truncated,
         findings: i.findings,
+        audit_signals,
         restored_count: i.restored_count,
         withheld_count: i.withheld_count,
     }
@@ -994,6 +1089,9 @@ pub struct StatusResponse {
     pub total_withheld: u64,
     pub total_blocked: u64,
     pub active_vault_tokens: usize,
+    pub telemetry_detected: u64,
+    pub bulk_upload_detected: u64,
+    pub harness_audit: Vec<crate::audit::HarnessAuditSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1282,6 +1380,8 @@ fn json_error(status: StatusCode, code: &str, message: impl Into<String>) -> Res
 
 async fn api_status(State(state): State<GatewayState>) -> Json<StatusResponse> {
     let s = &state.stats;
+    let records = state.get_records();
+    let (telemetry_detected, bulk_upload_detected, harness_audit) = crate::audit::summarize_harness_audit(&records);
     Json(StatusResponse {
         status: "running",
         version: env!("CARGO_PKG_VERSION"),
@@ -1293,6 +1393,9 @@ async fn api_status(State(state): State<GatewayState>) -> Json<StatusResponse> {
         total_withheld: s.withheld.load(Ordering::Relaxed),
         total_blocked: s.blocked.load(Ordering::Relaxed),
         active_vault_tokens: state.vault.len(),
+        telemetry_detected,
+        bulk_upload_detected,
+        harness_audit,
     })
 }
 
@@ -1633,7 +1736,16 @@ async fn api_ca_status(State(state): State<GatewayState>) -> Response {
 async fn api_ca_trust(State(state): State<GatewayState>) -> Response {
     let ca = state.ca.clone();
     match tokio::task::spawn_blocking(move || ca.install_trust()).await {
-        Ok(Ok(status)) => Json(status).into_response(),
+        Ok(Ok(status)) => {
+            let (sys_proxy_enabled, proxy_port) = {
+                let cfg = state.config.read();
+                (cfg.system_proxy_chain, cfg.proxy_port)
+            };
+            if sys_proxy_enabled && state.use_system_upstream_proxy && !state.allow_loopback_for_tests {
+                sync_system_proxy_runtime(true, proxy_port);
+            }
+            Json(status).into_response()
+        }
         Ok(Err(msg)) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "ca_trust_failed", msg),
         Err(_) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1730,16 +1842,20 @@ fn is_binary_response_content_type(ct: Option<&str>) -> bool {
 
 fn detect_harness_for_host(host: &str) -> Option<HarnessKind> {
     let h = host.trim().to_ascii_lowercase();
-    if h == "api.anthropic.com" {
+    if h == "api.anthropic.com" || h == "statsig.anthropic.com" || h == "telemetry.anthropic.com" {
         Some(HarnessKind::ClaudeCode)
-    } else if h == "api.openai.com" || h == "chatgpt.com" || h.ends_with(".openai.azure.com") {
+    } else if h == "api.openai.com" || h == "chatgpt.com" || h == "ab.chatgpt.com" || h.ends_with(".openai.azure.com") {
         Some(HarnessKind::Codex)
     } else if h == "generativelanguage.googleapis.com"
         || h == "cloudcode-pa.googleapis.com"
+        || h == "daily-cloudcode-pa.googleapis.com"
+        || h == "autopush-cloudcode-pa.googleapis.com"
+        || h == "staging-cloudcode-pa.googleapis.com"
         || h == "cloudaicompanion.googleapis.com"
         || h == "daily-cloudcode-pa.sandbox.googleapis.com"
         || h == "autopush-cloudcode-pa.sandbox.googleapis.com"
         || h == "antigravity-pa.googleapis.com"
+        || h == "jetski-webchannel.googleapis.com"
         || h == "aiplatform.googleapis.com"
         || h.ends_with("-aiplatform.googleapis.com")
         || h.ends_with("-generativelanguage.googleapis.com")
@@ -2767,6 +2883,22 @@ async fn execute_proxy_forward(
         None => String::from_utf8_lossy(&vendor_body).into_owned(),
     };
     let raw_request_len = body.len();
+    let req_content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let req_host = target_url.host_str().map(str::to_string);
+    let finding_total: usize = findings.iter().map(|f| f.count).sum();
+    let http_audit_signals = crate::audit::inspect_http_audit_signals(
+        req_host.as_deref(),
+        &telemetry_path,
+        req_content_type.as_deref(),
+        request_encoding,
+        body.as_ref(),
+        inspectable_text,
+        category,
+        finding_total,
+    );
     let record_base =
         |status: u16, vendor_response: &str, local_response: &str, restored: usize, withheld: usize, action: String| {
             let mut rec = build_record(RecordInput {
@@ -2789,6 +2921,7 @@ async fn execute_proxy_forward(
                 upstream_vendor: upstream_vendor.clone(),
             });
             rec.request_bytes = raw_request_len;
+            rec.audit_signals = http_audit_signals.clone();
             rec
         };
 
@@ -3075,6 +3208,16 @@ fn upstream_protobuf_request_headers(
     if framing == ProtobufFraming::Grpc {
         forwarded.insert(header::TE, "trailers".parse().unwrap());
     }
+    // Constrain advertised frame encodings to codecs we can decompress and re-encode losslessly.
+    if forwarded.contains_key("grpc-accept-encoding") {
+        forwarded.insert("grpc-accept-encoding", "identity,gzip,deflate".parse().unwrap());
+    }
+    if forwarded.contains_key("connect-accept-encoding") {
+        forwarded.insert("connect-accept-encoding", "identity,gzip,deflate".parse().unwrap());
+    }
+    if forwarded.contains_key(header::ACCEPT_ENCODING) {
+        forwarded.insert(header::ACCEPT_ENCODING, "identity, gzip, deflate".parse().unwrap());
+    }
     forwarded
 }
 
@@ -3153,6 +3296,18 @@ async fn execute_protobuf_forward(state: &GatewayState, input: ProtobufForwardIn
     };
     let action_taken = transformed.action_taken;
     let findings = transformed.findings;
+    let pb_host = target_url.host_str().map(str::to_string);
+    let pb_finding_total: usize = findings.iter().map(|f| f.count).sum();
+    let pb_audit_signals = crate::audit::inspect_http_audit_signals(
+        pb_host.as_deref(),
+        &endpoint_label,
+        Some(&req_ct_str),
+        headers.get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()),
+        body.as_ref(),
+        Some(&local_req_preview),
+        category,
+        pb_finding_total,
+    );
 
     let make_record =
         |status: u16, vendor_response: &str, local_response: &str, restored: usize, withheld: usize, action: String| {
@@ -3176,6 +3331,7 @@ async fn execute_protobuf_forward(state: &GatewayState, input: ProtobufForwardIn
                 upstream_vendor: upstream_vendor.clone(),
             });
             rec.request_bytes = raw_req_len;
+            rec.audit_signals = pb_audit_signals.clone();
             rec
         };
 
@@ -3587,6 +3743,32 @@ impl GrpcProxyStreamState {
             record.findings = m.findings.clone();
             self.action_taken = m.action_taken(*mode);
             record.action_taken = self.action_taken.clone();
+            let finding_total: usize = record.findings.iter().map(|f| f.count).sum();
+            let host = reqwest::Url::parse(&record.endpoint)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string));
+            let mut signals = crate::audit::inspect_http_audit_signals(
+                host.as_deref(),
+                &record.endpoint,
+                Some(req_ct),
+                None,
+                record.local_request_payload.as_bytes(),
+                Some(&record.local_request_payload),
+                record.category,
+                finding_total,
+            );
+            if m.request_bytes >= 1024 * 1024
+                && !signals
+                    .iter()
+                    .any(|s| s.kind == crate::audit::AuditSignalKind::LargeOutboundPayload)
+            {
+                signals.push(crate::audit::AuditSignal {
+                    kind: crate::audit::AuditSignalKind::LargeOutboundPayload,
+                    severity: crate::audit::AuditSeverity::Warn,
+                    detail: format!("Large streaming RPC payload ({} bytes)", m.request_bytes),
+                });
+            }
+            record.audit_signals = signals;
         }
         let fallback_note = format!("[{}, {} bytes]", self.resp_ct, record.response_bytes);
         let vendor_prev = self.restorer.vendor_preview();
@@ -4872,6 +5054,182 @@ mod tests {
         assert_eq!(records[0].harness, HarnessKind::Antigravity);
         assert_eq!(records[0].action_taken, "protobuf-desensitized");
         assert!(!records[0].findings.is_empty());
+        assert_eq!(records[0].restored_count, 1);
+    }
+
+    #[tokio::test]
+    async fn audit_mode_surfaces_telemetry_bulk_upload_and_harness_summary() {
+        use tower::ServiceExt as _;
+        let mut cfg = HideConfig::default();
+        cfg.mode = PrivacyMode::AuditOnly;
+        let state = test_state(cfg);
+
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().fallback(|| async {
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"ok":true}"#,
+            )
+        });
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let app = build_router(state.clone());
+
+        // 1. Telemetry event carrying a leaked key in Audit-Only mode
+        let tel_body = r#"{"machineId":"host-1","osVersion":"win11","telemetry":"sk-audit998877665544332211"}"#;
+        let tel_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/claude-code/v1/telemetry")
+            .header("host", "127.0.0.1:18787")
+            .header("content-type", "application/json")
+            .header("x-hide-go-token", TEST_TOKEN)
+            .header("x-hide-go-upstream", format!("http://{upstream_addr}"))
+            .body(Body::from(tel_body))
+            .unwrap();
+        let tel_resp = app.clone().oneshot(tel_req).await.unwrap();
+        assert_eq!(tel_resp.status(), StatusCode::OK);
+
+        // 2. Packaged ZIP upload to a codebase sync endpoint in Audit-Only mode
+        let zip_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/cursor/upload-chunks")
+            .header("host", "127.0.0.1:18787")
+            .header("content-type", "application/zip")
+            .header("x-hide-go-token", TEST_TOKEN)
+            .header("x-hide-go-upstream", format!("http://{upstream_addr}"))
+            .body(Body::from(&b"PK\x03\x04dummy-archive-bytes"[..]))
+            .unwrap();
+        let zip_resp = app.clone().oneshot(zip_req).await.unwrap();
+        assert_eq!(zip_resp.status(), StatusCode::OK);
+
+        // 3. Passthrough telemetry tunnel audit record
+        let tunnel_signals = crate::audit::inspect_connect_tunnel_audit("play.googleapis.com", 4096);
+        state.record_passthrough_tunnel_audit("play.googleapis.com", 443, 4096, 512, 12, tunnel_signals);
+
+        let status_req = axum::http::Request::builder()
+            .uri("/api/status")
+            .header("host", "127.0.0.1:18787")
+            .header("x-hide-go-token", TEST_TOKEN)
+            .body(Body::empty())
+            .unwrap();
+        let status_resp = app.oneshot(status_req).await.unwrap();
+        assert_eq!(status_resp.status(), StatusCode::OK);
+        let status_bytes = axum::body::to_bytes(status_resp.into_body(), 64 * 1024).await.unwrap();
+        let status_json: Value = serde_json::from_slice(&status_bytes).unwrap();
+        assert_eq!(status_json["telemetryDetected"], 2);
+        assert_eq!(status_json["bulkUploadDetected"], 1);
+        let summaries = status_json["harnessAudit"].as_array().unwrap();
+        assert!(summaries
+            .iter()
+            .any(|s| s["harness"] == "claude-code" && s["telemetryEvents"] == 1 && s["sensitiveExfilEvents"] == 1));
+        assert!(summaries
+            .iter()
+            .any(|s| s["harness"] == "cursor" && s["bulkUploadEvents"] == 1));
+    }
+
+    #[tokio::test]
+    async fn cloud_code_stream_generate_content_sse_restores_split_api_key_end_to_end() {
+        let mut cfg = HideConfig::default();
+        cfg.mode = PrivacyMode::AutoDesensitize;
+        let state = test_state(cfg);
+
+        // Mock upstream mimicking `daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse`:
+        // extracts the masked `sk-...` key from the outbound request and streams it back inside
+        // Cloud Code's `{"response":{"candidates":[...]}}` wrapper split into 4-byte SSE chunks.
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().fallback(|body: Bytes| async move {
+            let text = String::from_utf8_lossy(&body).into_owned();
+            assert!(
+                !text.contains("sk-wuehbfybhsbchj4564sceuajnchskr"),
+                "upstream must never receive raw secret"
+            );
+            let start = text.find("sk-").expect("masked key present in vendor request");
+            let masked_key: String = text[start..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            let mut sse = String::new();
+            let bytes = masked_key.as_bytes();
+            for chunk in bytes.chunks(4) {
+                let piece = std::str::from_utf8(chunk).unwrap();
+                let ev = serde_json::json!({
+                    "response": {
+                        "candidates": [{
+                            "content": {"role": "model", "parts": [{"text": piece}]}
+                        }]
+                    },
+                    "traceId": "trace-e2e-cc"
+                });
+                sse.push_str(&format!("data: {ev}\n\n"));
+            }
+            let fin = serde_json::json!({
+                "response": {
+                    "candidates": [{
+                        "content": {"role": "model", "parts": [{"text": " done"}]},
+                        "finishReason": "STOP"
+                    }]
+                },
+                "traceId": "trace-e2e-cc"
+            });
+            sse.push_str(&format!("data: {fin}\n\n"));
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")],
+                sse,
+            )
+        });
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let gateway = serve(build_router(state.clone())).await;
+        let req_body = serde_json::json!({
+            "project": "aicode-consumers",
+            "request": {
+                "contents": [{
+                    "role": "user",
+                    "parts": [{"text": "复述一下 sk-wuehbfybhsbchj4564sceuajnchskr"}]
+                }]
+            }
+        })
+        .to_string();
+        let resp = client()
+            .post(format!(
+                "{gateway}/antigravity/v1internal:streamGenerateContent?alt=sse"
+            ))
+            .header("x-hide-go-token", TEST_TOKEN)
+            .header("x-hide-go-upstream", format!("http://{upstream_addr}"))
+            .header("content-type", "application/json")
+            .body(req_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sse_body = resp.text().await.unwrap();
+        let mut assembled = String::new();
+        for line in sse_body.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                let val: Value = serde_json::from_str(data).unwrap();
+                if let Some(parts) = val
+                    .pointer("/response/candidates/0/content/parts")
+                    .and_then(Value::as_array)
+                {
+                    for p in parts {
+                        if let Some(t) = p.get("text").and_then(Value::as_str) {
+                            assembled.push_str(t);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(assembled, "sk-wuehbfybhsbchj4564sceuajnchskr done");
+        let records = state.get_records();
+        assert_eq!(records.len(), 1);
         assert_eq!(records[0].restored_count, 1);
     }
 }

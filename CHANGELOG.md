@@ -2,6 +2,25 @@
 
 All notable changes to Hide-Go are documented in this file.
 
+## [Unreleased]
+
+### Added
+- Audit risk engine (`audit.rs`) detecting telemetry endpoints and payloads, archive/multipart packaging uploads, bulk codebase syncs, oversized outbound payloads, and sensitive values inside telemetry or bulk uploads across HTTP, MITM, and raw `CONNECT` passthrough tunnels
+- Per-harness audit summary (`telemetryDetected`, `bulkUploadDetected`, `harnessAudit`) in `GET /api/status`, host risk tags (`telemetry` / `upload-storage`) in `GET /api/mitm/hosts`, and compact Traffic audit strip, signal badges, and telemetry/bulk-upload filters
+
+### Changed
+- Manage reversible Windows User Environment Variables (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, and local CA bundle paths via `HKCU\Environment` + `WM_SETTINGCHANGE`) alongside WinInet when `systemProxyChain` is active, so Go/desktop language servers inherit proxy and CA settings and restore cleanly on disconnect, shutdown, console close, logoff, startup recovery, or uninstall
+- Include `daily-cloudcode-pa.googleapis.com`, `autopush-cloudcode-pa.googleapis.com`, `staging-cloudcode-pa.googleapis.com`, and `jetski-webchannel.googleapis.com` in built-in AI MITM hosts and Antigravity attribution
+- Preserve byte-identical JSON payloads and report `passed` when zero items are masked in `AutoDesensitize`, register Windows path separator and drive-case restoration aliases, and expand OpenAI Responses delta event coverage (`reasoning_text`, `audio_transcript`, `code_interpreter_call_code`)
+
+### Fixed
+- Restore split placeholders across Google Cloud Code `{"response":{"candidates":[...]}}` SSE streams and JSON array chunks, keeping `thought` and `text` part channels aligned on transitions
+- Protect Google Cloud Code structural keys (`project`, `requestId`, `traceId`, `responseId`), Gemini `functionCall` names, and signed Gemini thought blocks (`thoughtSignature`), and stop skipping arbitrary JSON `"data"` fields during restoration
+- Fix Protobuf/gRPC 3+ frame split-placeholder restoration, tighten printable submessage recursion to avoid skipping short IPs or corrupting `": sk-..."` text, clear compressed flags on compression fallback, split dotted gRPC paths for telemetry/indexing classification, and run full audit signal analysis on Protobuf and streaming RPC payloads
+- Clear cached `Matcher` snapshots on `PrivacyVault::clear()`, enforce `allow_secret` on non-string JSON secrets, avoid O(N²) eviction scans, fix percent-encoded secret boundary checks, and prevent double-masking current `work/<tag>` path placeholders
+- Bound desktop graceful server drain to 1.5s and install Windows console control / Unix `SIGTERM` cleanup handlers so closing Hide-Go never hangs on open streams or leaves system proxy settings behind
+- Stop reporting Antigravity as configured on Windows when legacy `settings.json` proxy entries exist without `systemProxyChain` active, and refresh managed user CA environment variables immediately after trusting the local Root CA
+
 ## [0.3.0] - 2026-11-22
 
 ### Added

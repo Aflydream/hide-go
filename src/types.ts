@@ -68,11 +68,41 @@ export interface HideConfig {
   mitmBypassHosts?: string[];
 }
 
+export type HostRiskKind = 'telemetry' | 'upload-storage' | 'ai-api' | 'general';
+
+export type AuditSignalKind =
+  | 'telemetry-endpoint'
+  | 'telemetry-payload'
+  | 'archive-upload'
+  | 'bulk-codebase-upload'
+  | 'large-outbound-payload'
+  | 'sensitive-data-exfil';
+
+export type AuditSeverity = 'info' | 'warn' | 'high';
+
+export interface AuditSignal {
+  kind: AuditSignalKind;
+  severity: AuditSeverity;
+  detail: string;
+}
+
+export interface HarnessAuditSummary {
+  harness: HarnessKind;
+  totalRequests: number;
+  telemetryEvents: number;
+  bulkUploadEvents: number;
+  sensitiveExfilEvents: number;
+  outboundBytes: number;
+  telemetryHosts: string[];
+  uploadHosts: string[];
+}
+
 export interface ObservedConnectHost {
   host: string;
   port: number;
   mitm: boolean;
   tlsFailed: boolean;
+  riskKind?: HostRiskKind;
   count: number;
   lastSeenAt: string;
 }
@@ -111,6 +141,7 @@ export interface TrafficSummary {
   responseBytes: number;
   findingCount: number;
   topSeverity: Severity | null;
+  auditSignals?: AuditSignal[];
   restoredCount: number;
   withheldCount: number;
 }
@@ -136,6 +167,7 @@ export interface TrafficAuditRecord {
   responseBytes: number;
   truncated: boolean;
   findings: LeakFinding[];
+  auditSignals?: AuditSignal[];
   restoredCount: number;
   withheldCount: number;
 }
@@ -208,6 +240,9 @@ export interface GatewayStatus {
   totalWithheld: number;
   totalBlocked: number;
   activeVaultTokens: number;
+  telemetryDetected?: number;
+  bulkUploadDetected?: number;
+  harnessAudit?: HarnessAuditSummary[];
 }
 
 export interface RuleValidation {

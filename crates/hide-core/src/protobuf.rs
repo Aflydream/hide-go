@@ -238,30 +238,29 @@ fn should_recurse_printable_submessage(text: &str, fields: &[PbField<'_>], depth
     if fields.iter().any(|f| f.field_num > 2048) {
         return false;
     }
-    if fields.len() >= 2 {
+    let has_len_delim = fields
+        .iter()
+        .any(|f| matches!(&f.value, PbValue::LenDelim(inner) if !inner.is_empty()));
+    if !has_len_delim {
+        return false;
+    }
+    // If any inner LenDelim payload is itself binary Protobuf, this is genuinely a nested message.
+    if fields.iter().any(|f| {
+        matches!(
+            &f.value,
+            PbValue::LenDelim(inner)
+                if !inner.is_empty() && is_clean_printable_utf8(inner).is_none() && parse_pb_message(inner).is_some()
+        )
+    }) {
         return true;
     }
-    // Single-field printable message:
-    let f = &fields[0];
-    if f.field_num == 1 {
-        return true;
+    // Single-field `0x0A <len> <text>` (field 1 LenDelim, e.g. `Part { string text = 1; }`).
+    if fields.len() == 1 {
+        return fields[0].field_num == 1 && matches!(fields[0].value, PbValue::LenDelim(_));
     }
-    if let PbValue::LenDelim(inner) = &f.value {
-        if !inner.is_empty() && is_clean_printable_utf8(inner).is_none() && parse_pb_message(inner).is_some() {
-            return true;
-        }
-    }
-    if matches!(f.field_num, 2..=7) {
-        let bytes = text.as_bytes();
-        if bytes.first() == Some(&b'"') && text.ends_with('"') {
-            return false;
-        }
-        if bytes.first() == Some(&b'*') && matches!(bytes.get(1), Some(b' ' | b'*')) {
-            return false;
-        }
-        return true;
-    }
-    false
+    // Multi-field printable submessage: require at least one field tag in `1..=3` (control byte
+    // `0x08..=0x1F`, which does not appear in ordinary prose) alongside a LenDelim field.
+    fields.iter().any(|f| matches!(f.field_num, 1..=3))
 }
 
 fn looks_like_secret_prefix(s: &str) -> bool {
@@ -733,11 +732,20 @@ fn trailing_token_prefix_len(matcher: &Matcher, text: &str) -> usize {
     }
     let max_suffix = (max_token_len - 1).min(text.len());
     let start_bound = text.len().saturating_sub(max_suffix);
+    let bytes = text.as_bytes();
     for (idx, _) in text.char_indices() {
         if idx < start_bound {
             continue;
         }
-        if matcher.is_strict_prefix(&text[idx..]) {
+        let suffix = &text[idx..];
+        if idx > 0 {
+            let prev = bytes[idx - 1];
+            let first = suffix.as_bytes()[0];
+            if (prev.is_ascii_alphanumeric() || prev == b'_') && (first.is_ascii_alphanumeric() || first == b'_') {
+                continue;
+            }
+        }
+        if matcher.is_strict_prefix(suffix) {
             return text.len() - idx;
         }
     }
@@ -788,7 +796,12 @@ fn restore_pb_recursive(bytes: &[u8], st: &mut InboundWalkState<'_>, depth: usiz
                 st.matcher.restore(&candidate, None, allow_secret)
             };
             if used_prefix {
-                if count > 0 {
+                let (alone_restored, alone_count, alone_withheld) = if looks_like_json_container(text) {
+                    restore_response(st.matcher, text, st.policy)
+                } else {
+                    st.matcher.restore(text, None, allow_secret)
+                };
+                if count > alone_count {
                     // Consumed the carried prefix and completed a split placeholder!
                     st.pending_prefix_to_prepend = None;
                     st.restored_count += count;
@@ -804,11 +817,6 @@ fn restore_pb_recursive(bytes: &[u8], st: &mut InboundWalkState<'_>, depth: usiz
                     continue;
                 } else {
                     // Prefix did not combine here; restore `text` alone.
-                    let (alone_restored, alone_count, alone_withheld) = if looks_like_json_container(text) {
-                        restore_response(st.matcher, text, st.policy)
-                    } else {
-                        st.matcher.restore(text, None, allow_secret)
-                    };
                     st.restored_count += alone_count;
                     st.withheld_count += alone_withheld;
                     if text.len() >= 2 {
@@ -889,6 +897,54 @@ fn split_trailing_prefix_in_pb(bytes: &[u8], matcher: &Matcher, depth: usize) ->
         } else if let Some((updated, suffix)) = split_trailing_prefix_in_pb(payload, matcher, depth + 1) {
             *payload = updated;
             return Some((encode_pb_message(&fields), suffix));
+        }
+    }
+    None
+}
+
+/// For a middle frame following one or more held prefix frames (`carried`), check whether
+/// concatenating `carried` with a printable text field still forms a strict prefix of a vault
+/// token (enabling lossless restoration of placeholders split across 3+ consecutive frames).
+fn split_continuing_prefix_in_pb(
+    bytes: &[u8],
+    carried: &str,
+    matcher: &Matcher,
+    depth: usize,
+) -> Option<(Vec<u8>, String)> {
+    if depth >= MAX_PB_DEPTH || carried.is_empty() {
+        return None;
+    }
+    let mut fields = parse_pb_message(bytes)?;
+    for field in &mut fields {
+        let PbValue::LenDelim(ref mut payload) = field.value else {
+            continue;
+        };
+        if payload.is_empty() {
+            continue;
+        }
+        if let Some(text) = is_clean_printable_utf8(payload) {
+            if let Some(sub) = parse_pb_message(payload) {
+                if should_recurse_printable_submessage(text, &sub, depth) {
+                    if let Some((updated, piece)) = split_continuing_prefix_in_pb(payload, carried, matcher, depth + 1)
+                    {
+                        *payload = updated;
+                        return Some((encode_pb_message(&fields), piece));
+                    }
+                    continue;
+                }
+            }
+            if is_opaque_pb_string(text) {
+                continue;
+            }
+            let combined = format!("{carried}{text}");
+            if matcher.is_strict_prefix(&combined) {
+                let piece = text.to_string();
+                payload.clear();
+                return Some((encode_pb_message(&fields), piece));
+            }
+        } else if let Some((updated, piece)) = split_continuing_prefix_in_pb(payload, carried, matcher, depth + 1) {
+            *payload = updated;
+            return Some((encode_pb_message(&fields), piece));
         }
     }
     None
@@ -1039,12 +1095,15 @@ impl GrpcStreamRestorer {
     }
 
     fn emit_envelope(&self, out: &mut Vec<u8>, flags: u8, plain: &[u8], compressed: bool) {
-        let payload = if compressed {
-            compress_frame_payload(self.frame_encoding.as_deref(), plain).unwrap_or_else(|| plain.to_vec())
+        let (effective_flags, payload) = if compressed {
+            match compress_frame_payload(self.frame_encoding.as_deref(), plain) {
+                Some(comp) => (flags, comp),
+                None => (flags & !0x01, plain.to_vec()),
+            }
         } else {
-            plain.to_vec()
+            (flags, plain.to_vec())
         };
-        out.push(flags);
+        out.push(effective_flags);
         out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         out.extend_from_slice(&payload);
     }
@@ -1168,20 +1227,19 @@ impl GrpcStreamRestorer {
                 }
                 self.held_bytes = 0;
             } else if !self.held.is_empty() {
-                // Check whether appending this frame's trimmed text STILL forms a longer strict prefix
+                // Check whether appending this frame's text STILL forms a longer strict prefix
                 // of a vault token (e.g. a token split across 3+ tiny deltas).
-                if let Some((trimmed_cur, cur_suffix)) = split_trailing_prefix_in_pb(&restored_plain, &matcher, 0) {
-                    let combined_next = format!("{}{}", carried_prefix.as_deref().unwrap_or_default(), cur_suffix);
-                    if matcher.is_strict_prefix(&combined_next)
-                        && self.held.len() < MAX_HELD_FRAMES
-                        && self.held_bytes + restored_plain.len() <= MAX_HELD_BYTES
-                    {
+                let carried = carried_prefix.as_deref().unwrap_or_default();
+                if let Some((trimmed_cur, cur_piece)) =
+                    split_continuing_prefix_in_pb(&restored_plain, carried, &matcher, 0)
+                {
+                    if self.held.len() < MAX_HELD_FRAMES && self.held_bytes + restored_plain.len() <= MAX_HELD_BYTES {
                         self.held_bytes += restored_plain.len();
                         self.held.push(HeldFrame {
                             flags,
                             intact_plain: restored_plain,
                             trimmed_plain: trimmed_cur,
-                            trailing_prefix: cur_suffix,
+                            trailing_prefix: cur_piece,
                             compressed,
                         });
                         continue;
@@ -1716,5 +1774,76 @@ mod tests {
         assert!(String::from_utf8_lossy(&r1_dec).contains("sk-wbefwubfbsrfrsuf"));
         let r2_slice = &restored_wire[5 + r1_len..];
         assert!(String::from_utf8_lossy(&r2_slice[5..]).contains("TopSecret99"));
+    }
+
+    #[test]
+    fn streaming_grpc_restores_placeholder_split_across_three_frames_and_skips_false_submessages() {
+        let vault = PrivacyVault::new();
+        vault.insert_explicit("sk-real-three-way-998877", "sk-demo-placeholder-998877", "ApiKey");
+        let matcher = vault.matcher();
+        let mut restorer = GrpcStreamRestorer::new(
+            ProtobufFraming::Grpc,
+            None,
+            Some(matcher),
+            ToolCallSecretPolicy::FileEditsOnly,
+        );
+
+        let f1 = wrap_envelope(0x00, &encode_string_field(1, "key=sk-"));
+        let f2 = wrap_envelope(0x00, &encode_string_field(1, "demo-place"));
+        let f3 = wrap_envelope(0x00, &encode_string_field(1, "holder-998877!"));
+
+        let mut out = Vec::new();
+        out.extend(restorer.push_chunk(&f1));
+        out.extend(restorer.push_chunk(&f2));
+        out.extend(restorer.push_chunk(&f3));
+        out.extend(restorer.finish());
+
+        assert_eq!(restorer.restored_count(), 1);
+        let decoded = String::from_utf8_lossy(&out);
+        assert!(
+            decoded.contains("sk-real-three-way-998877!"),
+            "3-frame split placeholder must restore cleanly: {decoded:?}"
+        );
+
+        // Regression: 9-byte IP ("10.0.0.12") and ": sk-..." must NOT falsely recurse as submessages
+        let cfg = HideConfig::default();
+        let v2 = PrivacyVault::new();
+        let ip_pb = encode_string_field(1, "10.0.0.12");
+        let ip_res = transform_protobuf_outbound(
+            ProtobufFraming::Unary,
+            &ip_pb,
+            None,
+            None,
+            TrafficCategory::InteractivePrompt,
+            &cfg,
+            &v2,
+            None,
+        );
+        assert!(
+            !String::from_utf8_lossy(&ip_res.vendor_body).contains("10.0.0.12"),
+            "9-byte IP must be desensitized, not skipped as Fixed64"
+        );
+
+        let colon_text = ": sk-ant-api03-abcdefghijklmnop12";
+        let colon_pb = encode_string_field(1, colon_text);
+        let colon_res = transform_protobuf_outbound(
+            ProtobufFraming::Unary,
+            &colon_pb,
+            None,
+            None,
+            TrafficCategory::InteractivePrompt,
+            &cfg,
+            &v2,
+            None,
+        );
+        let out_fields = parse_pb_message(&colon_res.vendor_body).unwrap();
+        let PbValue::LenDelim(inner_bytes) = &out_fields[0].value else {
+            panic!("expected LenDelim");
+        };
+        let inner_str = std::str::from_utf8(inner_bytes).expect("must remain valid UTF-8");
+        assert!(
+            inner_str.starts_with(": sk-"),
+            "colon-space prefix must not be corrupted into Protobuf length byte: {inner_str:?}"
+        );
     }
 }

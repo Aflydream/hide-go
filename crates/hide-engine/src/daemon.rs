@@ -62,9 +62,22 @@ async fn run_daemon_async() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let conn_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
+        #[cfg(unix)]
+        let shutdown_sig = async {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        };
+        #[cfg(not(unix))]
+        let shutdown_sig = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown_sig => {
                 tracing::info!("shutdown signal received; stopping Hide-Go daemon");
                 break;
             }
