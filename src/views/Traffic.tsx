@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowsLeftRight, MagnifyingGlass, Trash, PaperPlaneTilt, WarningCircle, Funnel } from '@phosphor-icons/react';
+import { ArrowsLeftRight, MagnifyingGlass, Pause, Play, Trash, PaperPlaneTilt, WarningCircle, Funnel } from '@phosphor-icons/react';
 import { useStore } from '../store';
 import { api } from '../lib/api';
+import { useDebounced } from '../lib/hooks';
 import {
   HARNESS_ORDER,
   SEVERITY_RANK,
@@ -87,17 +88,56 @@ export function Traffic() {
   const { locale, t } = useI18n();
   const toast = useToast();
   const [query, setQuery] = useState('');
+  const debouncedQuery = useDebounced(query, 120);
   const [harness, setHarness] = useState<HarnessKind | 'all'>('all');
   const [category, setCategory] = useState<TrafficCategory | 'all'>('all');
   const [action, setAction] = useState<ActionFilter>('all');
   const [hideSimulated, setHideSimulated] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [frozenLogs, setFrozenLogs] = useState<TrafficSummary[] | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [tab, setTab] = useState<DetailTab>('request');
+  const [pinnedId, setPinnedId] = useState<string | null>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
   const selectedId = params.get('id');
 
+  const activeLogs = paused && frozenLogs ? frozenLogs : logs;
+  const pendingNewCount = useMemo(() => {
+    if (!paused || !frozenLogs) return 0;
+    const headId = frozenLogs[0]?.id;
+    if (!headId) return logs.length;
+    const idx = logs.findIndex((l) => l.id === headId);
+    return idx === -1 ? logs.length : idx;
+  }, [paused, frozenLogs, logs]);
+
+  const togglePause = useCallback(() => {
+    setPaused((prev) => {
+      if (!prev) {
+        setFrozenLogs(logs);
+        return true;
+      }
+      setFrozenLogs(null);
+      return false;
+    });
+  }, [logs]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (e.target as HTMLElement | null)?.isContentEditable) {
+        return;
+      }
+      e.preventDefault();
+      searchRef.current?.focus();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   const rows = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return logs.filter(
+    const q = debouncedQuery.trim().toLowerCase();
+    return activeLogs.filter(
       (r) =>
         (harness === 'all' || r.harness === harness) &&
         (category === 'all' || r.category === category) &&
@@ -108,10 +148,22 @@ export function Traffic() {
           getHarnessLabel(r.harness, locale).toLowerCase().includes(q) ||
           r.id.startsWith(q)),
     );
-  }, [logs, query, harness, category, action, hideSimulated, locale]);
+  }, [activeLogs, debouncedQuery, harness, category, action, hideSimulated, locale]);
 
-  const select = useCallback((id: string) => navigate('traffic', { id }), [navigate]);
-  const effectiveId = selectedId ?? rows[0]?.id ?? null;
+  const select = useCallback(
+    (id: string) => {
+      setPinnedId(id);
+      navigate('traffic', { id });
+    },
+    [navigate],
+  );
+  const pinnedStillPresent = pinnedId !== null && rows.some((r) => r.id === pinnedId);
+  const effectiveId = selectedId ?? (pinnedStillPresent ? pinnedId : rows[0]?.id ?? null);
+  useEffect(() => {
+    if (!selectedId && !pinnedStillPresent && rows[0]?.id) {
+      setPinnedId(rows[0].id);
+    }
+  }, [selectedId, pinnedStillPresent, rows]);
   const hasSelectedRow = effectiveId !== null && rows.some((r) => r.id === effectiveId);
 
   const listRef = useRef<HTMLTableSectionElement>(null);
@@ -130,6 +182,9 @@ export function Traffic() {
     try {
       await api.clearLogs();
       await refreshLogs();
+      setPaused(false);
+      setFrozenLogs(null);
+      setPinnedId(null);
       navigate('traffic');
       toast.push({ tone: 'brand', title: t('traffic.clearSuccess') });
     } catch (e) {
@@ -146,6 +201,7 @@ export function Traffic() {
         <div className="relative">
           <MagnifyingGlass aria-hidden="true" size={14} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-fg-subtle" />
           <input
+            ref={searchRef}
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -200,8 +256,21 @@ export function Traffic() {
         )}
         <div className="ml-auto flex items-center gap-2">
           <span className="tabular text-xs text-fg-subtle" role="status">
-            {t('traffic.countSummary', { rows: rows.length, total: logs.length })}
+            {t('traffic.countSummary', { rows: rows.length, total: activeLogs.length })}
           </span>
+          <Button
+            size="sm"
+            variant={paused ? 'secondary' : 'ghost'}
+            icon={paused ? <Play size={13} weight="fill" /> : <Pause size={13} />}
+            onClick={togglePause}
+          >
+            {t(paused ? 'traffic.resumeLive' : 'traffic.pauseLive')}
+            {pendingNewCount > 0 && (
+              <Badge tone="brand" className="ml-1">
+                {t('traffic.pausedPending', { count: pendingNewCount })}
+              </Badge>
+            )}
+          </Button>
           <Button size="sm" icon={<PaperPlaneTilt size={14} />} onClick={openSimulator}>
             {t('shell.simulate')}
           </Button>

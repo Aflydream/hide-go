@@ -2,6 +2,19 @@
 
 All notable changes to Hide-Go are documented in this file.
 
+## [Unreleased]
+
+### Added
+- Readable SSE stream view toggle in `CodeView` (reassembling OpenAI, Anthropic, Gemini, and Google Cloud Code streaming responses alongside raw wire frames) and a jump-to-next-match button for locating highlighted secrets and placeholders inside large payloads
+- Live stream Pause / Resume control with pending new-record counter, stable selection, debounced search, and `/` search shortcut in Traffic
+
+### Changed
+- Compute `GET /api/status` audit summaries by iterating in-memory records directly without cloning payload strings, and hide restoration-only path alias entries from Vault UI listings and counts
+- Reduce background polling load by scoping harness detection scans to Overview and Integrations, refreshing status immediately on config saves, and highlighting modern keyed placeholder formats in `CodeView`
+
+### Fixed
+- Display `/codex/v1` and `/grok-build/v1` base URLs in Overview quick-copy endpoints
+
 ## [0.3.1] - 2026-11-22
 
 ### Added

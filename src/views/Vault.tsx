@@ -2,6 +2,7 @@ import { useCallback, useMemo, useState } from 'react';
 import { Eye, EyeSlash, Funnel, MagnifyingGlass, Trash, Vault as VaultIcon } from '@phosphor-icons/react';
 import { useStore } from '../store';
 import { api } from '../lib/api';
+import { useDebounced } from '../lib/hooks';
 import { formatCount, getVaultCategoryLabel } from '../lib/format';
 import { useI18n } from '../lib/i18n';
 import { Badge, Button, ConfirmDialog, CopyButton, EmptyState, IconButton, Skeleton, Switch, cx, inputClass, useToast } from '../components/ui';
@@ -14,6 +15,7 @@ export function VaultView() {
   const { locale, t } = useI18n();
   const toast = useToast();
   const [query, setQuery] = useState('');
+  const debouncedQuery = useDebounced(query, 120);
   const [category, setCategory] = useState('all');
   const [secretsOnly, setSecretsOnly] = useState(false);
   const [revealAll, setRevealAll] = useState(false);
@@ -23,14 +25,14 @@ export function VaultView() {
 
   const categories = useMemo(() => Array.from(new Set(vault.map((v) => v.category))).sort(), [vault]);
   const rows = useMemo(() => {
-    const q = query.trim().toLowerCase();
+    const q = debouncedQuery.trim().toLowerCase();
     return vault.filter(
       (v) =>
         (category === 'all' || v.category === category) &&
         (!secretsOnly || v.secret) &&
         (!q || v.token.toLowerCase().includes(q) || v.originalRaw.toLowerCase().includes(q)),
     );
-  }, [vault, query, category, secretsOnly]);
+  }, [vault, debouncedQuery, category, secretsOnly]);
   const visible = useMemo(() => rows.slice(0, ROW_LIMIT), [rows]);
   const filtersActive = query || category !== 'all' || secretsOnly;
 

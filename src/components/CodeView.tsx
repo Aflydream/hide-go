@@ -1,7 +1,7 @@
-import { memo, useMemo, useState } from 'react';
-import { BracketsCurly } from '@phosphor-icons/react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowDown, BracketsCurly, TextAlignLeft } from '@phosphor-icons/react';
 import { CopyButton, IconButton, cx } from './ui';
-import { formatBytes, formatCount, prettyJson } from '../lib/format';
+import { extractSseReadableText, formatBytes, formatCount, prettyJson } from '../lib/format';
 import { useI18n } from '../lib/i18n';
 
 /** Shapes produced by the gateway, highlighted even when the vault was cleared since. */
@@ -10,7 +10,11 @@ const PLACEHOLDER_PATTERNS = [
   String.raw`<<[A-Z_]+?_\d{3}(?:_\d+)?>>`,
   String.raw`\b198\.1[89]\.\d{1,3}\.\d{1,3}\b`,
   String.raw`/workspace/user_\d+`,
-  String.raw`[A-Za-z]:(?:\\\\|\\)workspace(?:\\\\|\\)user_\d+`,
+  String.raw`[A-Za-z]:(?:\\\\|\\|/)workspace(?:\\\\|\\|/)user_\d+`,
+  String.raw`/opt/work/[a-z0-9]{8}\b`,
+  String.raw`[A-Za-z]:(?:\\\\|\\|/)work(?:\\\\|\\|/)[a-z0-9]{8}\b`,
+  String.raw`\b(?:key_ref_[A-Za-z0-9]{20}|sec_[A-Za-z0-9]{18}|tok_[A-Za-z0-9]{24}|ref_[a-z0-9]{10})\b`,
+  String.raw`[a-z0-9-]+\.db\.example:\d+`,
   String.raw`[a-z0-9-]+\.example\.internal`,
   String.raw`dev_member_\d+@sandbox\.example\.org`,
   String.raw`⟦HIDE-CIPHER::[^⟧]*⟧`,
@@ -83,10 +87,40 @@ export const CodeView = memo(function CodeView({
 }) {
   const { locale, t } = useI18n();
   const [pretty, setPretty] = useState(true);
-  const display = useMemo(() => (pretty ? prettyJson(text) : text), [pretty, text]);
+  const [sseReadable, setSseReadable] = useState(true);
+  const [matchCursor, setMatchCursor] = useState(-1);
+  const preRef = useRef<HTMLPreElement>(null);
+
+  const sseText = useMemo(() => extractSseReadableText(text), [text]);
+  const display = useMemo(() => {
+    if (sseText !== null && sseReadable) return sseText;
+    return pretty ? prettyJson(text) : text;
+  }, [sseText, sseReadable, pretty, text]);
   const { nodes, hits } = useMemo(() => highlight(display, matcher, mark === 'token' ? 'mark-token' : 'mark-secret'), [display, matcher, mark]);
-  const isJson = display !== text || /^\s*[[{]/.test(text);
+  const isJson = sseText === null && (display !== text || /^\s*[[{]/.test(text));
   const resolvedEmpty = emptyText ?? t('common.noContent');
+
+  useEffect(() => {
+    setMatchCursor(-1);
+  }, [display]);
+
+  const jumpNextMatch = useCallback(() => {
+    const pre = preRef.current;
+    if (!pre || hits === 0) return;
+    const marks = pre.querySelectorAll<HTMLElement>('mark');
+    if (!marks.length) return;
+    if (matchCursor >= 0 && marks[matchCursor]) {
+      marks[matchCursor]!.classList.remove('ring-2', 'ring-focus');
+    }
+    const next = (matchCursor + 1) % marks.length;
+    const target = marks[next];
+    if (target) {
+      target.classList.add('ring-2', 'ring-focus');
+      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+    setMatchCursor(next);
+  }, [hits, matchCursor]);
+
   return (
     <section aria-label={title} className={cx('flex min-h-0 min-w-0 flex-col', className)}>
       <header className={cx('flex h-9 shrink-0 items-center gap-2 border-b border-l-2 border-b-line bg-surface-2 px-3', mark === 'secret' ? 'border-l-danger' : 'border-l-brand')}>
@@ -97,13 +131,28 @@ export const CodeView = memo(function CodeView({
         {caption && <span className="truncate text-2xs text-fg-subtle">{caption}</span>}
         <span className="ml-auto flex items-center gap-1">
           {hits > 0 && (
-            <span className={cx('tabular mr-1 text-2xs', mark === 'secret' ? 'text-danger' : 'text-brand')}>
-              {t(mark === 'secret' ? 'codeView.hitsSensitive' : 'codeView.hitsReplaced', {
-                count: formatCount(hits, locale),
-              })}
-            </span>
+            <>
+              <span className={cx('tabular mr-0.5 text-2xs', mark === 'secret' ? 'text-danger' : 'text-brand')}>
+                {t(mark === 'secret' ? 'codeView.hitsSensitive' : 'codeView.hitsReplaced', {
+                  count: formatCount(hits, locale),
+                })}
+              </span>
+              <IconButton
+                label={t('codeView.nextMatch', { index: matchCursor >= 0 ? matchCursor + 1 : 1, total: hits })}
+                icon={<ArrowDown size={13} />}
+                onClick={jumpNextMatch}
+              />
+            </>
           )}
           {bytes !== undefined && <span className="tabular mr-1 text-2xs text-fg-subtle">{formatBytes(bytes)}</span>}
+          {sseText !== null && (
+            <IconButton
+              label={sseReadable ? t('codeView.sseRaw') : t('codeView.sseReadable')}
+              pressed={sseReadable}
+              icon={<TextAlignLeft size={14} />}
+              onClick={() => setSseReadable((v) => !v)}
+            />
+          )}
           {isJson && (
             <IconButton
               label={pretty ? t('codeView.showRaw') : t('codeView.prettyJson')}
@@ -116,7 +165,7 @@ export const CodeView = memo(function CodeView({
         </span>
       </header>
       {text ? (
-        <pre tabIndex={0} className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-all bg-surface px-3 py-2.5 font-mono text-xs leading-5 text-fg">
+        <pre ref={preRef} tabIndex={0} className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-all bg-surface px-3 py-2.5 font-mono text-xs leading-5 text-fg">
           {nodes}
         </pre>
       ) : (

@@ -551,8 +551,10 @@ pub fn has_sensitive_exfil_signal(signals: &[AuditSignal]) -> bool {
         .any(|s| matches!(s.kind, AuditSignalKind::SensitiveDataExfil))
 }
 
-/// Aggregate per-harness audit summaries across recorded traffic.
-pub fn summarize_harness_audit(records: &[crate::config::TrafficAuditRecord]) -> (u64, u64, Vec<HarnessAuditSummary>) {
+/// Aggregate per-harness audit summaries across recorded traffic without cloning payload strings.
+pub fn summarize_harness_audit<'a>(
+    records: impl IntoIterator<Item = &'a crate::config::TrafficAuditRecord>,
+) -> (u64, u64, Vec<HarnessAuditSummary>) {
     let mut total_telemetry = 0u64;
     let mut total_bulk = 0u64;
 

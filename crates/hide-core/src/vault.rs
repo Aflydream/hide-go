@@ -32,6 +32,9 @@ pub struct VaultEntry {
     last_used: u64,
     #[serde(skip)]
     pub(crate) scope: Option<String>,
+    /// True for restoration-only separator/case aliases that should stay hidden from UI tables.
+    #[serde(skip)]
+    pub(crate) alias: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1218,17 +1221,17 @@ impl PrivacyVault {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().token_to_real.len()
+        self.inner.read().token_to_real.values().filter(|e| !e.alias).count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.inner.read().token_to_real.is_empty()
     }
 
-    /// Return all VaultEntry items for UI inspection
+    /// Return all primary (non-alias) VaultEntry items for UI inspection
     pub fn list_entries(&self) -> Vec<VaultEntry> {
         let guard = self.inner.read();
-        let mut entries: Vec<VaultEntry> = guard.token_to_real.values().cloned().collect();
+        let mut entries: Vec<VaultEntry> = guard.token_to_real.values().filter(|e| !e.alias).cloned().collect();
         entries.sort_by(|a, b| b.hit_count.cmp(&a.hit_count).then(a.token.cmp(&b.token)));
         entries
     }
@@ -1263,6 +1266,7 @@ impl PrivacyVault {
                 secret,
                 last_used: tick,
                 scope: scope.map(str::to_string),
+                alias: true,
             },
         );
         guard.generation += 1;
@@ -1317,6 +1321,7 @@ fn commit_vault_entry(
             secret,
             last_used: tick,
             scope,
+            alias: false,
         },
     );
     guard.generation += 1;

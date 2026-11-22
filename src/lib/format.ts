@@ -209,6 +209,97 @@ export function prettyJson(text: string): string {
   }
 }
 
+/**
+ * Assemble clean human-readable text from an SSE response stream (OpenAI Chat / Responses,
+ * Anthropic Messages, Gemini, and Google Cloud Code wrapped `response.candidates`).
+ * Returns `null` when the payload is not an SSE stream with extractable text deltas.
+ */
+export function extractSseReadableText(text: string): string | null {
+  if (!text || (!text.includes('data: {') && !text.includes('data:{'))) {
+    return null;
+  }
+  const thoughts: string[] = [];
+  const reply: string[] = [];
+  let parsedEvents = 0;
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]' || !payload.startsWith('{')) continue;
+    try {
+      const obj = JSON.parse(payload) as Record<string, unknown>;
+      parsedEvents += 1;
+
+      // OpenAI Chat Completions
+      const choices = obj.choices;
+      if (Array.isArray(choices)) {
+        for (const c of choices) {
+          const delta = (c as Record<string, unknown>)?.delta as Record<string, unknown> | undefined;
+          if (typeof delta?.reasoning_content === 'string') thoughts.push(delta.reasoning_content);
+          if (typeof delta?.content === 'string') reply.push(delta.content);
+        }
+      }
+
+      // OpenAI Responses API
+      const evType = typeof obj.type === 'string' ? obj.type : '';
+      if (typeof obj.delta === 'string') {
+        if (evType.includes('reasoning')) {
+          thoughts.push(obj.delta);
+        } else if (evType.endsWith('.delta')) {
+          reply.push(obj.delta);
+        }
+      }
+
+      // Anthropic Messages
+      if (evType === 'content_block_delta' && obj.delta && typeof obj.delta === 'object') {
+        const d = obj.delta as Record<string, unknown>;
+        if (typeof d.thinking === 'string') thoughts.push(d.thinking);
+        if (typeof d.text === 'string') reply.push(d.text);
+        if (typeof d.partial_json === 'string') reply.push(d.partial_json);
+      }
+
+      // Gemini & Google Cloud Code (`response.candidates`)
+      const respObj = obj.response && typeof obj.response === 'object' ? (obj.response as Record<string, unknown>) : null;
+      const candidates = Array.isArray(obj.candidates)
+        ? obj.candidates
+        : Array.isArray(respObj?.candidates)
+          ? respObj.candidates
+          : null;
+      if (candidates) {
+        for (const cand of candidates) {
+          const content = (cand as Record<string, unknown>)?.content as Record<string, unknown> | undefined;
+          const parts = content?.parts;
+          if (Array.isArray(parts)) {
+            for (const part of parts) {
+              const p = part as Record<string, unknown>;
+              if (typeof p.text === 'string' && p.text.length > 0) {
+                if (p.thought === true) {
+                  thoughts.push(p.text);
+                } else {
+                  reply.push(p.text);
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Skip partial/truncated trailing event lines cleanly
+    }
+  }
+
+  if (parsedEvents === 0 || (thoughts.length === 0 && reply.length === 0)) {
+    return null;
+  }
+  const thoughtStr = thoughts.join('');
+  const replyStr = reply.join('');
+  if (thoughtStr && replyStr) {
+    return `[Thinking]\n${thoughtStr}\n\n${replyStr}`;
+  }
+  return replyStr || `[Thinking]\n${thoughtStr}`;
+}
+
 export function proxyBase(port: number): string {
   return `http://127.0.0.1:${port}`;
 }

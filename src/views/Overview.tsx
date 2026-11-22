@@ -250,6 +250,10 @@ export function Overview() {
               const count = summary?.count ?? 0;
               const latest = summary?.latest;
               const profile = profileByKind.get(kind);
+              const auditInfo = status?.harnessAudit?.find((h) => h.harness === kind);
+              const hasRisk = Boolean(
+                auditInfo && (auditInfo.telemetryEvents > 0 || auditInfo.bulkUploadEvents > 0 || auditInfo.sensitiveExfilEvents > 0),
+              );
               return (
                 <li key={kind} className="bg-surface">
                   <button
@@ -258,7 +262,10 @@ export function Overview() {
                     className="block w-full cursor-pointer px-4 py-3 text-left transition-colors hover:bg-surface-2"
                   >
                     <div className="flex items-center gap-2">
-                      <span aria-hidden="true" className={cx('h-1.5 w-1.5 rounded-full', count ? 'bg-brand' : 'bg-line-strong')} />
+                      <span
+                        aria-hidden="true"
+                        className={cx('h-1.5 w-1.5 rounded-full', hasRisk ? 'bg-warn' : count ? 'bg-brand' : 'bg-line-strong')}
+                      />
                       <span className="truncate text-sm text-fg">{getHarnessLabel(kind, locale)}</span>
                     </div>
                     <p className="tabular mt-1 font-mono text-lg font-semibold text-fg">{count}</p>
@@ -284,10 +291,14 @@ export function Overview() {
         <Panel title={t('overview.endpointsTitle')} description={t('overview.endpointsDesc')}>
           <div className="space-y-2 p-4">
             {base
-              ? ['claude-code', 'codex', 'grok-build'].map((slug) => (
+              ? [
+                  { slug: 'claude-code', path: '/claude-code' },
+                  { slug: 'codex', path: '/codex/v1' },
+                  { slug: 'grok-build', path: '/grok-build/v1' },
+                ].map(({ slug, path }) => (
                   <div key={slug} className="flex items-center gap-2 rounded border border-line bg-surface-2 py-1 pl-3 pr-1">
-                    <code className="min-w-0 flex-1 truncate font-mono text-xs text-fg">{`${base}/${slug}`}</code>
-                    <CopyButton compact text={`${base}/${slug}`} label={t('overview.copyEndpoint', { slug })} />
+                    <code className="min-w-0 flex-1 truncate font-mono text-xs text-fg">{`${base}${path}`}</code>
+                    <CopyButton compact text={`${base}${path}`} label={t('overview.copyEndpoint', { slug })} />
                   </div>
                 ))
               : Array.from({ length: 3 }, (_, i) => <Skeleton key={i} className="h-8" />)}

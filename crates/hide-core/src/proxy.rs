@@ -1380,8 +1380,10 @@ fn json_error(status: StatusCode, code: &str, message: impl Into<String>) -> Res
 
 async fn api_status(State(state): State<GatewayState>) -> Json<StatusResponse> {
     let s = &state.stats;
-    let records = state.get_records();
-    let (telemetry_detected, bulk_upload_detected, harness_audit) = crate::audit::summarize_harness_audit(&records);
+    let (telemetry_detected, bulk_upload_detected, harness_audit) = {
+        let logs = state.audit_logs.read();
+        crate::audit::summarize_harness_audit(logs.iter())
+    };
     Json(StatusResponse {
         status: "running",
         version: env!("CARGO_PKG_VERSION"),
