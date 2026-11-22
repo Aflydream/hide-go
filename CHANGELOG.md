@@ -2,7 +2,7 @@
 
 All notable changes to Hide-Go are documented in this file.
 
-## [Unreleased]
+## [0.3.0] - 2026-11-22
 
 ### Added
 - Built-in update check (`GET /api/updates/check` and `auto_check_updates`, enabled by default) with Settings UI controls and sidebar badge
