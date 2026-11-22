@@ -4,17 +4,19 @@ All notable changes to Hide-Go are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-11-22
+
 ### Added
-- 14-class exact request purpose classification (`RequestPurpose`: `chat-inference`, `tool-result-sync`, `inline-completion`, `token-count`, `codebase-indexing`, `file-upload`, `telemetry`, `feature-flags`, `crash-report`, `model-catalog`, `auth-account`, `realtime-sync`, `update-extension`, `other-api`) with per-request `purposeDetail`, `HarnessAuditSummary.purposeCounts`, `ObservedConnectHost.purpose`, and Traffic purpose filter dropdown
+- 14-class request purpose classification (`RequestPurpose`: `chat-inference`, `tool-result-sync`, `inline-completion`, `token-count`, `codebase-indexing`, `file-upload`, `telemetry`, `feature-flags`, `crash-report`, `model-catalog`, `auth-account`, `realtime-sync`, `update-extension`, `other-api`) with per-request `purposeDetail`, `HarnessAuditSummary.purposeCounts`, `ObservedConnectHost.purpose`, and Traffic purpose filter dropdown
 - Multi-layer telemetry detection covering camelCase/PascalCase RPC verbs (e.g. `:recordCodeAssistMetrics`, `AnalyticsService/ReportEvent`), telemetry SDK headers (`TelemetryHeader`), feature-flag/experiment tracking (`FeatureFlagTracking`), crash/diagnostics reporting (`CrashDiagnostics`), immediate live logging for long-lived passthrough telemetry `CONNECT` tunnels, MITM WebSocket channel recording, and plain-HTTP / binary-upload audit inspection
 - Readable SSE & NDJSON stream view toggle and Conversation view toggle in `CodeView` (reassembling OpenAI, Anthropic, Gemini, Google Cloud Code, and Ollama streams plus multi-turn JSON requests alongside raw payloads), jump-to-next-match navigation, and interactive Findings copy & locate-in-payload actions
 - Line-by-line streaming NDJSON / JSONL response restorer (`ndjson_restorer.rs`) for `application/x-ndjson`, `application/jsonl`, and `application/stream+json` upstreams with cross-chunk placeholder restoration
-- Live stream Pause / Resume control with pending new-record counter, stable selection, debounced search, `/` search shortcut, and URL filter deep-links (`tool`, `action`) in Traffic
+- Live stream Pause / Resume control with pending new-record counter, stable selection, debounced search, `/` search shortcut, and URL filter deep-links (`tool`, `action`, `purpose`) in Traffic
 
 ### Changed
-- Add weak `ETag` / `If-None-Match` (`304 Not Modified`) conditional polling on `GET /api/logs` and `GET /api/vault` so idle console polling skips JSON serialization and React re-renders
+- Return weak `ETag` / `304 Not Modified` on unchanged `GET /api/logs` and `GET /api/vault` polls so idle console polling skips JSON serialization and React re-renders
 - Compute `GET /api/status` audit summaries by iterating in-memory records directly without cloning payload strings, and hide restoration-only path alias entries from Vault UI listings and counts
-- Reduce background polling load by scoping harness detection scans to Overview and Integrations, refreshing status immediately on config saves, jumping directly from active Overview harness cards to filtered Traffic, and highlighting modern keyed placeholder formats in `CodeView`
+- Scope harness detection scans to Overview and Integrations, refresh status immediately on config saves, jump directly from active Overview harness cards to filtered Traffic, and highlight keyed placeholder formats in `CodeView`
 
 ### Fixed
 - Display `/codex/v1` and `/grok-build/v1` base URLs in Overview quick-copy endpoints
