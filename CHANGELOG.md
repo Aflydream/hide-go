@@ -2,7 +2,7 @@
 
 All notable changes to Hide-Go are documented in this file.
 
-## [Unreleased]
+## [0.3.1] - 2026-11-22
 
 ### Added
 - Audit risk engine (`audit.rs`) detecting telemetry endpoints and payloads, archive/multipart packaging uploads, bulk codebase syncs, oversized outbound payloads, and sensitive values inside telemetry or bulk uploads across HTTP, MITM, and raw `CONNECT` passthrough tunnels
