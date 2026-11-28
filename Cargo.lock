@@ -1164,7 +1164,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hide-chrome"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "png",
  "serde",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "hide-core"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "hide-daemon"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "hide-launcher",
  "winresource",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "hide-engine"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "axum",
  "flate2",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "hide-go-desktop"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "hide-launcher",
  "winresource",
@@ -1255,14 +1255,14 @@ dependencies = [
 
 [[package]]
 name = "hide-launcher"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "libloading",
 ]
 
 [[package]]
 name = "hide-setup"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "hide-chrome",
  "hide-engine",
