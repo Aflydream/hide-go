@@ -24,14 +24,14 @@ type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
 type ButtonSize = 'sm' | 'md';
 
 const BUTTON_VARIANT: Record<ButtonVariant, string> = {
-  primary: 'bg-brand-solid text-brand-on hover:bg-brand-solid/90 border border-transparent',
-  secondary: 'bg-surface text-fg border border-line-strong hover:bg-surface-2 hover:border-line-control',
-  ghost: 'text-fg-muted border border-transparent hover:bg-surface-3 hover:text-fg',
-  danger: 'bg-danger-solid text-white border border-transparent hover:bg-danger-solid/90',
+  primary: 'bg-brand-solid text-brand-on shadow-control hover:opacity-90 border border-transparent',
+  secondary: 'bg-surface text-fg border border-line-strong/80 shadow-control hover:bg-surface-2 hover:border-line-control/70',
+  ghost: 'text-fg-muted border border-transparent hover:bg-surface-3/80 hover:text-fg',
+  danger: 'bg-danger-solid text-white shadow-control hover:bg-danger-solid/90 border border-transparent',
 };
 const BUTTON_SIZE: Record<ButtonSize, string> = {
-  sm: 'h-7 px-2.5 text-xs gap-1.5',
-  md: 'h-8 px-3 text-sm gap-2',
+  sm: 'h-7 px-2.5 text-xs gap-1.5 rounded-md',
+  md: 'h-8 px-3.5 text-sm gap-2 rounded-lg',
 };
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
@@ -49,7 +49,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       ref={ref}
       type={type}
       className={cx(
-        'inline-flex shrink-0 cursor-pointer items-center justify-center whitespace-nowrap rounded font-medium transition-colors motion-safe:active:scale-[0.99]',
+        'inline-flex shrink-0 cursor-pointer items-center justify-center whitespace-nowrap font-medium transition-all motion-safe:active:scale-[0.985]',
         'disabled:pointer-events-none disabled:opacity-45',
         BUTTON_VARIANT[variant],
         BUTTON_SIZE[size],
@@ -81,8 +81,8 @@ export function IconButton({
       title={label}
       aria-pressed={pressed}
       className={cx(
-        'inline-flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded text-fg-muted transition-colors',
-        'hover:bg-surface-3 hover:text-fg disabled:pointer-events-none disabled:opacity-45',
+        'inline-flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-fg-muted transition-colors',
+        'hover:bg-surface-3/85 hover:text-fg disabled:pointer-events-none disabled:opacity-45',
         pressed && 'bg-surface-3 text-fg',
         className,
       )}
@@ -120,16 +120,16 @@ export function Switch({
       disabled={disabled}
       onClick={() => onChange(!checked)}
       className={cx(
-        'relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border transition-colors',
+        'relative inline-flex h-[22px] w-[38px] shrink-0 cursor-pointer items-center rounded-full border transition-colors',
         'disabled:cursor-not-allowed disabled:opacity-45',
-        checked ? 'border-brand-solid bg-brand-solid' : 'border-line-control bg-surface-3',
+        checked ? 'border-brand-solid bg-brand-solid' : 'border-line-strong bg-surface-3',
       )}
     >
       <span
         aria-hidden="true"
         className={cx(
-          'inline-block h-3.5 w-3.5 rounded-full transition-transform',
-          checked ? 'translate-x-[17px] bg-brand-on' : 'translate-x-[2px] bg-fg-muted',
+          'inline-block h-4 w-4 rounded-full shadow-sm transition-transform',
+          checked ? 'translate-x-[18px] bg-brand-on' : 'translate-x-[2px] bg-surface',
         )}
       />
     </button>
@@ -138,13 +138,13 @@ export function Switch({
 
 /* ------------------------------------------------------------------ Segmented control */
 
-/** Fill of the selected segment. Untoned segments read as a raised paper tab. */
+/** Fill of the selected segment. */
 export type SegmentTone = 'brand' | 'warn' | 'ink';
 const SEGMENT_ACTIVE: Record<SegmentTone | 'plain', string> = {
-  plain: 'bg-surface text-fg shadow-[0_0_0_1px_rgb(var(--line-strong))]',
-  brand: 'bg-brand-solid text-brand-on',
-  warn: 'bg-warn text-brand-on',
-  ink: 'bg-fg text-surface',
+  plain: 'hg-segment-active bg-surface text-fg shadow-control',
+  brand: 'hg-segment-active bg-surface text-fg shadow-control',
+  warn: 'hg-segment-active bg-warn/15 text-warn shadow-control',
+  ink: 'hg-segment-active bg-brand-solid text-brand-on shadow-control',
 };
 
 export function Segmented<T extends string>({
@@ -170,7 +170,7 @@ export function Segmented<T extends string>({
     onChange(options[next].value);
   };
   return (
-    <div role="radiogroup" aria-label={label} className="inline-flex rounded border border-line-strong bg-surface-2 p-0.5">
+    <div role="radiogroup" aria-label={label} className="inline-flex rounded-lg border border-line/80 bg-surface-3/75 p-[3px]">
       {options.map((opt, i) => {
         const active = opt.value === value;
         return (
@@ -185,9 +185,9 @@ export function Segmented<T extends string>({
             onClick={() => onChange(opt.value)}
             onKeyDown={(e) => onKey(e, i)}
             className={cx(
-              'inline-flex cursor-pointer items-center gap-1.5 rounded-sm font-medium transition-colors',
-              size === 'sm' ? 'h-6 px-2 text-2xs' : 'h-7 px-2.5 text-xs',
-              active ? SEGMENT_ACTIVE[opt.tone ?? 'plain'] : 'text-fg-muted hover:bg-surface/60 hover:text-fg',
+              'inline-flex cursor-pointer items-center gap-1.5 rounded-md font-medium transition-all',
+              size === 'sm' ? 'h-6 px-2.5 text-2xs' : 'h-7 px-3 text-xs',
+              active ? SEGMENT_ACTIVE[opt.tone ?? 'plain'] : 'text-fg-muted hover:text-fg',
             )}
           >
             {opt.icon && (
@@ -207,11 +207,11 @@ export function Segmented<T extends string>({
 
 export type Tone = 'brand' | 'warn' | 'danger' | 'info' | 'neutral';
 const TONE: Record<Tone, string> = {
-  brand: 'text-brand bg-brand/10 border-brand/30',
-  warn: 'text-warn bg-warn/10 border-warn/30',
-  danger: 'text-danger bg-danger/10 border-danger/30',
-  info: 'text-info bg-info/10 border-info/30',
-  neutral: 'text-fg-muted bg-surface-3 border-line-strong',
+  brand: 'text-ok bg-ok/10 border-ok/20',
+  warn: 'text-warn bg-warn/10 border-warn/20',
+  danger: 'text-danger bg-danger/10 border-danger/20',
+  info: 'text-info bg-info/10 border-info/20',
+  neutral: 'text-fg-muted bg-surface-3/85 border-transparent',
 };
 
 export function Badge({
@@ -231,7 +231,7 @@ export function Badge({
     <span
       title={title}
       className={cx(
-        'inline-flex h-5 shrink-0 items-center gap-1 whitespace-nowrap rounded-sm border px-1.5 text-2xs font-medium',
+        'inline-flex h-5 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border px-2 text-2xs font-medium',
         TONE[tone],
         className,
       )}
@@ -263,16 +263,16 @@ export function Panel({
 }) {
   const headingId = useId();
   return (
-    <section aria-labelledby={title ? headingId : undefined} id={id} className={cx('rounded-md border border-line bg-surface', className)}>
+    <section aria-labelledby={title ? headingId : undefined} id={id} className={cx('hg-card overflow-hidden rounded-xl border border-line/85 bg-surface shadow-card', className)}>
       {(title || actions) && (
-        <header className="flex min-h-11 items-center justify-between gap-3 border-b border-line px-4 py-2.5">
+        <header className="flex min-h-12 items-center justify-between gap-3 border-b border-line/75 px-5 py-3">
           <div className="min-w-0">
             {title && (
-              <h2 id={headingId} className="truncate text-sm font-semibold text-fg">
+              <h2 id={headingId} className="truncate text-sm font-semibold tracking-tight text-fg">
                 {title}
               </h2>
             )}
-            {description && <p className="truncate text-xs text-fg-subtle">{description}</p>}
+            {description && <p className="mt-0.5 truncate text-xs text-fg-subtle">{description}</p>}
           </div>
           {actions && <div className="flex shrink-0 items-center gap-1.5">{actions}</div>}
         </header>
@@ -287,10 +287,10 @@ export function Panel({
 export function Callout({ tone = 'info', title, children, action }: { tone?: Tone; title: ReactNode; children?: ReactNode; action?: ReactNode }) {
   const Icon = tone === 'danger' || tone === 'warn' ? WarningCircle : tone === 'brand' ? CheckCircle : Info;
   return (
-    <div role={tone === 'danger' ? 'alert' : undefined} className={cx('flex gap-3 rounded-md border px-3.5 py-3', TONE[tone])}>
+    <div role={tone === 'danger' ? 'alert' : undefined} className={cx('flex gap-3 rounded-xl border px-4 py-3.5', TONE[tone])}>
       <Icon aria-hidden="true" size={18} weight="bold" className="mt-px shrink-0" />
       <div className="min-w-0 flex-1">
-        <p className="text-sm font-semibold">{title}</p>
+        <p className="text-sm font-semibold text-fg">{title}</p>
         {children && <div className="mt-0.5 text-xs leading-5 text-fg-muted">{children}</div>}
       </div>
       {action && <div className="shrink-0 self-center">{action}</div>}
@@ -398,7 +398,7 @@ export function Field({
 
 /** Shared look of text inputs, selects and textareas; callers set the width. */
 export const inputClass =
-  'rounded border border-line-control bg-surface px-2.5 text-sm text-fg placeholder:text-fg-subtle transition-colors hover:border-fg-subtle focus-visible:border-focus focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus/30 aria-[invalid=true]:border-danger';
+  'rounded-lg border border-line-strong/85 bg-surface px-3 text-sm text-fg shadow-control placeholder:text-fg-subtle transition-colors hover:border-line-control focus-visible:border-focus focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus/20 aria-[invalid=true]:border-danger';
 
 /* ------------------------------------------------------------------ Dialog */
 
@@ -487,14 +487,14 @@ export function Dialog({
       aria-describedby={description ? descId : undefined}
       {...({ closedby: 'any' } as Record<string, unknown>)}
       className={cx(
-        'hg-dialog m-auto w-[calc(100vw-3rem)] flex-col overflow-hidden rounded-lg border border-line-strong bg-surface p-0 shadow-overlay open:flex',
+        'hg-dialog m-auto w-[calc(100vw-3rem)] flex-col overflow-hidden rounded-2xl border border-line-strong/80 bg-surface p-0 shadow-overlay open:flex',
         'max-h-[calc(100vh-3rem)]',
         width,
       )}
     >
-      <header className="flex shrink-0 items-start justify-between gap-4 border-b border-line px-5 py-4">
+      <header className="flex shrink-0 items-start justify-between gap-4 border-b border-line/75 px-6 py-4">
         <div>
-          <h2 id={titleId} className="text-base font-semibold text-fg">
+          <h2 id={titleId} className="text-[15px] font-semibold tracking-tight text-fg">
             {title}
           </h2>
           {description && (
@@ -505,8 +505,8 @@ export function Dialog({
         </div>
         <IconButton label={t('common.close')} icon={<X size={16} />} onClick={() => dialogRef.current?.close()} className="-mr-1.5 -mt-0.5" />
       </header>
-      {children && <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div>}
-      {footer && <footer className="flex shrink-0 justify-end gap-2 border-t border-line px-5 py-3">{footer}</footer>}
+      {children && <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">{children}</div>}
+      {footer && <footer className="flex shrink-0 justify-end gap-2 border-t border-line/75 bg-surface-2/50 px-6 py-3.5">{footer}</footer>}
     </dialog>
   );
 }
@@ -613,13 +613,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             <div
               key={item.id}
               role={item.tone === 'danger' ? 'alert' : 'status'}
-              className="hg-toast pointer-events-auto flex gap-2.5 rounded-md border border-line-strong bg-surface px-3.5 py-3 shadow-overlay"
+              className="hg-toast pointer-events-auto flex gap-2.5 rounded-xl border border-line-strong/80 bg-surface px-4 py-3 shadow-overlay"
             >
               <Icon
                 aria-hidden="true"
                 size={18}
                 weight="fill"
-                className={cx('mt-px shrink-0', item.tone === 'danger' ? 'text-danger' : item.tone === 'warn' ? 'text-warn' : 'text-brand')}
+                className={cx('mt-px shrink-0', item.tone === 'danger' ? 'text-danger' : item.tone === 'warn' ? 'text-warn' : 'text-ok')}
               />
               <div className="min-w-0 flex-1">
                 <p className="text-sm font-medium text-fg">{item.title}</p>
@@ -695,12 +695,11 @@ export function Kbd({ children }: { children: ReactNode }) {
 
 /* ------------------------------------------------------------------ Layout Helpers */
 
-export function Section({ index, title, description, children }: { index: string; title: string; description?: ReactNode; children: ReactNode }) {
+export function Section({ title, description, children }: { index?: string; title: string; description?: ReactNode; children: ReactNode }) {
   return (
-    <section className="grid grid-cols-1 gap-x-10 gap-y-4 border-b border-line py-7 last:border-b-0 lg:grid-cols-[260px_minmax(0,1fr)]">
+    <section className="grid grid-cols-1 gap-x-10 gap-y-4 border-b border-line/75 py-7 last:border-b-0 lg:grid-cols-[240px_minmax(0,1fr)]">
       <div>
-        <p className="tabular font-mono text-2xs text-fg-subtle">{index}</p>
-        <h2 className="mt-1 text-sm font-semibold text-fg">{title}</h2>
+        <h2 className="text-sm font-semibold tracking-tight text-fg">{title}</h2>
         {description && <div className="mt-1.5 text-xs leading-5 text-fg-subtle">{description}</div>}
       </div>
       <div className="min-w-0">{children}</div>
@@ -733,8 +732,8 @@ export function RadioCard<T extends string>({
     <label
       htmlFor={id}
       className={cx(
-        'block cursor-pointer rounded-md border px-4 py-3.5 transition-colors',
-        selected ? 'border-brand bg-brand/[0.06]' : 'border-line bg-surface hover:border-line-strong',
+        'block cursor-pointer rounded-xl border px-4 py-3.5 transition-all',
+        selected ? 'border-brand/80 bg-surface-2/70 shadow-control' : 'border-line/85 bg-surface hover:border-line-strong hover:bg-surface-2/40',
       )}
     >
       <div className="flex items-start gap-3">
@@ -742,11 +741,11 @@ export function RadioCard<T extends string>({
         <span
           aria-hidden="true"
           className={cx(
-            'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-focus',
-            selected ? 'border-brand' : 'border-line-control',
+            'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition-colors peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-focus',
+            selected ? 'border-brand bg-brand' : 'border-line-control bg-surface',
           )}
         >
-          {selected && <span className="h-2 w-2 rounded-full bg-brand" />}
+          {selected && <span className="h-1.5 w-1.5 rounded-full bg-brand-on" />}
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">

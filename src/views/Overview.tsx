@@ -21,16 +21,24 @@ import { SeverityBadge } from './Traffic';
 function Metric({ label, value, hint, tone }: { label: string; value: number | undefined; hint: string; tone?: 'brand' | 'warn' }) {
   const { locale } = useI18n();
   return (
-    <div className="min-w-0 bg-surface px-5 py-4">
-      <p className="label-caps">{label}</p>
+    <div className="hg-card min-w-0 rounded-xl border border-line/85 bg-surface p-4 shadow-card">
+      <div className="flex items-center justify-between gap-2">
+        <p className="truncate text-xs font-medium text-fg-subtle">{label}</p>
+        {tone && (
+          <span
+            aria-hidden="true"
+            className={cx('h-1.5 w-1.5 shrink-0 rounded-full', tone === 'brand' ? 'bg-ok' : 'bg-warn')}
+          />
+        )}
+      </div>
       {value === undefined ? (
-        <Skeleton className="mt-2 h-7 w-16" />
+        <Skeleton className="mt-2.5 h-7 w-16" />
       ) : (
-        <p className={cx('tabular mt-1 font-mono text-2xl font-semibold', tone === 'brand' ? 'text-brand' : tone === 'warn' ? 'text-warn' : 'text-fg')}>
+        <p className={cx('tabular mt-2 font-mono text-2xl font-semibold tracking-tight', tone === 'warn' ? 'text-warn' : 'text-fg')}>
           {formatCount(value, locale)}
         </p>
       )}
-      <p className="mt-0.5 truncate text-xs text-fg-subtle">{hint}</p>
+      <p className="mt-1 truncate text-2xs text-fg-subtle">{hint}</p>
     </div>
   );
 }
@@ -38,19 +46,19 @@ function Metric({ label, value, hint, tone }: { label: string; value: number | u
 function ProtectionRow({ on, label, detail }: { on: boolean; label: string; detail: ReactNode }) {
   const { t } = useI18n();
   return (
-    <li className="flex items-start gap-3 px-4 py-2.5">
+    <li className="flex items-start gap-3 px-5 py-3">
       <span
         aria-hidden="true"
-        className={cx('mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-sm', on ? 'bg-brand/15 text-brand' : 'bg-surface-3 text-fg-subtle')}
+        className={cx('mt-0.5 flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full', on ? 'bg-ok/15 text-ok' : 'bg-surface-3 text-fg-subtle')}
       >
-        {on ? <Check size={11} weight="bold" /> : <Minus size={11} weight="bold" />}
+        {on ? <Check size={10} weight="bold" /> : <Minus size={10} weight="bold" />}
       </span>
       <div className="min-w-0">
-        <p className="text-sm text-fg">
+        <p className="text-sm font-medium text-fg">
           {label}
           <span className="sr-only">{t(on ? 'overview.enabledSr' : 'overview.disabledSr')}</span>
         </p>
-        <p className="text-xs text-fg-subtle">{detail}</p>
+        <p className="mt-0.5 text-xs text-fg-subtle">{detail}</p>
       </div>
     </li>
   );
@@ -91,7 +99,7 @@ export function Overview() {
 
   return (
     <div className="mx-auto max-w-[1360px] space-y-5 p-6">
-      <section aria-label={t('overview.metricsAria')} className="grid grid-cols-3 gap-px overflow-hidden rounded-md border border-line bg-line xl:grid-cols-6">
+      <section aria-label={t('overview.metricsAria')} className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
         <Metric label={t('overview.metricRequests')} value={status?.totalRequests} hint={t('overview.metricRequestsHint')} />
         <Metric
           label={t('overview.metricFindings')}
@@ -252,7 +260,7 @@ export function Overview() {
             </Button>
           }
         >
-          <ul className="grid grid-cols-2 gap-px bg-line lg:grid-cols-4">
+          <ul className="grid grid-cols-2 gap-2.5 p-4 lg:grid-cols-4">
             {HARNESS_ORDER.map((kind) => {
               const summary = liveByHarness.get(kind);
               const count = summary?.count ?? 0;
@@ -263,21 +271,21 @@ export function Overview() {
                 auditInfo && (auditInfo.telemetryEvents > 0 || auditInfo.bulkUploadEvents > 0 || auditInfo.sensitiveExfilEvents > 0),
               );
               return (
-                <li key={kind} className="bg-surface">
+                <li key={kind}>
                   <button
                     type="button"
                     onClick={() => navigate(count > 0 || hasRisk ? 'traffic' : 'integrations', { tool: kind })}
-                    className="block w-full cursor-pointer px-4 py-3 text-left transition-colors hover:bg-surface-2"
+                    className="block w-full cursor-pointer rounded-lg border border-line/80 bg-surface-2/50 px-3.5 py-3 text-left transition-all hover:border-line-strong hover:bg-surface-2"
                   >
                     <div className="flex items-center gap-2">
                       <span
                         aria-hidden="true"
                         className={cx('h-1.5 w-1.5 rounded-full', hasRisk ? 'bg-warn' : count ? 'bg-ok' : 'bg-line-strong')}
                       />
-                      <span className="truncate text-sm text-fg">{getHarnessLabel(kind, locale)}</span>
+                      <span className="truncate text-xs font-medium text-fg">{getHarnessLabel(kind, locale)}</span>
                     </div>
-                    <p className="tabular mt-1 font-mono text-lg font-semibold text-fg">{count}</p>
-                    <p className="truncate text-2xs text-fg-subtle">
+                    <p className="tabular mt-1.5 font-mono text-lg font-semibold text-fg">{count}</p>
+                    <p className="mt-0.5 truncate text-2xs text-fg-subtle">
                       {latest
                         ? `${latest.timestamp.slice(0, 8)} · ${getPurposeLabel(latest.purpose, locale, latest.category)}`
                         : profile
@@ -300,7 +308,7 @@ export function Overview() {
                   { slug: 'grok-build', path: '/grok-build/v1' },
                   { slug: 'pi', path: '/pi' },
                 ].map(({ slug, path }) => (
-                  <div key={slug} className="flex items-center gap-2 rounded border border-line bg-surface-2 py-1 pl-3 pr-1">
+                  <div key={slug} className="flex items-center gap-2 rounded-lg border border-line/80 bg-surface-2/60 py-1.5 pl-3 pr-1.5">
                     <code className="min-w-0 flex-1 truncate font-mono text-xs text-fg">{`${base}${path}`}</code>
                     <CopyButton compact text={`${base}${path}`} label={t('overview.copyEndpoint', { slug })} />
                   </div>

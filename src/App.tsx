@@ -20,7 +20,7 @@ import { api } from './lib/api';
 import { Badge, Button, Dialog, Segmented, ToastProvider, cx, useToast, type SegmentTone } from './components/ui';
 import { ColorSchemeProvider, WindowFrame } from './components/WindowFrame';
 import type { Route } from './lib/hooks';
-import { formatCount, formatDuration, getModeLabel } from './lib/format';
+import { formatCount, formatDuration, getHarnessLabel, getModeLabel } from './lib/format';
 import { I18nProvider, translate, useI18n, type Locale } from './lib/i18n';
 import type { PrivacyMode } from './types';
 import { Overview } from './views/Overview';
@@ -131,8 +131,8 @@ function Sidebar({ navItems }: { navItems: NavItem[] }) {
     rules: config?.customRules.length,
   };
   return (
-    <aside className="flex w-52 shrink-0 flex-col border-r border-line bg-surface-2/60 max-[1180px]:w-14" aria-label={t('shell.navAria')}>
-      <nav className="flex-1 space-y-0.5 px-2 pt-3" aria-label={t('shell.viewsAria')}>
+    <aside className="flex w-[212px] shrink-0 flex-col bg-bg px-2.5 pb-2.5 pt-1 max-[1180px]:w-14 max-[1180px]:px-1.5" aria-label={t('shell.navAria')}>
+      <nav className="flex-1 space-y-0.5" aria-label={t('shell.viewsAria')}>
         {navItems.map((item) => {
           const active = item.route === route;
           const count = counts[item.route];
@@ -145,23 +145,24 @@ function Sidebar({ navItems }: { navItems: NavItem[] }) {
               aria-current={active ? 'page' : undefined}
               title={item.label}
               className={cx(
-                'relative flex h-9 w-full cursor-pointer items-center gap-3 rounded px-2.5 text-sm transition-colors max-[1180px]:justify-center max-[1180px]:px-0',
-                active ? 'bg-surface font-medium text-fg shadow-[0_0_0_1px_rgb(var(--line-strong))]' : 'text-fg-muted hover:bg-surface-3/70 hover:text-fg',
+                'relative flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 text-[13px] transition-all max-[1180px]:justify-center max-[1180px]:px-0',
+                active
+                  ? 'hg-nav-active bg-surface font-medium text-fg shadow-control'
+                  : 'text-fg-muted hover:bg-surface-3/70 hover:text-fg',
               )}
             >
-              {active && <span aria-hidden="true" className="hg-active-bar absolute inset-y-2 left-0 w-0.5 rounded-full bg-brand" />}
-              <span aria-hidden="true" className={cx('flex', active && 'text-brand')}>
+              <span aria-hidden="true" className={cx('flex shrink-0', active ? 'text-fg' : 'text-fg-subtle')}>
                 {item.icon}
               </span>
               <span className="flex-1 truncate text-left max-[1180px]:sr-only">{item.label}</span>
               {hasUpdateDot && (
                 <span
                   aria-hidden="true"
-                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-brand max-[1180px]:absolute max-[1180px]:right-2 max-[1180px]:top-2"
+                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-info max-[1180px]:absolute max-[1180px]:right-2 max-[1180px]:top-2"
                 />
               )}
               {count !== undefined && count > 0 && (
-                <span className="tabular rounded-sm bg-surface-3 px-1.5 py-px font-mono text-2xs text-fg-subtle max-[1180px]:hidden">
+                <span className="tabular rounded-full bg-surface-3 px-1.5 py-px font-mono text-2xs text-fg-subtle max-[1180px]:hidden">
                   {formatCount(count, locale)}
                 </span>
               )}
@@ -170,7 +171,7 @@ function Sidebar({ navItems }: { navItems: NavItem[] }) {
         })}
       </nav>
 
-      <div className="border-t border-line p-3 max-[1180px]:hidden">
+      <div className="mt-2 rounded-xl border border-line/80 bg-surface/90 px-3 py-2.5 shadow-control max-[1180px]:hidden">
         <div role="status" aria-live="polite">
           <div className="flex items-center gap-2 text-xs">
             <span aria-hidden="true" className={cx('h-2 w-2 rounded-full', online ? 'bg-ok' : 'bg-danger')} />
@@ -194,23 +195,19 @@ function TopBar({ navItems }: { navItems: NavItem[] }) {
   const item = navItems.find((n) => n.route === route) ?? navItems[0];
   const modeOptions = useMemo(() => getModeOptions(locale), [locale]);
   return (
-    <header className="flex h-12 shrink-0 items-center justify-between gap-4 border-b border-line bg-surface px-6">
+    <header className="flex h-[54px] shrink-0 items-center justify-between gap-4 border-b border-line/75 bg-surface px-6">
       <div className="flex min-w-0 items-baseline gap-2.5">
-        <h1 id="view-title" tabIndex={-1} className="w-fit shrink-0 text-base font-semibold text-fg focus:outline-none">
+        <h1 id="view-title" tabIndex={-1} className="w-fit shrink-0 text-[15px] font-semibold tracking-tight text-fg focus:outline-none">
           {item.title}
         </h1>
-        <p className="truncate text-xs text-fg-subtle max-[1100px]:hidden">{item.description}</p>
+        <p className="truncate text-xs text-fg-subtle max-[1120px]:hidden">{item.description}</p>
       </div>
-      <div role="toolbar" aria-label={t('shell.quickControlsAria')} className="flex shrink-0 items-center gap-3">
+      <div role="toolbar" aria-label={t('shell.quickControlsAria')} className="flex shrink-0 items-center gap-2.5">
         <div role="group" aria-label={t('shell.requestTestAria')}>
-          <Button size="sm" variant="ghost" icon={<PaperPlaneTilt size={14} />} onClick={openSimulator}>
+          <Button size="sm" variant="secondary" icon={<PaperPlaneTilt size={13} />} onClick={openSimulator}>
             {t('shell.simulate')}
           </Button>
         </div>
-        <span role="separator" aria-orientation="vertical" className="h-5 w-px bg-line" />
-        <span className="label-caps max-[1280px]:hidden" id="mode-label">
-          {t('shell.modeLabel')}
-        </span>
         {config ? (
           <Segmented
             label={t('shell.globalModeAria')}
@@ -222,7 +219,7 @@ function TopBar({ navItems }: { navItems: NavItem[] }) {
             options={modeOptions}
           />
         ) : (
-          <span className="h-8 w-[260px] animate-pulse rounded bg-surface-3" aria-hidden="true" />
+          <span className="h-8 w-[260px] animate-pulse rounded-lg bg-surface-3" aria-hidden="true" />
         )}
       </div>
     </header>
@@ -235,10 +232,10 @@ function ConnectionBanner() {
   if (!statusError) return null;
   const auth = isAuthError(statusError);
   return (
-    <div role="alert" className="flex items-center gap-3 border-b border-danger/40 bg-danger/10 px-6 py-2 text-sm text-danger">
-      <WifiSlash aria-hidden="true" size={16} weight="bold" />
-      <span className="font-medium">{t(auth ? 'shell.invalidTokenTitle' : 'shell.unreachableTitle')}</span>
-      <span className="text-xs text-fg-muted">{t(auth ? 'shell.invalidTokenBody' : 'shell.unreachableBody')}</span>
+    <div role="alert" className="mx-5 mt-3 flex items-center gap-2.5 rounded-xl border border-danger/25 bg-danger/10 px-4 py-2.5 text-xs text-danger">
+      <WifiSlash aria-hidden="true" size={15} weight="bold" className="shrink-0" />
+      <span className="font-semibold">{t(auth ? 'shell.invalidTokenTitle' : 'shell.unreachableTitle')}</span>
+      <span className="text-fg-muted">{t(auth ? 'shell.invalidTokenBody' : 'shell.unreachableBody')}</span>
     </div>
   );
 }
@@ -248,11 +245,11 @@ function AuditWarning() {
   const { t } = useI18n();
   if (!config || config.mode !== 'audit-only' || route === 'policy') return null;
   return (
-    <div className="flex items-center gap-3 border-b border-warn/40 bg-warn/10 px-6 py-2 text-xs">
-      <Lightning aria-hidden="true" size={14} weight="fill" className="text-warn" />
-      <span className="font-medium text-warn">{t('shell.auditBannerTitle')}</span>
-      <span className="text-fg-muted">{t('shell.auditBannerBody')}</span>
-      <button type="button" onClick={() => navigate('policy')} className="ml-auto cursor-pointer font-medium text-fg underline-offset-2 hover:underline">
+    <div className="mx-5 mt-3 flex items-center gap-2.5 rounded-xl border border-warn/25 bg-warn/10 px-4 py-2 text-xs">
+      <Lightning aria-hidden="true" size={14} weight="fill" className="shrink-0 text-warn" />
+      <span className="font-semibold text-warn">{t('shell.auditBannerTitle')}</span>
+      <span className="truncate text-fg-muted">{t('shell.auditBannerBody')}</span>
+      <button type="button" onClick={() => navigate('policy')} className="ml-auto shrink-0 cursor-pointer font-medium text-fg underline-offset-2 hover:underline">
         {t('shell.auditBannerAction')}
       </button>
     </div>
@@ -265,11 +262,11 @@ function RestartReminderBanner() {
   const pending = runtimeHealth?.runningHarnesses.filter((h) => h.needsRestart) ?? [];
   if (pending.length === 0) return null;
   const sep = locale === 'zh-CN' ? '、' : ', ';
-  const names = pending.map((h) => h.name).join(sep);
+  const names = pending.map((h) => getHarnessLabel(h.kind, locale)).join(sep);
   return (
-    <div role="status" className="flex items-center gap-3 border-b border-warn/40 bg-warn/10 px-6 py-2 text-xs">
+    <div role="status" className="mx-5 mt-3 flex items-center gap-2.5 rounded-xl border border-warn/25 bg-warn/10 px-4 py-2 text-xs">
       <ArrowsClockwise aria-hidden="true" size={14} weight="bold" className="shrink-0 text-warn" />
-      <span className="font-medium text-warn">{t('shell.restartBannerTitle', { tools: names })}</span>
+      <span className="font-semibold text-warn">{t('shell.restartBannerTitle', { tools: names })}</span>
       <span className="truncate text-fg-muted">{t('shell.restartBannerBody')}</span>
       <button
         type="button"
@@ -396,11 +393,11 @@ function Shell() {
   const statusChip = (
     <span
       className={cx(
-        'inline-flex items-center gap-1.5 rounded-sm border px-1.5 py-px font-mono text-2xs max-[1000px]:hidden',
-        online ? 'border-brand/30 bg-brand/10 text-brand' : 'border-line bg-surface-2 text-fg-subtle',
+        'inline-flex items-center gap-1.5 rounded-full border px-2 py-px font-mono text-2xs max-[1000px]:hidden',
+        online ? 'border-line bg-surface text-fg-muted shadow-control' : 'border-line bg-surface-2 text-fg-subtle',
       )}
     >
-      <span aria-hidden="true" className={cx('h-1.5 w-1.5 rounded-full', online ? 'bg-brand' : 'bg-danger')} />
+      <span aria-hidden="true" className={cx('h-1.5 w-1.5 rounded-full', online ? 'bg-ok' : 'bg-danger')} />
       127.0.0.1:{config?.proxyPort ?? 18787}
     </span>
   );
@@ -409,18 +406,20 @@ function Shell() {
     <WindowFrame title={t('shell.appName')} badge={status ? `v${status.version}` : undefined} statusSlot={statusChip} minWidthClass="min-w-[960px]">
       <a
         href="#main"
-        className="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-12 focus:z-[70] focus:rounded focus:border focus:border-line-strong focus:bg-surface focus:px-3 focus:py-2 focus:text-sm"
+        className="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-12 focus:z-[70] focus:rounded-lg focus:border focus:border-line-strong focus:bg-surface focus:px-3 focus:py-2 focus:text-sm"
       >
         {t('shell.skipToContent')}
       </a>
-      <div className="flex min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1 bg-bg">
         <Sidebar navItems={navItems} />
-        <div className="flex min-w-0 flex-1 flex-col">
-          <TopBar navItems={navItems} />
-          <ConnectionBanner />
-          <AuditWarning />
-          <RestartReminderBanner />
-          <Main />
+        <div className="flex min-w-0 flex-1 flex-col pb-2.5 pr-2.5">
+          <div className="hg-sheet flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-line/85 bg-surface shadow-sheet">
+            <TopBar navItems={navItems} />
+            <ConnectionBanner />
+            <AuditWarning />
+            <RestartReminderBanner />
+            <Main />
+          </div>
         </div>
       </div>
       <SimulateDialog open={simulatorOpen} onClose={closeSimulator} />

@@ -363,7 +363,7 @@ export function Traffic() {
       )}
 
       <div className="grid min-h-0 flex-1 grid-cols-[minmax(420px,5fr)_minmax(0,7fr)]">
-        <div className="min-h-0 overflow-y-auto border-r border-line bg-surface">
+        <div className="min-h-0 overflow-y-auto border-r border-line/75 bg-surface-2/30">
           {logsLoading && !logs.length ? (
             <div className="space-y-2 p-4">
               {Array.from({ length: 8 }, (_, i) => (
@@ -415,11 +415,10 @@ export function Traffic() {
                       onKeyDown={(e) => e.key === 'Enter' && select(r.id)}
                       className={cx(
                         'relative cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus',
-                        active ? 'bg-brand/[0.07]' : 'hover:bg-surface-2',
+                        active ? 'bg-surface shadow-[inset_2px_0_0_rgb(var(--fg))]' : 'hover:bg-surface/70',
                       )}
                     >
-                      <td className="tabular relative py-2 pl-4 align-top font-mono text-fg-muted">
-                        {active && <span aria-hidden="true" className="hg-active-bar absolute inset-y-0 left-0 w-0.5 bg-brand" />}
+                      <td className="tabular relative py-2.5 pl-4 align-top font-mono text-fg-muted">
                         {r.timestamp.slice(0, 8)}
                       </td>
                       <td className="min-w-0 py-2 pl-2">
@@ -762,7 +761,7 @@ function FindingsTable({ record, onLocate }: { record: TrafficAuditRecord; onLoc
                 <td className="px-2 py-2 font-mono text-danger">{f.originalPreview}</td>
                 <td className="max-w-[280px] px-2 py-2">
                   <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-                    <span className="min-w-0 truncate font-mono text-brand" title={f.replacementToken}>
+                    <span className="min-w-0 truncate font-mono text-info" title={f.replacementToken}>
                       {f.replacementToken}
                     </span>
                     {locatable && (

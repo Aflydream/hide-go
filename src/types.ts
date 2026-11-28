@@ -307,10 +307,11 @@ export interface CompanionProcessInfo {
 
 export interface RunningHarnessNotice {
   kind: HarnessKind;
-  name: string;
-  pids: number[];
+  runningPids: number[];
+  primaryProcess: string;
+  startedBeforeGateway: boolean;
   configured: boolean;
-  hasTraffic: boolean;
+  hasLiveTraffic: boolean;
   needsRestart: boolean;
   companions: CompanionProcessInfo[];
 }

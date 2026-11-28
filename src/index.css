@@ -21,37 +21,42 @@
 }
 
 /*
- * Design tokens — Dual-mode palette (Warm Paper Light + Warm Graphite Dark).
- * Meets WCAG AA contrast targets (>= 4.5:1 text, >= 3:1 controls) and keys off `color-scheme`.
+ * Design tokens — Neutral Alabaster Light + Deep Obsidian Dark.
+ * Monochrome architectural chrome with restrained semantic accents.
  * Values are RGB channels so Tailwind alpha modifiers work (bg-brand/10).
  */
 @layer base {
   :root {
     color-scheme: light dark;
 
-    /* Light tokens (Warm Paper & Slate Indigo) */
-    --bg: 246 244 240;
-    --surface: 254 253 251;
-    --surface-2: 249 247 243;
-    --surface-3: 239 236 229;
-    --line: 228 224 216;
-    --line-strong: 204 198 188;
-    --line-control: 132 128 120;
-    --fg: 24 25 29;
-    --fg-muted: 75 79 88;
-    --fg-subtle: 102 106 116;
-    --brand: 49 78 148;
-    --brand-solid: 43 72 142;
+    /* Light tokens (Neutral Alabaster & Graphite Ink) */
+    --bg: 243 244 246;
+    --surface: 255 255 255;
+    --surface-2: 248 249 250;
+    --surface-3: 236 238 242;
+    --line: 229 231 235;
+    --line-strong: 209 213 219;
+    --line-control: 130 136 146;
+    --fg: 20 22 26;
+    --fg-muted: 75 82 94;
+    --fg-subtle: 107 114 128;
+    --brand: 24 24 27;
+    --brand-solid: 24 24 27;
     --brand-on: 255 255 255;
-    --ok: 42 122 86;
-    --danger: 174 44 42;
-    --danger-solid: 185 45 43;
-    --warn: 152 86 14;
-    --info: 74 96 148;
-    --focus: 43 72 142;
+    --ok: 22 128 68;
+    --danger: 185 38 38;
+    --danger-solid: 204 42 42;
+    --warn: 168 85 10;
+    --info: 79 70 229;
+    --focus: 24 24 27;
 
-    --scrollbar-thumb-light: #b8b3a8;
-    --scrollbar-thumb-dark: #4f5565;
+    --shadow-control: 0 1px 2px rgb(15 23 42 / 0.05), 0 0 0 1px rgb(15 23 42 / 0.04);
+    --shadow-card: 0 1px 3px rgb(15 23 42 / 0.04), 0 1px 2px -1px rgb(15 23 42 / 0.03);
+    --shadow-sheet: 0 2px 10px -2px rgb(15 23 42 / 0.06), 0 1px 3px rgb(15 23 42 / 0.03);
+    --shadow-overlay: 0 20px 44px -12px rgb(15 23 42 / 0.24), 0 0 0 1px rgb(209 213 219 / 0.9);
+
+    --scrollbar-thumb-light: #c6cbd2;
+    --scrollbar-thumb-dark: #3f4552;
     --scrollbar-track-light: transparent;
     --scrollbar-track-dark: transparent;
     --scrollbar-thumb: var(--scrollbar-thumb-light);
@@ -65,49 +70,59 @@
 
   :root:has(> head > meta[name='color-scheme'][content='dark']) {
     color-scheme: dark;
-    --bg: 18 19 22;
-    --surface: 25 27 32;
-    --surface-2: 31 34 40;
-    --surface-3: 40 44 52;
-    --line: 48 52 62;
-    --line-strong: 68 74 88;
-    --line-control: 112 118 134;
-    --fg: 240 241 245;
-    --fg-muted: 176 181 193;
-    --fg-subtle: 146 152 166;
-    --brand: 138 172 252;
-    --brand-solid: 74 108 206;
-    --brand-on: 255 255 255;
-    --ok: 92 196 140;
-    --danger: 248 122 128;
-    --danger-solid: 212 62 72;
-    --warn: 244 190 88;
-    --info: 128 176 244;
-    --focus: 138 172 252;
+    --bg: 12 13 16;
+    --surface: 19 21 26;
+    --surface-2: 25 28 35;
+    --surface-3: 35 39 48;
+    --line: 38 42 52;
+    --line-strong: 56 62 76;
+    --line-control: 108 116 134;
+    --fg: 243 244 246;
+    --fg-muted: 168 175 189;
+    --fg-subtle: 126 134 150;
+    --brand: 243 244 246;
+    --brand-solid: 243 244 246;
+    --brand-on: 17 19 24;
+    --ok: 52 211 153;
+    --danger: 248 113 113;
+    --danger-solid: 220 53 69;
+    --warn: 251 191 36;
+    --info: 129 140 248;
+    --focus: 243 244 246;
+
+    --shadow-control: 0 1px 2px rgb(0 0 0 / 0.35), inset 0 1px 0 rgb(255 255 255 / 0.05);
+    --shadow-card: 0 2px 6px rgb(0 0 0 / 0.25), inset 0 1px 0 rgb(255 255 255 / 0.03);
+    --shadow-sheet: 0 4px 16px rgb(0 0 0 / 0.32), inset 0 1px 0 rgb(255 255 255 / 0.04);
+    --shadow-overlay: 0 24px 52px -12px rgb(0 0 0 / 0.65), 0 0 0 1px rgb(56 62 76 / 0.9);
     --scrollbar-thumb: var(--scrollbar-thumb-dark);
   }
 
   @media (prefers-color-scheme: dark) {
     :root:not(:has(> head > meta[name='color-scheme'][content='light'])) {
-      --bg: 18 19 22;
-      --surface: 25 27 32;
-      --surface-2: 31 34 40;
-      --surface-3: 40 44 52;
-      --line: 48 52 62;
-      --line-strong: 68 74 88;
-      --line-control: 112 118 134;
-      --fg: 240 241 245;
-      --fg-muted: 176 181 193;
-      --fg-subtle: 146 152 166;
-      --brand: 138 172 252;
-      --brand-solid: 74 108 206;
-      --brand-on: 255 255 255;
-      --ok: 92 196 140;
-      --danger: 248 122 128;
-      --danger-solid: 212 62 72;
-      --warn: 244 190 88;
-      --info: 128 176 244;
-      --focus: 138 172 252;
+      --bg: 12 13 16;
+      --surface: 19 21 26;
+      --surface-2: 25 28 35;
+      --surface-3: 35 39 48;
+      --line: 38 42 52;
+      --line-strong: 56 62 76;
+      --line-control: 108 116 134;
+      --fg: 243 244 246;
+      --fg-muted: 168 175 189;
+      --fg-subtle: 126 134 150;
+      --brand: 243 244 246;
+      --brand-solid: 243 244 246;
+      --brand-on: 17 19 24;
+      --ok: 52 211 153;
+      --danger: 248 113 113;
+      --danger-solid: 220 53 69;
+      --warn: 251 191 36;
+      --info: 129 140 248;
+      --focus: 243 244 246;
+
+      --shadow-control: 0 1px 2px rgb(0 0 0 / 0.35), inset 0 1px 0 rgb(255 255 255 / 0.05);
+      --shadow-card: 0 2px 6px rgb(0 0 0 / 0.25), inset 0 1px 0 rgb(255 255 255 / 0.03);
+      --shadow-sheet: 0 4px 16px rgb(0 0 0 / 0.32), inset 0 1px 0 rgb(255 255 255 / 0.04);
+      --shadow-overlay: 0 24px 52px -12px rgb(0 0 0 / 0.65), 0 0 0 1px rgb(56 62 76 / 0.9);
       --scrollbar-thumb: var(--scrollbar-thumb-dark);
     }
   }
@@ -150,11 +165,11 @@
   :focus-visible {
     outline: 2px solid rgb(var(--focus));
     outline-offset: 2px;
-    border-radius: 3px;
+    border-radius: 6px;
   }
 
   ::selection {
-    background: rgb(var(--brand) / 0.28);
+    background: rgb(var(--info) / 0.22);
   }
 
   /* Standard scrollbar styling (never animate scrollbar-color) */
@@ -165,12 +180,12 @@
 
   @supports not (scrollbar-color: auto) {
     ::-webkit-scrollbar {
-      width: 10px;
-      height: 10px;
+      width: 9px;
+      height: 9px;
     }
     ::-webkit-scrollbar-thumb {
       background: var(--scrollbar-thumb);
-      border: 3px solid transparent;
+      border: 2.5px solid transparent;
       background-clip: content-box;
       border-radius: 999px;
     }
@@ -195,8 +210,8 @@
   }
 
   dialog[open]::backdrop {
-    background-color: rgb(9 13 20 / 0.52);
-    backdrop-filter: blur(2px);
+    background-color: rgb(9 13 20 / 0.46);
+    backdrop-filter: blur(4px);
   }
 
   dialog.hg-dialog {
@@ -257,16 +272,19 @@
   @media (forced-colors: active) {
     dialog.hg-dialog,
     .hg-window-frame,
+    .hg-sheet,
+    .hg-card,
     .hg-toast {
       border: 1px solid CanvasText;
+    }
+    .hg-nav-active,
+    .hg-segment-active {
+      outline: 2px solid Highlight;
     }
     button[role='switch'] {
       border: 1px solid ButtonText;
     }
     button[role='switch'][aria-checked='true'] {
-      background-color: Highlight;
-    }
-    .hg-active-bar {
       background-color: Highlight;
     }
     :focus-visible {
@@ -297,21 +315,21 @@
     font-variant-numeric: tabular-nums;
   }
   .label-caps {
-    @apply text-2xs font-medium uppercase tracking-[0.06em] text-fg-subtle;
+    @apply text-2xs font-medium uppercase tracking-[0.05em] text-fg-subtle;
   }
   .hairline {
     @apply border-line;
   }
   .mark-token {
-    @apply rounded-sm bg-brand/15 text-brand;
-    box-shadow: inset 0 -1px 0 rgb(var(--brand) / 0.55);
+    @apply rounded-sm bg-info/15 text-info;
+    box-shadow: inset 0 -1px 0 rgb(var(--info) / 0.45);
   }
   .mark-secret {
     @apply rounded-sm bg-danger/15 text-danger;
-    box-shadow: inset 0 -1px 0 rgb(var(--danger) / 0.55);
+    box-shadow: inset 0 -1px 0 rgb(var(--danger) / 0.45);
   }
   .mark-warn {
     @apply rounded-sm bg-warn/15 text-warn;
-    box-shadow: inset 0 -1px 0 rgb(var(--warn) / 0.55);
+    box-shadow: inset 0 -1px 0 rgb(var(--warn) / 0.45);
   }
 }

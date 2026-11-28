@@ -129,7 +129,7 @@ export function ThemeToggle() {
       onClick={toggle}
       aria-label={label}
       title={label}
-      className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded px-2 text-2xs font-medium text-fg-muted transition-colors hover:bg-surface-3 hover:text-fg"
+      className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md px-2 text-2xs font-medium text-fg-muted transition-colors hover:bg-surface-3 hover:text-fg"
     >
       <span aria-hidden="true" className="flex text-fg">
         {pref === 'system' ? (
@@ -226,13 +226,13 @@ export function WindowFrame({
       {/* Custom Native-Style Window Chrome */}
       <div
         onPointerDown={handleDragStart}
-        className="flex h-10 shrink-0 select-none items-center justify-between gap-3 border-b border-line bg-surface/95 pl-3.5 pr-0 backdrop-blur-sm"
+        className="flex h-10 shrink-0 select-none items-center justify-between gap-3 bg-bg pl-3.5 pr-0"
       >
         <div className="flex min-w-0 items-center gap-2.5">
-          <img src={logoMark} alt="" className="h-[18px] w-[18px] shrink-0" />
-          <span className="truncate text-xs font-semibold tracking-tight text-fg">{title}</span>
+          <img src={logoMark} alt="" className="h-[18px] w-[18px] shrink-0 rounded-[4px]" />
+          <span className="truncate text-[13px] font-semibold tracking-tight text-fg">{title}</span>
           {badge && (
-            <span className="tabular rounded-sm border border-line bg-surface-2 px-1.5 py-px font-mono text-2xs text-fg-subtle">
+            <span className="tabular rounded-full bg-surface-3/90 px-2 py-px font-mono text-2xs text-fg-subtle">
               {badge}
             </span>
           )}

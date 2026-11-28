@@ -131,7 +131,7 @@ export function Settings() {
   return (
     <div className="mx-auto max-w-5xl px-6 pb-10">
       <Section index="01" title={t('settings.generalTitle')}>
-        <div className="divide-y divide-line rounded-md border border-line bg-surface">
+        <div className="hg-card divide-y divide-line/75 overflow-hidden rounded-xl border border-line/85 bg-surface shadow-card">
           <div className="flex flex-wrap items-center justify-between gap-4 px-4 py-3">
             <span className="text-sm font-medium text-fg">{t('settings.langTitle')}</span>
             <Segmented<UiLanguage>
@@ -169,7 +169,7 @@ export function Settings() {
             <Skeleton className="h-12" />
           </div>
         ) : (
-          <div className="divide-y divide-line rounded-md border border-line bg-surface">
+          <div className="hg-card divide-y divide-line/75 overflow-hidden rounded-xl border border-line/85 bg-surface shadow-card">
             <div className="flex items-center justify-between gap-6 px-4 py-3">
               <span className="text-sm font-medium text-fg">{t('settings.updatesAutoTitle')}</span>
               <Switch
@@ -195,7 +195,7 @@ export function Settings() {
                     </Badge>
                   ) : updateInfo ? (
                     <Badge tone="neutral">
-                      <CheckCircle size={12} weight="fill" className="text-brand" />
+                      <CheckCircle size={12} weight="fill" className="text-ok" />
                       {t('settings.updatesUpToDate')}
                     </Badge>
                   ) : updateError ? (
@@ -317,7 +317,7 @@ export function Settings() {
             <Skeleton className="h-12" />
           </div>
         ) : (
-          <dl className="divide-y divide-line rounded-md border border-line bg-surface text-xs">
+          <dl className="hg-card divide-y divide-line/75 overflow-hidden rounded-xl border border-line/85 bg-surface text-xs shadow-card">
             <div className="flex items-center justify-between gap-4 px-4 py-3">
               <dt className="text-fg-subtle">{t('settings.versionLabel')}</dt>
               <dd className="tabular font-mono text-fg">{status ? `v${status.version}` : t('common.none')}</dd>

@@ -85,14 +85,14 @@ function CaTrustCard({
   };
   return (
     <section aria-label={t('integrations.caSectionAria')} className="mx-auto max-w-3xl px-8 pt-6">
-      <div className="rounded-md border border-line bg-surface-2 px-4 py-3.5">
+      <div className="hg-card rounded-xl border border-line/85 bg-surface-2/50 px-5 py-4 shadow-card">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex min-w-0 items-center gap-2">
             <ShieldCheck
               aria-hidden="true"
               size={18}
               weight={caStatus?.installedInOsStore ? 'fill' : 'regular'}
-              className={caStatus?.installedInOsStore ? 'shrink-0 text-brand' : 'shrink-0 text-warn'}
+              className={caStatus?.installedInOsStore ? 'shrink-0 text-ok' : 'shrink-0 text-warn'}
             />
             <h2 className="truncate text-sm font-semibold text-fg">{t('integrations.caTitle')}</h2>
             {!caStatus ? (
@@ -332,12 +332,11 @@ function CaTrustCard({
   );
 }
 
-function Block({ index, title, aside, children }: { index: string; title: string; aside?: ReactNode; children: ReactNode }) {
+function Block({ title, aside, children }: { index?: string; title: string; aside?: ReactNode; children: ReactNode }) {
   return (
-    <section className="border-t border-line py-6">
+    <section className="border-t border-line/75 py-6">
       <div className="mb-3 flex min-h-7 items-center gap-3">
-        <span className="tabular font-mono text-2xs text-fg-subtle">{index}</span>
-        <h3 className="text-sm font-semibold text-fg">{title}</h3>
+        <h3 className="text-sm font-semibold tracking-tight text-fg">{title}</h3>
         {aside && <div className="ml-auto">{aside}</div>}
       </div>
       {children}
@@ -466,7 +465,7 @@ function ToolDetail({
           <div className="mt-4">
             <Callout tone="warn" title={t('integrations.restartCalloutTitle', { name: profile.name })}>
               {t('integrations.restartCalloutBody', {
-                pids: runningNotice.pids.slice(0, 4).join(', '),
+                pids: runningNotice.runningPids.slice(0, 4).join(', '),
               })}
             </Callout>
           </div>
@@ -553,15 +552,15 @@ function ToolDetail({
           )
         }
       >
-        <div className="space-y-3 rounded-md border border-line bg-surface-2 px-4 py-3 text-xs">
+        <div className="space-y-3 rounded-xl border border-line/85 bg-surface-2/50 px-5 py-4 text-xs">
           <div className="flex items-start justify-between gap-4">
             <span className="shrink-0 text-fg-subtle">{t('integrations.connectMethod')}</span>
             <span className="text-right text-fg">{describeAutoConnectMode(profile, locale)}</span>
           </div>
           {profile.requiresCaTrust && (
-            <div className="flex items-start justify-between gap-4 border-t border-line pt-2.5">
+            <div className="flex items-start justify-between gap-4 border-t border-line/75 pt-3">
               <span className="shrink-0 text-fg-subtle">{t('integrations.tlsCertLabel')}</span>
-              <span className={cx('text-right font-mono', caStatus?.installedInOsStore ? 'text-brand' : 'text-warn')}>
+              <span className={cx('text-right font-mono', caStatus?.installedInOsStore ? 'text-ok' : 'text-warn')}>
                 {caStatus?.installedInOsStore
                   ? t('integrations.caTrusted')
                   : caStatus && !caStatus.osTrustSupported
@@ -570,15 +569,15 @@ function ToolDetail({
               </span>
             </div>
           )}
-          <div className="flex items-start justify-between gap-4 border-t border-line pt-2.5">
+          <div className="flex items-start justify-between gap-4 border-t border-line/75 pt-3">
             <span className="shrink-0 text-fg-subtle">{t('integrations.currentStateLabel')}</span>
-            <span className={cx('text-right font-mono', profile.configured ? 'text-brand' : 'text-fg-muted')}>
+            <span className={cx('text-right font-mono', profile.configured ? 'text-ok' : 'text-fg-muted')}>
               {profile.configured
                 ? t('integrations.stateActiveVia', { via: profile.configuredVia ?? entry })
                 : t('integrations.stateNotRouted')}
             </span>
           </div>
-          <div className="flex items-start justify-between gap-4 border-t border-line pt-2.5">
+          <div className="flex items-start justify-between gap-4 border-t border-line/75 pt-3">
             <span className="shrink-0 text-fg-subtle">{t('integrations.detectedPathsLabel')}</span>
             <div className="min-w-0 text-right font-mono text-fg-muted">
               {profile.installPaths.length > 0 ? (
@@ -618,11 +617,11 @@ function ToolDetail({
       </Block>
 
       <Block index="02" title={t('integrations.blockRouteTitle')}>
-        <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-stretch rounded-md border border-line">
-          <div className="min-w-0 py-3 pl-4 pr-2">
+        <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-stretch rounded-xl border border-line/85 bg-surface-2/40">
+          <div className="min-w-0 py-3.5 pl-4 pr-2">
             <p className="label-caps">{t('integrations.localEntryLabel')}</p>
             <div className="mt-1 flex items-center gap-1">
-              <code className="min-w-0 truncate font-mono text-sm text-brand" title={entry}>
+              <code className="min-w-0 truncate font-mono text-sm text-info" title={entry}>
                 {entry}
               </code>
               <CopyButton compact text={entry} label={t('integrations.copyEntry')} />
@@ -631,7 +630,7 @@ function ToolDetail({
           <span aria-hidden="true" className="flex items-center px-2 text-fg-subtle">
             <ArrowRight size={16} />
           </span>
-          <div className="min-w-0 border-l border-line px-4 py-3">
+          <div className="min-w-0 border-l border-line/75 px-4 py-3.5">
             <p className="label-caps">{t('integrations.forwardToLabel')}</p>
             <code className="mt-1 block truncate py-1 font-mono text-sm text-fg-muted" title={profile.defaultUpstream}>
               {profile.defaultUpstream}
@@ -662,8 +661,8 @@ function ToolDetail({
           />
         }
       >
-        <div className="overflow-hidden rounded-md border border-line">
-          <div className="flex h-9 items-center gap-2 border-b border-line bg-surface-2 pl-3 pr-1">
+        <div className="overflow-hidden rounded-xl border border-line/85">
+          <div className="flex h-9 items-center gap-2 border-b border-line/75 bg-surface-2/70 pl-3.5 pr-1.5">
             <Terminal aria-hidden="true" size={14} className="shrink-0 text-fg-subtle" />
             <span className="truncate text-xs text-fg-subtle">{t('integrations.currentShellOnly')}</span>
             <span className="ml-auto">
@@ -910,9 +909,9 @@ export function Integrations() {
   };
 
   return (
-    <div className="grid h-full min-h-0 grid-cols-[280px_minmax(0,1fr)]">
-      <nav aria-label={t('integrations.navAria')} className="flex min-h-0 flex-col border-r border-line bg-surface">
-        <div className="border-b border-line p-3">
+    <div className="grid h-full min-h-0 grid-cols-[264px_minmax(0,1fr)]">
+      <nav aria-label={t('integrations.navAria')} className="flex min-h-0 flex-col border-r border-line/75 bg-surface-2/40">
+        <div className="border-b border-line/75 p-3.5">
           <div className="flex items-center justify-between gap-2">
             <span className="label-caps">
               {t('integrations.summaryCount', {
@@ -926,7 +925,7 @@ export function Integrations() {
               onClick={handleScan}
               disabled={scanning}
               title={t('integrations.scanBtnTitle')}
-              className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-1 text-2xs text-fg-muted hover:bg-surface-2 hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus/40 disabled:cursor-not-allowed disabled:opacity-50"
+              className="inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-1 text-2xs text-fg-muted hover:bg-surface-3 hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus/40 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <ArrowsClockwise size={13} className={scanning ? 'animate-spin' : undefined} />
               {t('integrations.scanBtn')}
@@ -943,7 +942,7 @@ export function Integrations() {
             {t('integrations.connectAllBtn')}
           </Button>
         </div>
-        <ul className="min-h-0 flex-1 divide-y divide-line overflow-y-auto">
+        <ul className="min-h-0 flex-1 space-y-0.5 overflow-y-auto p-2">
           {harnesses.map((h) => {
             const active = h.kind === selected.kind;
             const running = runningByKind.get(h.kind);
@@ -961,7 +960,7 @@ export function Integrations() {
               : running?.needsRestart
                 ? 'bg-warn'
                 : h.configured
-                  ? 'bg-brand'
+                  ? 'bg-ok'
                   : h.installed
                     ? 'bg-warn'
                     : 'bg-line-strong';
@@ -972,12 +971,11 @@ export function Integrations() {
                   onClick={() => navigate('integrations', { tool: h.kind })}
                   aria-current={active ? 'true' : undefined}
                   className={cx(
-                    'relative flex w-full cursor-pointer items-center gap-3 px-4 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus/40',
-                    active ? 'bg-brand/[0.07]' : 'hover:bg-surface-2',
+                    'flex w-full cursor-pointer items-center gap-3 rounded-lg px-3 py-2 text-left transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus/40',
+                    active ? 'hg-nav-active bg-surface font-medium text-fg shadow-control' : 'text-fg-muted hover:bg-surface-3/60 hover:text-fg',
                   )}
                 >
-                  {active && <span aria-hidden="true" className="hg-active-bar absolute inset-y-0 left-0 w-0.5 bg-brand" />}
-                  <span className="min-w-0 flex-1 truncate text-sm font-medium text-fg">{h.name}</span>
+                  <span className="min-w-0 flex-1 truncate text-sm text-fg">{h.name}</span>
                   <span className="inline-flex shrink-0 items-center gap-1.5 text-2xs text-fg-subtle">
                     <span aria-hidden="true" className={cx('h-1.5 w-1.5 rounded-full', dotTone)} />
                     {statusText}
@@ -1005,17 +1003,17 @@ export function Integrations() {
           onRemoveMitmHost={handleRemoveMitmHost}
         />
         <section aria-label={t('integrations.compatTitle')} className="mx-auto max-w-3xl px-8 pt-3">
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-line bg-surface-2 px-4 py-2.5 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line/85 bg-surface-2/50 px-5 py-3 text-xs">
             <span className="font-medium text-fg">{t('integrations.compatTitle')}</span>
             <div className="flex flex-wrap items-center gap-3">
               <span className="inline-flex items-center gap-1.5">
                 <span className="text-fg-subtle">{t('integrations.compatOpenAi')}</span>
-                <code className="font-mono text-brand">{`${proxyBase(config.proxyPort)}/codex/v1`}</code>
+                <code className="font-mono text-info">{`${proxyBase(config.proxyPort)}/codex/v1`}</code>
                 <CopyButton compact text={`${proxyBase(config.proxyPort)}/codex/v1`} label={t('integrations.copyEntry')} />
               </span>
               <span className="inline-flex items-center gap-1.5">
                 <span className="text-fg-subtle">{t('integrations.compatAnthropic')}</span>
-                <code className="font-mono text-brand">{`${proxyBase(config.proxyPort)}/claude-code`}</code>
+                <code className="font-mono text-info">{`${proxyBase(config.proxyPort)}/claude-code`}</code>
                 <CopyButton compact text={`${proxyBase(config.proxyPort)}/claude-code`} label={t('integrations.copyEntry')} />
               </span>
             </div>

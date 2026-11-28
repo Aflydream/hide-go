@@ -41,14 +41,14 @@ function ToggleRow({
 function Example({ local, vendor }: { local: string; vendor: string }) {
   const { t } = useI18n();
   return (
-    <dl className="mt-3 overflow-hidden rounded border border-line font-mono text-2xs leading-5">
-      <div className="flex gap-3 bg-surface-2 px-3 py-1.5">
+    <dl className="mt-3 overflow-hidden rounded-lg border border-line/80 font-mono text-2xs leading-5">
+      <div className="flex gap-3 bg-surface-2/80 px-3 py-1.5">
         <dt className="w-10 shrink-0 text-fg-subtle">{t('policy.exampleLocal')}</dt>
         <dd className="min-w-0 break-all text-fg">{local}</dd>
       </div>
-      <div className="flex gap-3 border-t border-line px-3 py-1.5">
+      <div className="flex gap-3 border-t border-line/75 bg-surface px-3 py-1.5">
         <dt className="w-10 shrink-0 text-fg-subtle">{t('policy.exampleVendor')}</dt>
-        <dd className="min-w-0 break-all text-brand">{vendor}</dd>
+        <dd className="min-w-0 break-all text-info">{vendor}</dd>
       </div>
     </dl>
   );
@@ -134,7 +134,7 @@ export function Policy() {
           </>
         }
       >
-        <div className="divide-y divide-line rounded-md border border-line bg-surface">
+        <div className="hg-card divide-y divide-line/75 overflow-hidden rounded-xl border border-line/85 bg-surface shadow-card">
           <ToggleRow
             title={t('policy.scopeSecretsTitle')}
             description={t('policy.scopeSecretsDesc')}
@@ -198,7 +198,7 @@ export function Policy() {
       </Section>
 
       <Section index="03" title={t('policy.secTelemetryTitle')} description={t('policy.secTelemetryDesc')}>
-        <div className="divide-y divide-line rounded-md border border-line bg-surface">
+        <div className="hg-card divide-y divide-line/75 overflow-hidden rounded-xl border border-line/85 bg-surface shadow-card">
           <ToggleRow
             title={t('policy.telemetryRowTitle')}
             description={t('policy.telemetryRowDesc')}
@@ -260,7 +260,7 @@ export function Policy() {
           </>
         }
       >
-        <div className={cx('divide-y divide-line rounded-md border border-line bg-surface', !allHideActive && 'opacity-80')}>
+        <div className={cx('hg-card divide-y divide-line/75 overflow-hidden rounded-xl border border-line/85 bg-surface shadow-card', !allHideActive && 'opacity-80')}>
           <ToggleRow
             title={t('policy.literalTitle')}
             description={t('policy.literalDesc')}
@@ -303,8 +303,8 @@ export function Policy() {
                     onClick={() => setAllHide({ coverTheme: theme })}
                     onKeyDown={onThemeKeyDown}
                     className={cx(
-                      'cursor-pointer rounded border px-3 py-2 text-left text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus/40 disabled:cursor-not-allowed disabled:opacity-45',
-                      active ? 'border-brand bg-brand/[0.06] text-fg' : 'border-line text-fg-muted hover:border-line-strong',
+                      'cursor-pointer rounded-lg border px-3 py-2.5 text-left text-xs transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus/40 disabled:cursor-not-allowed disabled:opacity-45',
+                      active ? 'border-brand/80 bg-surface-2/80 text-fg shadow-control' : 'border-line/85 text-fg-muted hover:border-line-strong hover:bg-surface-2/40',
                     )}
                   >
                     <span className="block font-medium">{getCoverThemeLabel(theme, locale)}</span>

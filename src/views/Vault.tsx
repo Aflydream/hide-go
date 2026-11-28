@@ -168,7 +168,7 @@ export function VaultView() {
                   <tr key={v.token} className="group transition-colors hover:bg-surface-2">
                     <td className="py-1.5 pl-6 align-top">
                       <div className="flex items-start gap-1">
-                        <code className="min-w-0 break-all py-1 font-mono text-brand">{v.token}</code>
+                        <code className="min-w-0 break-all py-1 font-mono text-info">{v.token}</code>
                         <span className="opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
                           <CopyButton compact text={v.token} label={t('vault.copyToken')} />
                         </span>

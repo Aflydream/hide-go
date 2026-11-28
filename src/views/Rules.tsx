@@ -151,7 +151,7 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
           error={patternError}
           hint={
             result?.valid ? (
-              <span className="flex items-center gap-1 text-brand">
+              <span className="flex items-center gap-1 text-ok">
                 <CheckCircle aria-hidden="true" size={13} weight="bold" />
                 {t('rules.patternValid')}
               </span>
@@ -180,7 +180,7 @@ function RuleEditor({ draft, onChange, onDone }: { draft: Draft; onChange: (d: D
           hint={
             <>
               {t('rules.hintExamplePrefix')}
-              <code className="font-mono text-brand">{replacementPreview(draft.replacementHint)}</code>
+              <code className="font-mono text-info">{replacementPreview(draft.replacementHint)}</code>
             </>
           }
         >

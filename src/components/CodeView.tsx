@@ -147,16 +147,16 @@ export const CodeView = memo(function CodeView({
 
   return (
     <section aria-label={title} className={cx('flex min-h-0 min-w-0 flex-col', className)}>
-      <header className={cx('flex h-9 shrink-0 items-center gap-2 border-b border-l-2 border-b-line bg-surface-2 px-3', mark === 'secret' ? 'border-l-danger' : 'border-l-brand')}>
+      <header className={cx('flex h-10 shrink-0 items-center gap-2 border-b border-l-2 border-b-line/75 bg-surface-2/60 px-3.5', mark === 'secret' ? 'border-l-danger' : 'border-l-info')}>
         <h3 className="truncate text-xs font-semibold text-fg">{title}</h3>
-        <span className={cx('shrink-0 rounded-sm px-1 text-2xs font-medium', mark === 'secret' ? 'bg-danger/10 text-danger' : 'bg-brand/10 text-brand')}>
+        <span className={cx('shrink-0 rounded-full px-2 py-px text-2xs font-medium', mark === 'secret' ? 'bg-danger/10 text-danger' : 'bg-info/10 text-info')}>
           {mark === 'secret' ? t('codeView.localOnly') : t('codeView.vendorSees')}
         </span>
         {caption && <span className="truncate text-2xs text-fg-subtle">{caption}</span>}
         <span className="ml-auto flex items-center gap-1">
           {hits > 0 && (
             <>
-              <span className={cx('tabular mr-0.5 text-2xs', mark === 'secret' ? 'text-danger' : 'text-brand')}>
+              <span className={cx('tabular mr-0.5 text-2xs', mark === 'secret' ? 'text-danger' : 'text-info')}>
                 {t(mark === 'secret' ? 'codeView.hitsSensitive' : 'codeView.hitsReplaced', {
                   count: formatCount(hits, locale),
                 })}
