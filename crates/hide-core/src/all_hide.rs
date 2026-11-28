@@ -1700,17 +1700,13 @@ fn should_preserve_quoted_literal(text: &str, quote_start: usize, inner: &str, p
     // Module import / export / require statements on the current line
     let line_start = text[..quote_start].rfind('\n').map_or(0, |i| i + 1);
     let prefix_on_line = text[line_start..quote_start].trim_start();
-    if prefix_on_line.starts_with("import ")
+    prefix_on_line.starts_with("import ")
         || prefix_on_line.starts_with("export ")
         || prefix_on_line.ends_with("from ")
         || prefix_on_line.ends_with("require(")
         || prefix_on_line.ends_with("include!(")
         || prefix_on_line.ends_with("include_str!(")
         || prefix_on_line.ends_with("include_bytes!(")
-    {
-        return true;
-    }
-    false
 }
 
 /// Build a natural, domain-consistent cover string literal preserving any format placeholders.
@@ -1793,10 +1789,7 @@ fn is_protected_lexical_context(text: &str, start: usize, end: usize) -> bool {
         return true;
     }
     // Direct stdlib / framework qualified member (`std::collections`, `React.useState`, `fmt.Sprintf`)
-    if STDLIB_QUALIFIERS.iter().any(|q| before.ends_with(q)) {
-        return true;
-    }
-    false
+    STDLIB_QUALIFIERS.iter().any(|q| before.ends_with(q))
 }
 
 fn decoy_json(value: &mut Value, modules: &[(&str, &str)], n: &mut usize, depth: usize) {

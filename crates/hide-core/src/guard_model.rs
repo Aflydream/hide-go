@@ -528,10 +528,7 @@ fn is_code_identifier_shape(raw: &str) -> bool {
     }
     let bytes = raw.as_bytes();
     let all_lower_sep = bytes.iter().all(|b| b.is_ascii_lowercase() || matches!(b, b'_' | b'-'));
-    if all_lower_sep && (raw.contains('_') || raw.contains('-')) {
-        return true;
-    }
-    false
+    all_lower_sep && (raw.contains('_') || raw.contains('-'))
 }
 
 fn has_clean_boundaries(text: &str, start: usize, end: usize, entity: GuardEntity) -> bool {
