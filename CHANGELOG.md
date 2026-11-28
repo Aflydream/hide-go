@@ -4,24 +4,38 @@
 
 All notable changes to Hide-Go are documented in this file.
 
+## [0.4.0] - 2026-11-28
+
+### Added
+- Pi (`@earendil-works/pi-coding-agent`) integration with automatic detection, dedicated multi-provider sub-routes (`/pi/anthropic`, `/pi/openai/v1`, `/pi/google/v1beta`, `/pi/deepseek`, `/pi/openrouter/v1`, `/pi/xai/v1`), surgical `~/.pi/agent/models.json` backup/restore with per-provider upstream chaining, expanded built-in AI MITM hosts, and `oldText`/`newText` credential restoration for Pi's `edit` tool
+- Embedded multi-task traffic audit neural network (`43 -> 32 ReLU -> 14-class purpose Softmax + 3-head risk Sigmoid`) for request purpose classification, telemetry detection, opaque bulk-upload detection, and calibrated privacy risk scoring
+- Direct in-app update download (`POST /api/updates/download`) in Settings with SHA-256 checksum verification, saving and launching the matching platform installer instead of opening the GitHub Release page
+- Local proxy coexistence and active redaction conflict detection (`GET /api/runtime/health`, `POST /api/runtime/conflict/resolve`): detects local relay config drift with one-click re-chaining, identifies concurrent local redaction proxies via config inspection and live payload/header signatures, and shows an in-app resolution dialog to stop the peer proxy, switch Hide-Go to Audit-Only, or quit Hide-Go
+- Running-client restart reminders and companion-process traffic auditing: flags already-running connected tools with no captured traffic yet, attributes loopback proxy sockets to their owning process (including child processes and same-directory helpers), and audits companion traffic alongside its parent tool
+
+### Changed
+- Refactored host routing, request classification priors, and harness category detection from linear scans into O(1) hash tables, single-pass `RegexSet` matchers, and embedded audit model inference
+- Refreshed the console and installer palette (warm paper light, warm graphite dark, slate-indigo accents) with clearer copy across views and high-contrast `forced-colors` fallbacks
+- Replaced the duplicated Chinese section in GitHub Release bodies with a top jump link to the matching version in `CHANGELOG.zh-CN.md`
+
 ## [0.3.6] - 2026-11-28
 
 ### Added
-- Embedded statistical request classifier (`classifier.rs`) combining JSON AST schema features, Shannon byte entropy, header/path/host morphology, upload-asymmetry ratios, and repeat-endpoint cadence with Softmax confidence scoring (`purposeConfidence`) across all 14 `RequestPurpose` classes
-- High-entropy unknown-prefix credential scanner (`scanner.rs`) catching random secret assignments with strict metadata and character-class false-positive guards
-- Embedded hybrid contextual guard model (`guard_model.rs`) combining exact mathematical validators (GB 11643-1999 Resident ID Mod 11-2, Luhn payment cards, phone formatting) with a 2-layer sliding-window MLP scorer (`protectPersonalInfo`, `guardModelEnabled`, configurable `guardThreshold` presets `0.65` / `0.80` / `0.90`) to catch bilingual prose secrets, cookies, CLI credentials, and personal data while suppressing coding-agent false positives (XML token counters, timestamps, commit hashes, semver strings, base64 data URIs, and test placeholders), paired with shape-preserving keyed PII placeholders in `desensitizer.rs`
-- Chinese changelog (`CHANGELOG.zh-CN.md`), bilingual GitHub Release notes with a top Chinese jump link, and a collapsible localized changelog preview inside Settings when a newer version is available
+- Built-in local request classifier that inspects JSON structure, byte entropy, headers, paths, host shape, upload asymmetry, and repeat cadence to tag all 14 request purposes with a confidence score — without relying on static allow/deny lists
+- High-entropy secret detector that catches random credentials with unfamiliar prefixes while ignoring normal hashes, IDs, and metadata fields
+- Local contextual guard model combining exact checksum checks (Resident ID Mod 11-2, Luhn payment cards, phone formats) with a lightweight sliding-window neural scorer (`Strict` / `Balanced` / `Conservative` presets) to catch secrets and personal details in natural prose while staying quiet on token counters, timestamps, commit hashes, versions, base64 images, and sample values
+- Chinese changelog (`CHANGELOG.zh-CN.md`) and a collapsible, language-aware "What's new" preview right inside Settings when an update is available
 
 ### Changed
-- Rebuilt `All-Hide` isomorphic camouflage (`all_hide.rs`) to emit grammatical, role-preserving cover identifiers (preserving type suffixes like `Config`/`Error`/`Service` and verb prefixes), combinatorial natural comments without hex tags, format-preserving natural cover string literals (skipping imports, MIME types, HTTP methods, and file paths), dynamic request-schema tool/parameter protection, and multi-module indexing decoys so AI coding agents can read and edit camouflaged code cleanly with lossless restoration
-- Unified HTTP, MITM, Protobuf, and raw `CONNECT` tunnel auditing around `RequestClassifier`, adding upload-asymmetry detection for bulk encrypted uploads to previously unseen hosts
-- Optimized hot-path scanning, classification, and camouflage latency with single-pass `RegexSet` prefilters in `guard_model.rs` (including precompiled negative-cue matching, zero-allocation stack validators, O(K log K) interval fusion, and minified-blob/candidate caps), a 28-byte token-run prefilter in `scanner.rs`, bounded head/tail structural probing for `>128 KB` JSON payloads in `classifier.rs`, fast exits in `desensitizer.rs`/`vault.rs`, and O(log N) binary-search interval lookups in `all_hide.rs`
+- Reworked **All-Hide** code camouflage so renamed identifiers keep their roles and suffixes (`Config`, `Error`, `Service`, etc.), comments read naturally without hex tags, string literals preserve format placeholders while skipping imports and paths, and tool schemas stay intact — letting coding agents read and edit camouflaged code smoothly with lossless restoration
+- Unified HTTP, MITM, Protobuf, and raw `CONNECT` tunnel auditing on the new classifier, flagging large asymmetric uploads even to previously unseen hosts
+- Tuned scanning, classification, and camouflage hot paths with single-pass regex prefilters, stack-allocated validators, bounded probing for large JSON bodies (`> 128 KB`), fast-path early exits, and binary-search span lookups
 
 ### Fixed
-- Preserve Anthropic top-level `system` prompts and OpenAI `system` / `developer` messages from `All-Hide` identifier and literal camouflage after `SemanticDesensitizer` has masked secrets and paths
-- Strip `tool_calls` and `done_reason` from synthesized NDJSON tail flush frames so EOF lookahead flushes never duplicate tool invocations
-- Include a per-instance boot nonce in `/api/logs` and `/api/vault` weak `ETag` headers so gateway restarts never serve stale `304 Not Modified` responses to an open console tab
-- Refresh managed Windows user proxy/CA environment variables on `DELETE /api/ca/trust` when `systemProxyChain` is active
+- Stop All-Hide from rewriting Anthropic top-level `system` prompts and OpenAI `system` / `developer` instructions after secrets and paths are masked
+- Strip `tool_calls` and `done_reason` from synthetic NDJSON tail flush frames so EOF lookahead never triggers duplicate tool calls
+- Include a per-launch nonce in `/api/logs` and `/api/vault` weak `ETag` values so restarting the gateway never serves stale `304` responses to an open console window
+- Refresh managed Windows proxy/CA environment variables when revoking Root CA trust while system proxy chaining is enabled
 
 ## [0.3.5] - 2026-11-22
 

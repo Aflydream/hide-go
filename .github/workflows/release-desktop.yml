@@ -163,7 +163,7 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-      - name: Extract bilingual release notes from CHANGELOG.md and CHANGELOG.zh-CN.md
+      - name: Extract release notes from CHANGELOG.md with Chinese link
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -173,29 +173,20 @@ jobs:
             found && /^## \[/ { exit }
             found { print }
           ' CHANGELOG.md > release-notes-en.md
-          awk -v ver="$VERSION" '
+          ZH_HEADING=$(awk -v ver="$VERSION" '
             { sub(/\r$/, "") }
-            index($0, "## [" ver "]") == 1 { found=1; print; next }
-            found && /^## \[/ { exit }
-            found { print }
-          ' CHANGELOG.zh-CN.md > release-notes-zh.md
+            index($0, "## [" ver "]") == 1 { print; exit }
+          ' CHANGELOG.zh-CN.md)
           if [ ! -s release-notes-en.md ]; then
             echo "Hide-Go ${GITHUB_REF_NAME}" > release-notes-en.md
           fi
           {
-            if [ -s release-notes-zh.md ]; then
-              echo "> **Language / 语言**: **English** | [简体中文](#中文更新日志) · [CHANGELOG.zh-CN.md](https://github.com/Aflydream/hide-go/blob/${GITHUB_REF_NAME}/CHANGELOG.zh-CN.md)"
+            if [ -n "$ZH_HEADING" ]; then
+              ZH_ANCHOR=$(printf '%s' "$ZH_HEADING" | sed 's/^## //' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9 -]//g' | tr ' ' '-')
+              echo "> [中文更新日志](https://github.com/Aflydream/hide-go/blob/${GITHUB_REF_NAME}/CHANGELOG.zh-CN.md#${ZH_ANCHOR})"
               echo ""
             fi
             cat release-notes-en.md
-            if [ -s release-notes-zh.md ]; then
-              echo ""
-              echo "---"
-              echo ""
-              echo "## 中文更新日志"
-              echo ""
-              cat release-notes-zh.md
-            fi
           } > release-notes.md
       - uses: softprops/action-gh-release@v2
         with:
