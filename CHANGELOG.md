@@ -1,8 +1,26 @@
 # Changelog
 
+**English** | [简体中文](CHANGELOG.zh-CN.md)
+
 All notable changes to Hide-Go are documented in this file.
 
 ## [Unreleased]
+
+### Added
+- Embedded statistical request classifier (`classifier.rs`) combining JSON AST schema features, Shannon byte entropy, header/path/host morphology, upload-asymmetry ratios, and repeat-endpoint cadence with Softmax confidence scoring (`purposeConfidence`) across all 14 `RequestPurpose` classes
+- High-entropy unknown-prefix credential scanner (`scanner.rs`) catching random secret assignments with strict metadata and character-class false-positive guards
+- Embedded hybrid contextual guard model (`guard_model.rs`) combining exact mathematical validators (GB 11643-1999 Resident ID Mod 11-2, Luhn payment cards, phone formatting) with a 2-layer sliding-window MLP scorer (`protectPersonalInfo`, `guardModelEnabled`, configurable `guardThreshold` presets `0.65` / `0.80` / `0.90`) to catch bilingual prose secrets, cookies, CLI credentials, and personal data while suppressing coding-agent false positives (XML token counters, timestamps, commit hashes, semver strings, base64 data URIs, and test placeholders), paired with shape-preserving keyed PII placeholders in `desensitizer.rs`
+- Chinese changelog (`CHANGELOG.zh-CN.md`), bilingual GitHub Release notes with a top Chinese jump link, and a collapsible localized changelog preview inside Settings when a newer version is available
+
+### Changed
+- Rebuilt `All-Hide` isomorphic camouflage (`all_hide.rs`) to emit grammatical, role-preserving cover identifiers (preserving type suffixes like `Config`/`Error`/`Service` and verb prefixes), combinatorial natural comments without hex tags, format-preserving natural cover string literals (skipping imports, MIME types, HTTP methods, and file paths), dynamic request-schema tool/parameter protection, and multi-module indexing decoys so AI coding agents can read and edit camouflaged code cleanly with lossless restoration
+- Unified HTTP, MITM, Protobuf, and raw `CONNECT` tunnel auditing around `RequestClassifier`, adding upload-asymmetry detection for bulk encrypted uploads to previously unseen hosts
+- Optimized hot-path scanning, classification, and camouflage latency with single-pass `RegexSet` prefilters in `guard_model.rs` (including precompiled negative-cue matching, zero-allocation stack validators, O(K log K) interval fusion, and minified-blob/candidate caps), a 28-byte token-run prefilter in `scanner.rs`, bounded head/tail structural probing for `>128 KB` JSON payloads in `classifier.rs`, fast exits in `desensitizer.rs`/`vault.rs`, and O(log N) binary-search interval lookups in `all_hide.rs`
+
+### Fixed
+- Preserve Anthropic top-level `system` prompts and OpenAI `system` / `developer` messages from `All-Hide` identifier and literal camouflage after `SemanticDesensitizer` has masked secrets and paths
+- Strip `tool_calls` and `done_reason` from synthesized NDJSON tail flush frames so EOF lookahead flushes never duplicate tool invocations
+- Include a per-instance boot nonce in `/api/logs` and `/api/vault` weak `ETag` headers so gateway restarts never serve stale `304 Not Modified` responses to an open console tab
 
 ## [0.3.5] - 2026-11-22
 
