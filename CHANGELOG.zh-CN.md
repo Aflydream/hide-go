@@ -4,7 +4,7 @@
 
 本文件记录 Hide-Go 各版本的主要变更。
 
-## [Unreleased]
+## [0.3.6] - 2026-11-28
 
 ### 新增
 - 内置本地统计请求分类器（`classifier.rs`），综合 JSON AST 结构特征、Shannon 字节熵、请求头/路径/主机形态、上传不对称度与重复端点节奏，对 14 类 `RequestPurpose` 进行 Softmax 置信度评分（`purposeConfidence`）
@@ -21,6 +21,7 @@
 - 在 `SemanticDesensitizer` 完成密钥与路径脱敏后，保护 Anthropic 顶层 `system` 提示词及 OpenAI `system` / `developer` 消息不被 `All-Hide` 标识符与字面量伪装改写
 - 在 NDJSON 流式还原的尾部合成帧中移除 `tool_calls` 与 `done_reason`，避免 EOF 刷新前瞻缓冲时重复触发工具调用
 - 为 `/api/logs` 与 `/api/vault` 的弱 `ETag` 加入进程级随机启动标识，避免网关重启后向已打开的控制台返回过期的 `304 Not Modified`
+- 在启用 `systemProxyChain` 且调用 `DELETE /api/ca/trust` 取消信任根证书后同步刷新托管的 Windows 用户代理/CA 环境变量
 
 ## [0.3.5] - 2026-11-22
 

@@ -4,7 +4,7 @@
 
 All notable changes to Hide-Go are documented in this file.
 
-## [Unreleased]
+## [0.3.6] - 2026-11-28
 
 ### Added
 - Embedded statistical request classifier (`classifier.rs`) combining JSON AST schema features, Shannon byte entropy, header/path/host morphology, upload-asymmetry ratios, and repeat-endpoint cadence with Softmax confidence scoring (`purposeConfidence`) across all 14 `RequestPurpose` classes
@@ -21,6 +21,7 @@ All notable changes to Hide-Go are documented in this file.
 - Preserve Anthropic top-level `system` prompts and OpenAI `system` / `developer` messages from `All-Hide` identifier and literal camouflage after `SemanticDesensitizer` has masked secrets and paths
 - Strip `tool_calls` and `done_reason` from synthesized NDJSON tail flush frames so EOF lookahead flushes never duplicate tool invocations
 - Include a per-instance boot nonce in `/api/logs` and `/api/vault` weak `ETag` headers so gateway restarts never serve stale `304 Not Modified` responses to an open console tab
+- Refresh managed Windows user proxy/CA environment variables on `DELETE /api/ca/trust` when `systemProxyChain` is active
 
 ## [0.3.5] - 2026-11-22
 
