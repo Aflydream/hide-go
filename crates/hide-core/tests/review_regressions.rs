@@ -595,6 +595,8 @@ fn r23_wave2a_all_seven_harnesses_connect_and_restore_without_host_mutation() {
     std::fs::create_dir_all(tmp.0.join(".grok")).unwrap();
     std::fs::create_dir_all(tmp.0.join(".claude")).unwrap();
     std::fs::write(tmp.0.join(".claude").join("settings.json"), "{}").unwrap();
+    std::fs::create_dir_all(tmp.0.join(".pi").join("agent")).unwrap();
+    std::fs::write(tmp.0.join(".pi").join("agent").join("models.json"), "{}").unwrap();
 
     let host = IsolatedHost {
         root: tmp.0.clone(),
@@ -643,6 +645,7 @@ fn r23_wave2a_all_seven_harnesses_connect_and_restore_without_host_mutation() {
         HarnessKind::Qoder,
         HarnessKind::Cursor,
         HarnessKind::GrokBuild,
+        HarnessKind::Pi,
     ] {
         assert!(disconnect_harness_with_deps(&host, cfg_path.clone(), kind).ok);
     }

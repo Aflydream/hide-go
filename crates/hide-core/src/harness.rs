@@ -50,7 +50,7 @@ pub struct HarnessProfile {
     pub last_seen_at: Option<String>,
 }
 
-/// Returns rich, accurate profiles for all 7 supported AI coding harnesses
+/// Returns rich, accurate profiles for all supported AI coding harnesses
 pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
     let base = format!("http://127.0.0.1:{}", proxy_port);
 
@@ -333,6 +333,46 @@ pub fn get_all_harness_profiles(proxy_port: u16) -> Vec<HarnessProfile> {
             traffic_count: 0,
             last_seen_at: None,
         },
+        HarnessProfile {
+            kind: HarnessKind::Pi,
+            name: "Pi".to_string(),
+            vendor_name: "Pi Coding Agent (Multi-Provider)".to_string(),
+            default_upstream: "https://api.anthropic.com".to_string(),
+            local_proxy_route: "/pi".to_string(),
+            protocol_family: "Anthropic / OpenAI / Multi-Provider CLI".to_string(),
+            description: "开源终端编程助手，支持通过 models.json 和代理环境变量对接 Anthropic、OpenAI、Google 等多家模型服务。"
+                .to_string(),
+            risk_summary: vec![
+                "工具调用会把文件内容、目录结构和命令输出一并带入对话上下文".to_string(),
+                "多模型切换时可能把相同的敏感变量或内网地址发往不同厂商".to_string(),
+                "长会话记录和扩展插件输出可能附带本地绝对路径与凭据片段".to_string(),
+            ],
+            env_setup_bash: format!(
+                "export HTTPS_PROXY=\"{}\"\nexport HTTP_PROXY=\"{}\"\nexport NODE_USE_ENV_PROXY=1\nexport NO_PROXY=\"localhost,127.0.0.1,::1\"\npi",
+                base, base
+            ),
+            env_setup_powershell: format!(
+                "$env:HTTPS_PROXY=\"{}\"\n$env:HTTP_PROXY=\"{}\"\n$env:NODE_USE_ENV_PROXY=\"1\"\n$env:NO_PROXY=\"localhost,127.0.0.1,::1\"\npi",
+                base, base
+            ),
+            integration_note: Some(
+                "在 ~/.pi/agent/models.json 中为 anthropic、openai、google、deepseek、openrouter、xai 配置本地 Base URL 反向代理（无需根证书即可直连，自动串联保留原有中转上游），并同步写入 HTTPS_PROXY、NODE_USE_ENV_PROXY=1 与本地根证书以覆盖 Kimi、MiniMax、Moonshot、Groq、Mistral 等其余厂商。"
+                    .to_string(),
+            ),
+            detected_active: false,
+            installed: false,
+            install_paths: Vec::new(),
+            configured: false,
+            configured_via: None,
+            auto_connect_mode: AutoConnectMode::ConfigFile,
+            requires_ca_trust: true,
+            auto_connect_targets: vec![
+                "~/.pi/agent/models.json (providers.{anthropic,openai,google,deepseek,openrouter,xai}.baseUrl)".to_string(),
+                "~/.hide-go/env.ps1 / Shell 配置文件 (HTTPS_PROXY, NODE_USE_ENV_PROXY, NODE_EXTRA_CA_CERTS, SSL_CERT_FILE)".to_string(),
+            ],
+            traffic_count: 0,
+            last_seen_at: None,
+        },
     ]
 }
 
@@ -354,95 +394,82 @@ pub fn is_inference_endpoint(path: &str) -> bool {
         && !p.contains("/count_tokens")
 }
 
-/// Inspects the URL path prefix and User-Agent to determine both `HarnessKind` and
-/// `TrafficCategory`. Classification is path-based on purpose: request bodies are user
-/// content, and a tool schema that merely mentions `event_type` must not turn a chat request
-/// into "telemetry" that gets answered locally.
+/// Inspects the URL route prefix, User-Agent, and trained `RequestClassifier` output to
+/// determine `(HarnessKind, TrafficCategory)` without duplicating keyword allow/deny lists.
 pub fn detect_harness_and_category(path: &str, user_agent: Option<&str>, body: &str) -> (HarnessKind, TrafficCategory) {
-    let path_lower = path.to_lowercase();
-    let ua_lower = user_agent.unwrap_or_default().to_lowercase();
+    let first_seg = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
-    let harness = if path_lower.starts_with("/claude-code") {
-        HarnessKind::ClaudeCode
-    } else if path_lower.starts_with("/codex") {
-        HarnessKind::Codex
-    } else if path_lower.starts_with("/antigravity") {
-        HarnessKind::Antigravity
-    } else if path_lower.starts_with("/zcode") {
-        HarnessKind::Zcode
-    } else if path_lower.starts_with("/qoder") {
-        HarnessKind::Qoder
-    } else if path_lower.starts_with("/cursor") {
-        HarnessKind::Cursor
-    } else if path_lower.starts_with("/grok-build") {
-        HarnessKind::GrokBuild
-    } else if ua_lower.contains("claude-cli") || ua_lower.contains("claude-code") {
-        HarnessKind::ClaudeCode
-    } else if ua_lower.contains("codex") {
-        HarnessKind::Codex
-    } else if ua_lower.contains("antigravity") {
-        HarnessKind::Antigravity
-    } else if ua_lower.contains("zcode") {
-        HarnessKind::Zcode
-    } else if ua_lower.contains("qoder") {
-        HarnessKind::Qoder
-    } else if ua_lower.contains("cursor") {
-        HarnessKind::Cursor
-    } else if ua_lower.contains("grok") || ua_lower.contains("xai") {
-        HarnessKind::GrokBuild
-    } else {
-        HarnessKind::Generic
+    let harness = match first_seg.as_str() {
+        "claude-code" => HarnessKind::ClaudeCode,
+        "codex" => HarnessKind::Codex,
+        "antigravity" => HarnessKind::Antigravity,
+        "zcode" => HarnessKind::Zcode,
+        "qoder" => HarnessKind::Qoder,
+        "cursor" => HarnessKind::Cursor,
+        "grok-build" => HarnessKind::GrokBuild,
+        "pi" => HarnessKind::Pi,
+        _ => detect_harness_from_ua(user_agent).unwrap_or(HarnessKind::Generic),
     };
 
-    let segments: Vec<&str> = path_lower
-        .split(['/', '?', ':', '.'])
-        .filter(|s| !s.is_empty())
-        .collect();
-    let has_segment = |names: &[&str]| segments.iter().any(|s| names.contains(s));
+    let cls = crate::classifier::RequestClassifier::classify(&crate::classifier::ClassificationInput {
+        method: "POST",
+        host: None,
+        path,
+        content_type: None,
+        content_encoding: None,
+        headers: None,
+        raw_bytes: body.as_bytes(),
+        body_text: Some(body),
+        bytes_sent_override: None,
+        bytes_received_override: None,
+        repeat_count: 0,
+    });
 
-    let category = if is_inference_endpoint(&path_lower) {
-        if body.contains("\"tool_result\"")
-            || body.contains("\"function_call_output\"")
-            || body.contains("\"functionResponse\"")
-            || body.contains("\"role\":\"tool\"")
-            || body.contains("\"role\": \"tool\"")
-        {
-            TrafficCategory::ToolExecutionSync
-        } else {
-            TrafficCategory::InteractivePrompt
+    let category = match cls.purpose {
+        crate::audit::RequestPurpose::ToolResultSync => TrafficCategory::ToolExecutionSync,
+        crate::audit::RequestPurpose::CodebaseIndexing | crate::audit::RequestPurpose::FileUpload => {
+            TrafficCategory::CodebaseIndexing
         }
-    } else if has_segment(&[
-        "telemetry",
-        "event_logging",
-        "analytics",
-        "metrics",
-        "events",
-        "traces",
-        "logs",
-        "rgstr",
-    ]) || path_lower.contains("event_logging")
-        || crate::audit::has_telemetry_path(path)
-        || crate::audit::has_crash_diagnostic_path(path, None)
-    {
-        TrafficCategory::Telemetry
-    } else if has_segment(&[
-        "embeddings",
-        "embedding",
-        "index",
-        "indexing",
-        "index-sync",
-        "codebase",
-        "merkle",
-        "vector",
-        "repo-service",
-        "repositoryservice",
-        "upload-chunks",
-    ]) || path_lower.contains("codebase_sync")
-    {
-        TrafficCategory::CodebaseIndexing
-    } else {
-        TrafficCategory::InteractivePrompt
+        crate::audit::RequestPurpose::Telemetry | crate::audit::RequestPurpose::CrashReport => {
+            if is_inference_endpoint(path) {
+                TrafficCategory::InteractivePrompt
+            } else {
+                TrafficCategory::Telemetry
+            }
+        }
+        _ => TrafficCategory::InteractivePrompt,
     };
 
     (harness, category)
+}
+
+fn detect_harness_from_ua(user_agent: Option<&str>) -> Option<HarnessKind> {
+    let ua = user_agent?.to_ascii_lowercase();
+    if ua.contains("claude-cli") || ua.contains("claude-code") {
+        Some(HarnessKind::ClaudeCode)
+    } else if ua.contains("codex") {
+        Some(HarnessKind::Codex)
+    } else if ua.contains("antigravity") {
+        Some(HarnessKind::Antigravity)
+    } else if ua.contains("zcode") {
+        Some(HarnessKind::Zcode)
+    } else if ua.contains("qoder") {
+        Some(HarnessKind::Qoder)
+    } else if ua.contains("cursor") {
+        Some(HarnessKind::Cursor)
+    } else if ua.contains("grok") || ua.contains("xai") {
+        Some(HarnessKind::GrokBuild)
+    } else if ua.contains("pi-coding-agent") || ua.starts_with("pi/") {
+        Some(HarnessKind::Pi)
+    } else {
+        None
+    }
 }

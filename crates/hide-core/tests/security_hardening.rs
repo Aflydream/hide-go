@@ -581,6 +581,7 @@ fn s07_corrupted_harness_backup_disconnect_scrubs_dead_routes() {
         HarnessKind::Qoder,
         HarnessKind::Antigravity,
         HarnessKind::GrokBuild,
+        HarnessKind::Pi,
     ];
     for kind in harnesses {
         let res = connect_harness_with_deps(&host, ca_adapter.clone(), ca_dir.clone(), cfg_path.clone(), kind, 18787);
@@ -605,6 +606,7 @@ fn s07_corrupted_harness_backup_disconnect_scrubs_dead_routes() {
         HarnessKind::Qoder,
         HarnessKind::Antigravity,
         HarnessKind::GrokBuild,
+        HarnessKind::Pi,
     ] {
         let _ = disconnect_harness_with_deps(&host, cfg_path.clone(), kind);
     }

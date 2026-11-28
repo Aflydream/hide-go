@@ -18,6 +18,10 @@ const FILE_EDIT_KEYS: &[&str] = &[
     "file_text",
     "old_str",
     "new_str",
+    "oldtext",
+    "newtext",
+    "old_text",
+    "new_text",
     "text",
     "patch",
     "diff",
@@ -508,5 +512,39 @@ mod tests {
             .filter_map(|item| item.pointer("/response/candidates/0/content/parts/0/text")?.as_str())
             .collect();
         assert_eq!(joined, "key: sk-ant-real-key-123456789!");
+    }
+
+    #[test]
+    fn pi_edit_tool_restores_oldtext_and_newtext_under_file_edits_only() {
+        let v = vault();
+        let body = json!({"content": [
+            {"type": "tool_use", "id": "t_pi_edit", "name": "edit",
+             "input": {
+                "path": "/workspace/user_01/.env",
+                "edits": [{
+                    "oldText": "ANTHROPIC_API_KEY=sk-sem-placeholder-key-0001",
+                    "newText": "ANTHROPIC_API_KEY=sk-sem-placeholder-key-0001\nDEBUG=1"
+                }]
+             }},
+            {"type": "tool_use", "id": "t_pi_bash", "name": "bash",
+             "input": {"command": "echo sk-sem-placeholder-key-0001"}}
+        ]});
+        let (out, restored, withheld) =
+            restore_response(&v.matcher(), &body.to_string(), ToolCallSecretPolicy::FileEditsOnly);
+        assert_eq!(withheld, 1, "bash must still withhold credentials");
+        assert!(restored >= 3);
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed["content"][0]["input"]["edits"][0]["oldText"],
+            "ANTHROPIC_API_KEY=sk-ant-real-key-123456789"
+        );
+        assert_eq!(
+            parsed["content"][0]["input"]["edits"][0]["newText"],
+            "ANTHROPIC_API_KEY=sk-ant-real-key-123456789\nDEBUG=1"
+        );
+        assert_eq!(
+            parsed["content"][1]["input"]["command"],
+            "echo sk-sem-placeholder-key-0001"
+        );
     }
 }

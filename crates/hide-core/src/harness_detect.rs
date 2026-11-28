@@ -19,10 +19,21 @@ const SHARED_PROXY_VARS: &[&str] = &[
     "HTTPS_PROXY",
     "HTTP_PROXY",
     "NO_PROXY",
+    "NODE_USE_ENV_PROXY",
     "NODE_EXTRA_CA_CERTS",
     "SSL_CERT_FILE",
     "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
     "REQUESTS_CA_BUNDLE",
+];
+
+/// Pi built-in providers wired to dedicated local Base URL sub-routes under `/pi/<provider>`.
+const PI_MANAGED_PROVIDERS: &[(&str, &str)] = &[
+    ("anthropic", "/pi/anthropic"),
+    ("openai", "/pi/openai/v1"),
+    ("google", "/pi/google/v1beta"),
+    ("deepseek", "/pi/deepseek"),
+    ("openrouter", "/pi/openrouter/v1"),
+    ("xai", "/pi/xai/v1"),
 ];
 const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1";
 const VSCODE_HTTP_NO_PROXY: &[&str] = &["localhost", "127.0.0.1", "::1", ".local"];
@@ -158,7 +169,11 @@ struct HarnessBackup {
     #[serde(default)]
     prev_config_upstream: Option<String>,
     #[serde(default)]
+    prev_provider_upstreams: HashMap<String, Option<String>>,
+    #[serde(default)]
     added_loopback_target: Option<String>,
+    #[serde(default)]
+    added_loopback_targets: Vec<String>,
     #[serde(default)]
     enabled_system_proxy_chain: bool,
 }
@@ -289,6 +304,23 @@ const SPECS: &[HarnessSpec] = &[
         registry_keywords: &["grok bot", "grok-build"],
         requires_ca_trust: true,
     },
+    HarnessSpec {
+        kind: HarnessKind::Pi,
+        binaries: &["pi"],
+        home_paths: &[
+            ".pi/agent/models.json",
+            ".pi/agent/settings.json",
+            ".pi/agent",
+            ".pi",
+            ".local/bin/pi",
+            ".local/bin/pi.exe",
+        ],
+        appdata_paths: &["npm/pi.cmd", "npm/pi"],
+        local_appdata_paths: &["Programs/pi"],
+        mac_apps: &[],
+        registry_keywords: &["pi coding agent"],
+        requires_ca_trust: true,
+    },
 ];
 
 fn spec_for(kind: HarnessKind) -> Option<&'static HarnessSpec> {
@@ -304,6 +336,7 @@ pub fn harness_slug(kind: HarnessKind) -> &'static str {
         HarnessKind::Qoder => "qoder",
         HarnessKind::Cursor => "cursor",
         HarnessKind::GrokBuild => "grok-build",
+        HarnessKind::Pi => "pi",
         HarnessKind::Generic => "generic",
     }
 }
@@ -317,6 +350,7 @@ pub fn parse_harness_slug(slug: &str) -> Option<HarnessKind> {
         "qoder" => Some(HarnessKind::Qoder),
         "cursor" => Some(HarnessKind::Cursor),
         "grok-build" | "grok_build" | "grokbuild" => Some(HarnessKind::GrokBuild),
+        "pi" | "pi-coding-agent" | "pi-agent" => Some(HarnessKind::Pi),
         _ => None,
     }
 }
@@ -1580,6 +1614,23 @@ fn cursor_settings_path(host: &dyn HostAdapter) -> Option<PathBuf> {
         .map(|d| d.join("Cursor").join("User").join("settings.json"))
 }
 
+fn pi_models_path(host: &dyn HostAdapter) -> Option<PathBuf> {
+    let custom_dir = host
+        .process_env("PI_CODING_AGENT_DIR")
+        .or_else(|| host.user_env_get("PI_CODING_AGENT_DIR"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(dir) = custom_dir {
+        if let Some(rest) = dir.strip_prefix("~/").or_else(|| dir.strip_prefix("~\\")) {
+            if let Some(home) = host.home_dir() {
+                return Some(home.join(rest).join("models.json"));
+            }
+        }
+        return Some(PathBuf::from(dir).join("models.json"));
+    }
+    host.home_dir().map(|h| h.join(".pi").join("agent").join("models.json"))
+}
+
 fn check_vscode_proxy_file(path: &Path, proxy_port: u16, check_qoder_advanced: bool) -> bool {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return false;
@@ -1729,6 +1780,30 @@ fn check_configured(
                 }
             }
         }
+        HarnessKind::Pi => {
+            if let Some(models_path) = pi_models_path(host) {
+                if let Ok(raw) = std::fs::read_to_string(&models_path) {
+                    if let Ok(val) = parse_jsonc_value(&raw) {
+                        let any_routed = PI_MANAGED_PROVIDERS.iter().any(|(provider, _)| {
+                            val.pointer(&format!("/providers/{provider}/baseUrl"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|u| {
+                                    points_to_local_gateway(u, "/pi", proxy_port)
+                                        || points_to_local_gateway(u, "/codex", proxy_port)
+                                })
+                        });
+                        if any_routed {
+                            return (true, Some(models_path.to_string_lossy().into_owned()));
+                        }
+                    }
+                }
+            }
+            if backup_file_path(host, HarnessKind::Pi).is_some_and(|p| p.exists()) {
+                if let Some(via) = check_env_either(host, "HTTPS_PROXY", "", proxy_port) {
+                    return (true, Some(via));
+                }
+            }
+        }
         HarnessKind::Generic => {}
     }
     (false, None)
@@ -1776,13 +1851,13 @@ fn shared_leases_path(backup_dir: &Path) -> PathBuf {
 
 enum BackupLoadState {
     Missing,
-    Loaded(HarnessBackup),
+    Loaded(Box<HarnessBackup>),
     Corrupt,
 }
 
 fn load_backup(path: &Path) -> Option<HarnessBackup> {
     match load_backup_state(path) {
-        BackupLoadState::Loaded(b) => Some(b),
+        BackupLoadState::Loaded(b) => Some(*b),
         _ => None,
     }
 }
@@ -1790,7 +1865,7 @@ fn load_backup(path: &Path) -> Option<HarnessBackup> {
 fn load_backup_state(path: &Path) -> BackupLoadState {
     match std::fs::read_to_string(path) {
         Ok(s) => match serde_json::from_str(&s) {
-            Ok(b) => BackupLoadState::Loaded(b),
+            Ok(b) => BackupLoadState::Loaded(Box::new(b)),
             Err(_) => BackupLoadState::Corrupt,
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => BackupLoadState::Missing,
@@ -2001,7 +2076,12 @@ fn update_config_upstream(
 }
 
 fn restore_config_upstream(config_path: Option<&Path>, slug: &str, backup: &HarnessBackup) -> Result<(), String> {
-    if !backup.wrote_config_upstream && backup.added_loopback_target.is_none() && !backup.enabled_system_proxy_chain {
+    if !backup.wrote_config_upstream
+        && backup.prev_provider_upstreams.is_empty()
+        && backup.added_loopback_target.is_none()
+        && backup.added_loopback_targets.is_empty()
+        && !backup.enabled_system_proxy_chain
+    {
         return Ok(());
     }
     let Some(path) = config_path else {
@@ -2021,7 +2101,21 @@ fn restore_config_upstream(config_path: Option<&Path>, slug: &str, backup: &Harn
             }
         }
     }
+    for (up_key, prev) in &backup.prev_provider_upstreams {
+        match prev {
+            Some(p) => {
+                cfg.harness_upstreams.insert(up_key.clone(), p.clone());
+            }
+            None => {
+                cfg.harness_upstreams.remove(up_key);
+            }
+        }
+    }
     if let Some(target) = &backup.added_loopback_target {
+        cfg.allowed_loopback_proxy_targets
+            .retain(|existing| !existing.eq_ignore_ascii_case(target));
+    }
+    for target in &backup.added_loopback_targets {
         cfg.allowed_loopback_proxy_targets
             .retain(|existing| !existing.eq_ignore_ascii_case(target));
     }
@@ -2780,6 +2874,145 @@ pub fn connect_harness_with_deps(
             }
             targets_summary.push("Managed Env (GROK_XAI_API_BASE_URL, GROK_CLI_*, HTTPS_PROXY)".to_string());
         }
+        HarnessKind::Pi => {
+            let Some(models_path) = pi_models_path(host) else {
+                return fail_action(kind, false, "无法定位 Pi 配置目录");
+            };
+            let had_file = models_path.exists();
+            let raw_original = if had_file {
+                match std::fs::read_to_string(&models_path) {
+                    Ok(raw) => Some(raw),
+                    Err(e) => return fail_action(kind, false, format!("读取 {} 失败: {e}", models_path.display())),
+                }
+            } else {
+                None
+            };
+            let mut root: Value = match &raw_original {
+                Some(raw) => match parse_jsonc_value(raw) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return fail_action(
+                            kind,
+                            false,
+                            format!("无法解析现有的 {} ({e})，为安全起见未修改", models_path.display()),
+                        )
+                    }
+                },
+                None => Value::Object(Map::new()),
+            };
+            let Some(root_map) = root.as_object_mut() else {
+                return fail_action(kind, false, "Pi models.json 根节点不是 JSON 对象");
+            };
+
+            let had_providers = root_map.get("providers").is_some_and(Value::is_object);
+            let mut prev_keys = HashMap::new();
+            let mut prev_urls: Vec<(&str, Option<String>)> = Vec::with_capacity(PI_MANAGED_PROVIDERS.len());
+            prev_keys.insert("had_providers".to_string(), Some(Value::Bool(had_providers)));
+            for &(provider_key, _) in PI_MANAGED_PROVIDERS {
+                let existed = root_map
+                    .get("providers")
+                    .and_then(Value::as_object)
+                    .and_then(|p| p.get(provider_key))
+                    .is_some_and(Value::is_object);
+                let prev_url = root_map
+                    .get("providers")
+                    .and_then(Value::as_object)
+                    .and_then(|p| p.get(provider_key))
+                    .and_then(Value::as_object)
+                    .and_then(|o| o.get("baseUrl"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                prev_keys.insert(format!("had_{provider_key}"), Some(Value::Bool(existed)));
+                prev_keys.insert(format!("{provider_key}_baseUrl"), prev_url.clone().map(Value::String));
+                prev_urls.push((provider_key, prev_url));
+            }
+
+            if is_fresh_connect {
+                let snap_rel = if let (Some(bdir), Some(raw)) = (&backup_dir, &raw_original) {
+                    let rel = format!("snapshots/{slug}__0.raw");
+                    if let Err(e) = write_raw_snapshot(bdir, &rel, raw.as_bytes()) {
+                        return fail_with_rollback(&backup, e);
+                    }
+                    Some(rel)
+                } else {
+                    None
+                };
+                backup.files.push(FileBackupEntry {
+                    path: models_path.to_string_lossy().into_owned(),
+                    had_file,
+                    had_env_object: had_providers,
+                    raw_snapshot_rel: snap_rel,
+                    prev_keys,
+                });
+
+                for &(provider_key, ref prev_url_opt) in &prev_urls {
+                    let effective_prev = prev_url_opt
+                        .as_deref()
+                        .filter(|u| {
+                            !u.trim().is_empty()
+                                && !points_to_hidego_gateway(u, "/pi", proxy_port)
+                                && !points_to_hidego_gateway(u, "/codex", proxy_port)
+                        })
+                        .map(str::to_string);
+                    if let Some(prev) = effective_prev {
+                        let up_key = format!("pi:{provider_key}");
+                        match update_config_upstream(config_path.as_deref(), &up_key, "/pi", proxy_port, Some(prev)) {
+                            Ok((wrote, prev_cfg, added_loopback)) => {
+                                if wrote {
+                                    backup.prev_provider_upstreams.insert(up_key, prev_cfg);
+                                }
+                                if let Some(lb) = added_loopback {
+                                    backup.added_loopback_targets.push(lb);
+                                }
+                            }
+                            Err(e) => return fail_with_rollback(&backup, e),
+                        }
+                    }
+                }
+            }
+
+            let providers_obj = root_map
+                .entry("providers".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            let Some(providers_map) = providers_obj.as_object_mut() else {
+                return fail_with_rollback(&backup, "Pi models.json 中的 providers 字段不是对象".to_string());
+            };
+            for &(provider_key, route_suffix) in PI_MANAGED_PROVIDERS {
+                let entry = providers_map
+                    .entry(provider_key.to_string())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                let Some(p_map) = entry.as_object_mut() else {
+                    return fail_with_rollback(
+                        &backup,
+                        format!("Pi models.json 中的 providers.{provider_key} 不是对象"),
+                    );
+                };
+                p_map.insert(
+                    "baseUrl".to_string(),
+                    Value::String(format!("{proxy_url}{route_suffix}")),
+                );
+            }
+
+            let Ok(pretty) = serde_json::to_string_pretty(&root) else {
+                return fail_with_rollback(&backup, "序列化 Pi models.json 失败".to_string());
+            };
+            if let Err(e) = write_atomic_secure(&models_path, format!("{pretty}\n").as_bytes()) {
+                return fail_with_rollback(&backup, format!("写入 {} 失败: {e}", models_path.display()));
+            }
+            targets_summary.push(models_path.to_string_lossy().into_owned());
+
+            if let Err(e) = apply_shared_proxy_and_ca_leases(
+                host,
+                &mut backup,
+                slug,
+                &proxy_url,
+                ca_cert_path.as_deref(),
+                ca_bundle_path.as_deref(),
+            ) {
+                return fail_with_rollback(&backup, e);
+            }
+            targets_summary.push("Managed Env (HTTPS_PROXY, NODE_USE_ENV_PROXY, NODE_EXTRA_CA_CERTS)".to_string());
+        }
         HarnessKind::Generic => return fail_action(kind, false, "不支持自动接入通用类型"),
     }
 
@@ -2813,6 +3046,7 @@ fn build_vscode_terminal_env(
         ("HTTPS_PROXY", proxy_url.to_string()),
         ("HTTP_PROXY", proxy_url.to_string()),
         ("NO_PROXY", DEFAULT_NO_PROXY.to_string()),
+        ("NODE_USE_ENV_PROXY", "1".to_string()),
     ];
     if let Some(cert) = ca_cert_path {
         out.push(("NODE_EXTRA_CA_CERTS", cert.to_string()));
@@ -2842,6 +3076,11 @@ fn rollback_failed_connect(
         HarnessKind::Antigravity | HarnessKind::Qoder | HarnessKind::Cursor => {
             for entry in &backup.files {
                 let _ = restore_vscode_settings_file(entry, backup_dir.as_deref());
+            }
+        }
+        HarnessKind::Pi => {
+            if let Some(entry) = backup.files.first() {
+                let _ = restore_pi_models_file(entry, backup_dir.as_deref());
             }
         }
         HarnessKind::ClaudeCode => {
@@ -2880,6 +3119,7 @@ fn apply_shared_proxy_and_ca_leases(
         ("HTTPS_PROXY", proxy_url),
         ("HTTP_PROXY", proxy_url),
         ("NO_PROXY", DEFAULT_NO_PROXY),
+        ("NODE_USE_ENV_PROXY", "1"),
     ];
     if let Some(cert) = ca_cert_path {
         pairs.push(("NODE_EXTRA_CA_CERTS", cert));
@@ -2944,7 +3184,7 @@ pub fn disconnect_harness_with_deps(
                 backup_path: None,
             };
         }
-        Some(BackupLoadState::Loaded(b)) => b,
+        Some(BackupLoadState::Loaded(b)) => *b,
         _ => HarnessBackup::default(),
     };
 
@@ -3037,6 +3277,13 @@ pub fn disconnect_harness_with_deps(
         HarnessKind::Antigravity | HarnessKind::Qoder | HarnessKind::Cursor => {
             for entry in &backup.files {
                 if let Err(e) = restore_vscode_settings_file(entry, backup_dir.as_deref()) {
+                    return fail_keep(e);
+                }
+            }
+        }
+        HarnessKind::Pi => {
+            if let Some(entry) = backup.files.first() {
+                if let Err(e) = restore_pi_models_file(entry, backup_dir.as_deref()) {
                     return fail_keep(e);
                 }
             }
@@ -3146,6 +3393,77 @@ fn restore_codex_file_from_entry(entry: &FileBackupEntry, backup_dir: Option<&Pa
             let _ = std::fs::remove_file(snap_path);
             return Ok(());
         }
+    }
+    Ok(())
+}
+
+fn restore_pi_models_file(entry: &FileBackupEntry, backup_dir: Option<&Path>) -> Result<(), String> {
+    let path = Path::new(&entry.path);
+    if !entry.had_file {
+        if path.exists() {
+            ensure_not_symlink(path)?;
+            std::fs::remove_file(path).map_err(|e| format!("移除 {} 失败: {e}", path.display()))?;
+        }
+        if let (Some(bdir), Some(rel)) = (
+            backup_dir,
+            entry.raw_snapshot_rel.as_deref().filter(|r| is_valid_snapshot_rel(r)),
+        ) {
+            let _ = std::fs::remove_file(bdir.join(rel));
+        }
+        return Ok(());
+    }
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+    let mut root = parse_jsonc_value(&raw).map_err(|e| format!("解析 {} 失败: {e}", path.display()))?;
+    let Some(root_map) = root.as_object_mut() else {
+        return Err(format!("{} 根节点不是 JSON 对象", path.display()));
+    };
+
+    let had_providers = entry
+        .prev_keys
+        .get("had_providers")
+        .and_then(|v| v.as_ref())
+        .and_then(Value::as_bool)
+        .unwrap_or(entry.had_env_object);
+
+    if let Some(providers_map) = root_map.get_mut("providers").and_then(Value::as_object_mut) {
+        for &(provider_key, _) in PI_MANAGED_PROVIDERS {
+            let existed_before = entry
+                .prev_keys
+                .get(&format!("had_{provider_key}"))
+                .and_then(|v| v.as_ref())
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let backup_key = format!("{provider_key}_baseUrl");
+            if let Some(p_map) = providers_map.get_mut(provider_key).and_then(Value::as_object_mut) {
+                match entry.prev_keys.get(&backup_key).and_then(|v| v.as_ref()) {
+                    Some(prev) => {
+                        p_map.insert("baseUrl".to_string(), prev.clone());
+                    }
+                    None => {
+                        p_map.remove("baseUrl");
+                    }
+                }
+                if p_map.is_empty() && !existed_before {
+                    providers_map.remove(provider_key);
+                }
+            }
+        }
+        if providers_map.is_empty() && !had_providers {
+            root_map.remove("providers");
+        }
+    }
+
+    let pretty = serde_json::to_string_pretty(&root).map_err(|e| format!("序列化 {} 失败: {e}", path.display()))?;
+    write_atomic_secure(path, format!("{pretty}\n").as_bytes())
+        .map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
+    if let (Some(bdir), Some(rel)) = (
+        backup_dir,
+        entry.raw_snapshot_rel.as_deref().filter(|r| is_valid_snapshot_rel(r)),
+    ) {
+        let _ = std::fs::remove_file(bdir.join(rel));
     }
     Ok(())
 }
@@ -3316,6 +3634,42 @@ fn scrub_hidego_artifacts_on_corrupt_backup(host: &dyn HostAdapter, config_path:
                 let _ = host.user_env_remove(var);
             }
         }
+        HarnessKind::Pi => {
+            if let Some(models_path) = pi_models_path(host) {
+                if let Ok(raw) = std::fs::read_to_string(&models_path) {
+                    if let Ok(mut root) = parse_jsonc_value(&raw) {
+                        let mut changed = false;
+                        if let Some(providers_map) = root.get_mut("providers").and_then(Value::as_object_mut) {
+                            for &(provider_key, _) in PI_MANAGED_PROVIDERS {
+                                if let Some(p_map) = providers_map.get_mut(provider_key).and_then(Value::as_object_mut)
+                                {
+                                    if p_map.get("baseUrl").and_then(Value::as_str).is_some_and(|u| {
+                                        looks_like_hidego_local_url(u, Some("/pi"))
+                                            || looks_like_hidego_local_url(u, Some("/codex"))
+                                    }) {
+                                        p_map.remove("baseUrl");
+                                        changed = true;
+                                    }
+                                    if p_map.is_empty() {
+                                        providers_map.remove(provider_key);
+                                    }
+                                }
+                            }
+                            if providers_map.is_empty() {
+                                if let Some(root_map) = root.as_object_mut() {
+                                    root_map.remove("providers");
+                                }
+                            }
+                        }
+                        if changed {
+                            if let Ok(pretty) = serde_json::to_string_pretty(&root) {
+                                let _ = write_atomic_secure(&models_path, format!("{pretty}\n").as_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         HarnessKind::Generic => {}
     }
 
@@ -3325,6 +3679,13 @@ fn scrub_hidego_artifacts_on_corrupt_backup(host: &dyn HostAdapter, config_path:
         if path.exists() {
             let mut cfg = HideConfig::load_or_create(path);
             let mut changed = cfg.harness_upstreams.remove(slug).is_some();
+            if kind == HarnessKind::Pi {
+                for &(provider_key, _) in PI_MANAGED_PROVIDERS {
+                    if cfg.harness_upstreams.remove(&format!("pi:{provider_key}")).is_some() {
+                        changed = true;
+                    }
+                }
+            }
             if kind == HarnessKind::Antigravity && cfg.system_proxy_chain {
                 cfg.system_proxy_chain = false;
                 changed = true;
@@ -4285,5 +4646,98 @@ mod tests {
             read_shell_rc_var(tmp.path(), "HTTPS_PROXY").as_deref(),
             Some("http://127.0.0.1:18787")
         );
+    }
+
+    #[test]
+    fn pi_connect_and_disconnect_roundtrip_preserves_custom_models_and_upstream() {
+        let tmp = TempDir::new();
+        let pi_dir = tmp.path().join(".pi").join("agent");
+        std::fs::create_dir_all(&pi_dir).unwrap();
+        let models_path = pi_dir.join("models.json");
+        let original = serde_json::json!({
+            "providers": {
+                "anthropic": {
+                    "baseUrl": "https://relay.example.com"
+                },
+                "ollama": {
+                    "baseUrl": "http://localhost:11434/v1",
+                    "api": "openai-completions"
+                }
+            }
+        });
+        std::fs::write(&models_path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+
+        let host = MockHost::new(tmp.path());
+        let ca = Arc::new(crate::ca::MockCaTrustAdapter::new());
+
+        let before = detect_all_harness_profiles_with(&host, 18787, &HashMap::new());
+        let pi_before = before.iter().find(|p| p.kind == HarnessKind::Pi).unwrap();
+        assert!(pi_before.installed);
+        assert!(!pi_before.configured);
+
+        let res = connect_isolated(&host, ca.clone(), HarnessKind::Pi, 18787);
+        assert!(res.ok && res.connected, "connect failed: {}", res.message);
+
+        let after = detect_all_harness_profiles_with(&host, 18787, &HashMap::new());
+        let pi_after = after.iter().find(|p| p.kind == HarnessKind::Pi).unwrap();
+        assert!(pi_after.configured);
+
+        let updated: Value = serde_json::from_str(&std::fs::read_to_string(&models_path).unwrap()).unwrap();
+        assert_eq!(
+            updated["providers"]["anthropic"]["baseUrl"],
+            "http://127.0.0.1:18787/pi/anthropic"
+        );
+        assert_eq!(
+            updated["providers"]["openai"]["baseUrl"],
+            "http://127.0.0.1:18787/pi/openai/v1"
+        );
+        assert_eq!(
+            updated["providers"]["google"]["baseUrl"],
+            "http://127.0.0.1:18787/pi/google/v1beta"
+        );
+        assert_eq!(
+            updated["providers"]["deepseek"]["baseUrl"],
+            "http://127.0.0.1:18787/pi/deepseek"
+        );
+        assert_eq!(
+            updated["providers"]["openrouter"]["baseUrl"],
+            "http://127.0.0.1:18787/pi/openrouter/v1"
+        );
+        assert_eq!(
+            updated["providers"]["xai"]["baseUrl"],
+            "http://127.0.0.1:18787/pi/xai/v1"
+        );
+        assert_eq!(updated["providers"]["ollama"]["baseUrl"], "http://localhost:11434/v1");
+        assert_eq!(
+            host.user_env_get("HTTPS_PROXY").as_deref(),
+            Some("http://127.0.0.1:18787")
+        );
+        assert_eq!(host.user_env_get("NODE_USE_ENV_PROXY").as_deref(), Some("1"));
+
+        let cfg_path = tmp.path().join("hide-go").join("config.json");
+        let cfg = HideConfig::load_or_create(&cfg_path);
+        assert_eq!(
+            cfg.harness_upstreams.get("pi:anthropic").map(String::as_str),
+            Some("https://relay.example.com")
+        );
+
+        let disc = disconnect_isolated(&host, HarnessKind::Pi);
+        assert!(disc.ok && !disc.connected, "disconnect failed: {}", disc.message);
+
+        let restored: Value = serde_json::from_str(&std::fs::read_to_string(&models_path).unwrap()).unwrap();
+        assert_eq!(
+            restored["providers"]["anthropic"]["baseUrl"],
+            "https://relay.example.com"
+        );
+        assert!(restored["providers"].get("openai").is_none());
+        assert!(restored["providers"].get("google").is_none());
+        assert!(restored["providers"].get("deepseek").is_none());
+        assert!(restored["providers"].get("openrouter").is_none());
+        assert!(restored["providers"].get("xai").is_none());
+        assert_eq!(restored["providers"]["ollama"]["baseUrl"], "http://localhost:11434/v1");
+        assert!(host.user_env_get("HTTPS_PROXY").is_none());
+        assert!(host.user_env_get("NODE_USE_ENV_PROXY").is_none());
+        let cfg_after = HideConfig::load_or_create(&cfg_path);
+        assert!(!cfg_after.harness_upstreams.contains_key("pi:anthropic"));
     }
 }

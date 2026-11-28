@@ -26,7 +26,9 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+use once_cell::sync::Lazy;
 use serde_json::json;
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -79,9 +81,25 @@ const EXACT_AI_MITM_HOSTS: &[&str] = &[
     "api.groq.com",
     "api.mistral.ai",
     "api.together.xyz",
+    "api.together.ai",
     "api.fireworks.ai",
     "api.perplexity.ai",
     "api.zcode.ai",
+    "api.kimi.com",
+    "api.moonshot.cn",
+    "api.moonshot.ai",
+    "api.minimax.io",
+    "api.minimaxi.com",
+    "api.cerebras.ai",
+    "router.huggingface.co",
+    "integrate.api.nvidia.com",
+    "ai-gateway.vercel.sh",
+    "api.individual.githubcopilot.com",
+    "api.githubcopilot.com",
+    "api.xiaomimimo.com",
+    "token-plan.maas.qwencloudapi.com",
+    "token-plan.maas.qianwenaiapi.com",
+    "radius.pi.dev",
 ];
 
 /// Auth/login/OAuth/general hosts that must NEVER be implicitly matched by wildcards.
@@ -125,65 +143,66 @@ fn match_host_pattern(host: &str, pattern: &str) -> bool {
     }
 }
 
-fn is_builtin_ai_wildcard(host: &str) -> bool {
-    // `*-aiplatform.googleapis.com` (single region label before `-aiplatform`)
-    if let Some(region) = host.strip_suffix("-aiplatform.googleapis.com") {
-        if !region.is_empty() && !region.contains('.') {
-            return true;
-        }
-    }
-    // `*-cloudcode-pa.googleapis.com`, `*-cloudcode-pa.sandbox.googleapis.com`,
-    // `*-antigravity-pa.googleapis.com`, `*-antigravity-pa.sandbox.googleapis.com`
-    for suffix in [
-        "-generativelanguage.googleapis.com",
-        "-cloudaicompanion.googleapis.com",
-        "-cloudcode-pa.googleapis.com",
-        "-cloudcode-pa.sandbox.googleapis.com",
-        "-antigravity-pa.googleapis.com",
-        "-antigravity-pa.sandbox.googleapis.com",
-    ] {
-        if let Some(prefix) = host.strip_suffix(suffix) {
-            if !prefix.is_empty() && !prefix.contains('.') {
-                return true;
-            }
-        }
-    }
-    if match_host_pattern(host, "*.cloudcode-pa.googleapis.com") {
-        return true;
-    }
-    // `*.cursorapi.com` / `*.cursor.sh` (auth/login guarded out by NEVER_MITM_EXACT_HOSTS)
-    if match_host_pattern(host, "*.cursorapi.com") || match_host_pattern(host, "*.cursor.sh") {
-        return true;
-    }
-    // `*.qoder.sh` / `*.qoder.com` / `*.qoder.com.cn` (auth/login guarded out by NEVER_MITM_EXACT_HOSTS)
-    if match_host_pattern(host, "*.qoder.sh")
-        || match_host_pattern(host, "*.qoder.com")
-        || match_host_pattern(host, "*.qoder.com.cn")
-    {
-        return true;
-    }
-    // `*.openai.azure.com`
-    if match_host_pattern(host, "*.openai.azure.com") {
-        return true;
-    }
-    // `bedrock-runtime.<region>.amazonaws.com`
-    if let Some(rest) = host.strip_prefix("bedrock-runtime.") {
-        if let Some(region) = rest.strip_suffix(".amazonaws.com") {
-            if !region.is_empty() && !region.contains('.') {
-                return true;
-            }
-        }
-    }
-    false
+/// O(1) hash lookup table for built-in AI API hosts eligible for selective TLS MITM.
+static EXACT_AI_MITM_HOST_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| EXACT_AI_MITM_HOSTS.iter().copied().collect());
+
+/// O(1) hash lookup table for auth/OAuth/general hosts never implicitly matched by wildcards.
+static NEVER_MITM_EXACT_HOST_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| NEVER_MITM_EXACT_HOSTS.iter().copied().collect());
+
+const SINGLE_LABEL_AI_SUFFIXES: &[&str] = &[
+    "-aiplatform.googleapis.com",
+    "-generativelanguage.googleapis.com",
+    "-cloudaicompanion.googleapis.com",
+    "-cloudcode-pa.googleapis.com",
+    "-cloudcode-pa.sandbox.googleapis.com",
+    "-antigravity-pa.googleapis.com",
+    "-antigravity-pa.sandbox.googleapis.com",
+];
+
+const WILDCARD_AI_DOMAINS: &[&str] = &[
+    "*.cloudcode-pa.googleapis.com",
+    "*.cursorapi.com",
+    "*.cursor.sh",
+    "*.qoder.sh",
+    "*.qoder.com",
+    "*.qoder.com.cn",
+    "*.openai.azure.com",
+];
+
+fn is_auth_subdomain(host: &str) -> bool {
+    matches!(
+        host.split('.').next().unwrap_or(""),
+        "auth" | "login" | "oauth" | "oauth2" | "accounts" | "sso"
+    )
 }
 
-/// Returns `true` if `host` matches Hide-Go's built-in AI API MITM host list.
-pub fn is_builtin_ai_mitm_host(host: &str) -> bool {
-    let norm = normalize_host(host);
-    if norm.is_empty() || norm.contains('*') || NEVER_MITM_EXACT_HOSTS.contains(&norm.as_str()) {
+fn is_builtin_ai_wildcard(host: &str) -> bool {
+    if is_auth_subdomain(host) {
         return false;
     }
-    EXACT_AI_MITM_HOSTS.contains(&norm.as_str()) || is_builtin_ai_wildcard(&norm)
+    if SINGLE_LABEL_AI_SUFFIXES.iter().any(|suffix| {
+        host.strip_suffix(suffix)
+            .is_some_and(|prefix| !prefix.is_empty() && !prefix.contains('.'))
+    }) {
+        return true;
+    }
+    if WILDCARD_AI_DOMAINS.iter().any(|pat| match_host_pattern(host, pat)) {
+        return true;
+    }
+    host.strip_prefix("bedrock-runtime.")
+        .and_then(|rest| rest.strip_suffix(".amazonaws.com"))
+        .is_some_and(|region| !region.is_empty() && !region.contains('.'))
+}
+
+/// Returns `true` if `host` matches Hide-Go's built-in AI API MITM host policy (O(1) exact set + structural suffix).
+pub fn is_builtin_ai_mitm_host(host: &str) -> bool {
+    let norm = normalize_host(host);
+    if norm.is_empty() || norm.contains('*') || NEVER_MITM_EXACT_HOST_SET.contains(norm.as_str()) {
+        return false;
+    }
+    EXACT_AI_MITM_HOST_SET.contains(norm.as_str()) || is_builtin_ai_wildcard(&norm)
 }
 
 /// Decide whether a destination hostname should undergo selective TLS MITM.
@@ -199,10 +218,10 @@ pub fn should_mitm_host(host: &str, cfg: &HideConfig) -> bool {
     if cfg.mitm_extra_hosts.iter().any(|p| match_host_pattern(&norm, p)) {
         return true;
     }
-    if NEVER_MITM_EXACT_HOSTS.contains(&norm.as_str()) {
+    if NEVER_MITM_EXACT_HOST_SET.contains(norm.as_str()) {
         return false;
     }
-    EXACT_AI_MITM_HOSTS.contains(&norm.as_str()) || is_builtin_ai_wildcard(&norm)
+    EXACT_AI_MITM_HOST_SET.contains(norm.as_str()) || is_builtin_ai_wildcard(&norm)
 }
 
 fn connect_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
@@ -633,7 +652,7 @@ async fn dial_upstream_tcp(
     }
 }
 
-async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Response {
+async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>, peer_addr: Option<SocketAddr>) -> Response {
     if is_browser_cross_site_proxy_trigger(req.headers()) {
         return connect_error(
             StatusCode::FORBIDDEN,
@@ -665,6 +684,8 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
         );
     };
 
+    let client_attr = state.resolve_peer_attribution(peer_addr);
+
     if !should_mitm_host(&host, &cfg) {
         state.record_connect_host(&host, port, false, false);
         let mut upstream = match dial_upstream_tcp(&host, port, &cfg, state.allow_loopback_for_tests, "connect").await {
@@ -680,13 +701,22 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
         {
             let init_signals = crate::audit::inspect_connect_tunnel_audit(&audit_host, 0);
             if !init_signals.is_empty() {
-                Some(audit_state.record_passthrough_tunnel_audit(&audit_host, port, 0, 0, 0, init_signals))
+                Some(audit_state.record_passthrough_tunnel_audit_with_client(
+                    &audit_host,
+                    port,
+                    0,
+                    0,
+                    0,
+                    init_signals,
+                    client_attr.as_ref(),
+                ))
             } else {
                 None
             }
         } else {
             None
         };
+        let tunnel_attr = client_attr.clone();
         tokio::spawn(async move {
             let _permit = permit;
             match on_upgrade.await {
@@ -711,13 +741,14 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
                                     signals,
                                 );
                             } else if !signals.is_empty() {
-                                audit_state.record_passthrough_tunnel_audit(
+                                audit_state.record_passthrough_tunnel_audit_with_client(
                                     &audit_host,
                                     port,
                                     to_upstream,
                                     to_client,
                                     elapsed,
                                     signals,
+                                    tunnel_attr.as_ref(),
                                 );
                             }
                         }
@@ -795,9 +826,11 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
 
         let host_clone = host.clone();
         let state_clone = state.clone();
+        let mitm_attr = client_attr.clone();
         let service = service_fn(move |inner_req: hyper::Request<hyper::body::Incoming>| {
             let state = state_clone.clone();
             let host = host_clone.clone();
+            let client_attr = mitm_attr.clone();
             async move {
                 if is_websocket_upgrade_request(inner_req.method(), inner_req.headers()) {
                     return Ok::<_, Infallible>(handle_mitm_websocket_upgrade(state, host, port, inner_req).await);
@@ -832,6 +865,7 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
                     parts.uri,
                     parts.headers,
                     body_bytes,
+                    client_attr,
                 )
                 .await;
                 Ok::<_, Infallible>(resp)
@@ -1040,7 +1074,11 @@ async fn handle_mitm_websocket_upgrade(
         .unwrap_or_else(|_| StatusCode::SWITCHING_PROTOCOLS.into_response())
 }
 
-async fn handle_absolute_proxy_request(state: GatewayState, req: Request<Body>) -> Response {
+async fn handle_absolute_proxy_request(
+    state: GatewayState,
+    req: Request<Body>,
+    peer_addr: Option<SocketAddr>,
+) -> Response {
     if is_browser_cross_site_proxy_trigger(req.headers()) {
         return connect_error(
             StatusCode::FORBIDDEN,
@@ -1079,12 +1117,22 @@ async fn handle_absolute_proxy_request(state: GatewayState, req: Request<Body>) 
     }
 
     let mitm_inspect = should_mitm_host(&host, &cfg);
+    let client_attr = state.resolve_peer_attribution(peer_addr);
     let (parts, body) = req.into_parts();
     let body_bytes = match read_limited_body(body).await {
         Ok(bytes) => bytes,
         Err(err_resp) => return *err_resp,
     };
-    handle_forward_http_request(state, parts.method, parts.uri, parts.headers, body_bytes, mitm_inspect).await
+    handle_forward_http_request(
+        state,
+        parts.method,
+        parts.uri,
+        parts.headers,
+        body_bytes,
+        mitm_inspect,
+        client_attr,
+    )
+    .await
 }
 
 /// Per-connection Tower service dispatching `CONNECT`, absolute-form proxy URLs, and normal Axum routes.
@@ -1128,10 +1176,14 @@ impl Service<Request<Body>> for GatewayProxyService {
                 ));
             }
             if *req.method() == Method::CONNECT {
-                return Ok(handle_connect_tunnel(state, req).await);
+                return Ok(handle_connect_tunnel(state, req, peer_addr).await);
             }
             if req.uri().scheme().is_some() {
-                return Ok(handle_absolute_proxy_request(state, req).await);
+                return Ok(handle_absolute_proxy_request(state, req, peer_addr).await);
+            }
+            let mut req = req;
+            if let Some(addr) = peer_addr {
+                req.extensions_mut().insert(crate::proxy::ClientPeerAddr(addr));
             }
             router.oneshot(req).await
         })

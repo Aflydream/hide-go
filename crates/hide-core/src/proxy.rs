@@ -1,5 +1,8 @@
 use crate::all_hide::AllHideEngine;
 use crate::ca::{CaManager, RealCaTrustAdapter};
+use crate::coexistence::{
+    detect_external_redaction_in_request, inspect_coexistence, CoexistenceTracker, ConflictAlert, RuntimeHealthResponse,
+};
 use crate::config::{
     HarnessKind, HideConfig, LeakFinding, PrivacyMode, TrafficAuditRecord, TrafficAuditSummary, TrafficCategory,
     MAX_UPSTREAM_IDLE_TIMEOUT_SECS, MIN_UPSTREAM_IDLE_TIMEOUT_SECS,
@@ -20,6 +23,7 @@ use crate::protobuf::{
     GrpcStreamRestorer, OutboundStreamMetrics, ProtobufFraming,
 };
 use crate::restore::restore_response;
+use crate::runtime_monitor::{terminate_local_process, ClientAttribution, RuntimeMonitor};
 use crate::scanner::{validate_custom_rules, ProjectScanner};
 use crate::sse_restorer::SseRestorer;
 use crate::system_proxy::{is_system_proxy_active_for_port, sync_system_proxy_runtime};
@@ -235,6 +239,10 @@ const MAX_OBSERVED_CONNECT_HOSTS: usize = 64;
 
 type UpstreamProxyCache = Arc<RwLock<Option<(Instant, Option<String>, Option<reqwest::Client>)>>>;
 
+/// Request extension carrying the accepted client loopback socket address.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClientPeerAddr(pub SocketAddr);
+
 /// Shared application state for the Hide-Go gateway
 #[derive(Clone)]
 pub struct GatewayState {
@@ -255,6 +263,8 @@ pub struct GatewayState {
     pub upstream_proxy_cache: UpstreamProxyCache,
     pub update_http_client: reqwest::Client,
     pub update_cache: Arc<RwLock<Option<(Instant, UpdateCheckResult)>>>,
+    pub runtime_monitor: Arc<RuntimeMonitor>,
+    pub coexistence: Arc<CoexistenceTracker>,
     pub admin_token: Arc<String>,
     pub connect_semaphore: Arc<Semaphore>,
     pub allow_loopback_for_tests: bool,
@@ -375,6 +385,8 @@ impl GatewayState {
             upstream_proxy_cache: Arc::new(RwLock::new(None)),
             update_http_client: build_update_client(),
             update_cache: Arc::new(RwLock::new(None)),
+            runtime_monitor: Arc::new(RuntimeMonitor::new()),
+            coexistence: Arc::new(CoexistenceTracker::new()),
             admin_token: Arc::new(admin_token),
             connect_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECT_TUNNELS)),
             allow_loopback_for_tests: false,
@@ -593,6 +605,16 @@ impl GatewayState {
         }));
     }
 
+    /// Resolve the local client process and companion harness for an incoming loopback socket.
+    pub fn resolve_peer_attribution(&self, peer_addr: Option<SocketAddr>) -> Option<ClientAttribution> {
+        if self.allow_loopback_for_tests {
+            return None;
+        }
+        let port = self.config.read().proxy_port;
+        let profiles = self.runtime_monitor.cached_profiles_or_static(port);
+        self.runtime_monitor.attribute_connection(peer_addr, port, &profiles)
+    }
+
     /// Surface a raw TCP passthrough `CONNECT` tunnel when telemetry or bulk upload signals
     /// are detected (so audit-only mode reports background telemetry and upload storage activity).
     /// Returns the created record ID so long-lived tunnels can update byte counts on close.
@@ -605,7 +627,31 @@ impl GatewayState {
         latency_ms: u64,
         audit_signals: Vec<crate::audit::AuditSignal>,
     ) -> String {
-        let harness = detect_harness_for_host(host).unwrap_or(HarnessKind::Generic);
+        self.record_passthrough_tunnel_audit_with_client(
+            host,
+            port,
+            bytes_sent,
+            bytes_received,
+            latency_ms,
+            audit_signals,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_passthrough_tunnel_audit_with_client(
+        &self,
+        host: &str,
+        port: u16,
+        bytes_sent: u64,
+        bytes_received: u64,
+        latency_ms: u64,
+        audit_signals: Vec<crate::audit::AuditSignal>,
+        client_attr: Option<&ClientAttribution>,
+    ) -> String {
+        let harness = detect_harness_for_host(host)
+            .or_else(|| client_attr.and_then(|c| c.harness))
+            .unwrap_or(HarnessKind::Generic);
         let cfg = self.get_config();
         let endpoint = if port == 443 {
             format!("https://{host}")
@@ -666,6 +712,7 @@ impl GatewayState {
         rec.response_bytes = bytes_received.min(usize::MAX as u64) as usize;
         rec.latency_ms = latency_ms.max(1);
         rec.audit_signals = audit_signals;
+        rec.client_process = client_attr.map(ClientAttribution::display_label);
         self.push_record(rec);
         id
     }
@@ -799,7 +846,9 @@ impl GatewayState {
     pub fn get_harness_profiles(&self) -> Vec<HarnessProfile> {
         let port = self.config.read().proxy_port;
         let stats = self.harness_stats.read().clone();
-        detect_all_harness_profiles(port, &stats)
+        let profiles = detect_all_harness_profiles(port, &stats);
+        self.runtime_monitor.update_cached_profiles(profiles.clone());
+        profiles
     }
 
     pub fn get_vault_entries(&self) -> Vec<VaultEntry> {
@@ -908,6 +957,7 @@ impl GatewayState {
             }
             (HarnessKind::Cursor, _) => "/cursor/v1/chat/completions".to_string(),
             (HarnessKind::GrokBuild, _) => "/grok-build/v1/chat/completions".to_string(),
+            (HarnessKind::Pi, _) => "/pi/v1/messages".to_string(),
             (HarnessKind::Generic, _) => "/v1/chat/completions".to_string(),
         };
         let sample = custom_payload
@@ -927,6 +977,7 @@ impl GatewayState {
             HarnessKind::Qoder => "Qoder (api.qoder.com)",
             HarnessKind::Cursor => "Cursor (api2.cursor.sh)",
             HarnessKind::GrokBuild => "xAI (api.x.ai)",
+            HarnessKind::Pi => "Pi (Multi-Provider)",
             HarnessKind::Generic => "Upstream LLM Provider",
         }
     }
@@ -940,6 +991,7 @@ impl GatewayState {
             HarnessKind::Qoder => "https://api.qoder.com",
             HarnessKind::Cursor => "https://api2.cursor.sh",
             HarnessKind::GrokBuild => "https://api.x.ai",
+            HarnessKind::Pi => "https://api.anthropic.com",
             HarnessKind::Generic => "https://api.openai.com",
         }
     }
@@ -1207,6 +1259,7 @@ fn build_record(i: RecordInput) -> TrafficAuditRecord {
         audit_signals,
         restored_count: i.restored_count,
         withheld_count: i.withheld_count,
+        client_process: None,
     }
 }
 
@@ -1249,6 +1302,26 @@ pub struct UpdateCheckResult {
     pub release_notes_en: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_notes_zh: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDownloadResult {
+    pub version: String,
+    pub file_name: String,
+    pub file_path: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub verified: bool,
+    pub launched: bool,
 }
 
 /// Build the full Axum Router serving both:
@@ -1275,6 +1348,9 @@ pub fn build_router(state: GatewayState) -> Router {
         .route("/simulate", post(api_simulate))
         .route("/rules/validate", post(api_validate_rule))
         .route("/updates/check", get(api_check_updates))
+        .route("/updates/download", post(api_download_update))
+        .route("/runtime/health", get(api_runtime_health))
+        .route("/runtime/conflict/resolve", post(api_resolve_conflict))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin_auth));
 
     Router::new()
@@ -1554,7 +1630,18 @@ struct UpdateCheckQuery {
 }
 
 const MAX_RELEASE_NOTES_BYTES: usize = 16 * 1024;
+const MAX_UPDATE_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
+const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 const UPDATE_ZH_CHANGELOG_RAW_BASE: &str = "https://raw.githubusercontent.com/Aflydream/hide-go";
+const UPDATE_ASSET_URL_PREFIX: &str = "https://github.com/aflydream/hide-go/releases/download/";
+
+#[derive(Deserialize, Clone)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    #[serde(default)]
+    size: u64,
+}
 
 #[derive(Deserialize)]
 struct GithubLatestRelease {
@@ -1565,6 +1652,75 @@ struct GithubLatestRelease {
     published_at: Option<String>,
     #[serde(default)]
     body: Option<String>,
+    #[serde(default)]
+    assets: Vec<GithubReleaseAsset>,
+}
+
+fn is_safe_asset_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with('.')
+        && !trimmed.contains(['/', '\\', '\0', ':'])
+        && !trimmed.contains("..")
+}
+
+fn is_allowed_update_asset_url(url: &str, allow_non_github: bool) -> bool {
+    let trimmed = url.trim();
+    if allow_non_github {
+        return reqwest::Url::parse(trimmed).is_ok_and(|u| matches!(u.scheme(), "http" | "https"));
+    }
+    trimmed.to_ascii_lowercase().starts_with(UPDATE_ASSET_URL_PREFIX)
+}
+
+fn select_platform_release_assets(
+    assets: &[GithubReleaseAsset],
+    target_os: &str,
+    target_arch: &str,
+    allow_non_github: bool,
+) -> (Option<String>, Option<String>, Option<u64>, Option<String>) {
+    let preferred_patterns: &[&str] = match (target_os, target_arch) {
+        ("windows", _) => &["hide-go-setup-windows-x64.exe", "hide-go-setup-windows"],
+        ("macos", "aarch64") => &["hide-go-setup-macos-arm64", "macos-arm64"],
+        ("macos", _) => &["hide-go-setup-macos-x64", "macos-x64"],
+        ("linux", "aarch64") => &["hide-go-setup-linux-arm64", "linux-arm64"],
+        ("linux", _) => &["hide-go-setup-linux-x64", "linux-x64"],
+        _ => &[],
+    };
+
+    let mut chosen: Option<&GithubReleaseAsset> = None;
+    for pat in preferred_patterns {
+        if let Some(asset) = assets.iter().find(|a| {
+            let lower = a.name.to_ascii_lowercase();
+            is_safe_asset_name(&a.name)
+                && !lower.ends_with(".sha256")
+                && lower.contains(pat)
+                && (target_os != "windows" || lower.ends_with(".exe"))
+                && is_allowed_update_asset_url(&a.browser_download_url, allow_non_github)
+        }) {
+            chosen = Some(asset);
+            break;
+        }
+    }
+
+    let Some(asset) = chosen else {
+        return (None, None, None, None);
+    };
+
+    let sha_name = format!("{}.sha256", asset.name);
+    let sha_url = assets
+        .iter()
+        .find(|a| {
+            a.name.eq_ignore_ascii_case(&sha_name)
+                && is_allowed_update_asset_url(&a.browser_download_url, allow_non_github)
+        })
+        .map(|a| a.browser_download_url.trim().to_string());
+
+    (
+        Some(asset.browser_download_url.trim().to_string()),
+        Some(asset.name.trim().to_string()),
+        (asset.size > 0).then_some(asset.size),
+        sha_url,
+    )
 }
 
 fn cap_release_notes(raw: &str) -> Option<String> {
@@ -1812,6 +1968,14 @@ async fn fetch_latest_release_with_zh_fallback(
         }
     }
 
+    let allow_non_github_assets = !url.starts_with("https://api.github.com/");
+    let (download_url, asset_name, asset_size, sha256_url) = select_platform_release_assets(
+        &release.assets,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        allow_non_github_assets,
+    );
+
     Ok(UpdateCheckResult {
         current_version: current_version.trim().trim_start_matches(['v', 'V']).to_string(),
         update_available,
@@ -1821,14 +1985,21 @@ async fn fetch_latest_release_with_zh_fallback(
         checked_at: Local::now().to_rfc3339(),
         release_notes_en,
         release_notes_zh,
+        download_url,
+        asset_name,
+        asset_size,
+        sha256_url,
     })
 }
 
-async fn api_check_updates(State(state): State<GatewayState>, Query(query): Query<UpdateCheckQuery>) -> Response {
-    if !query.force {
+async fn resolve_latest_release_checked(
+    state: &GatewayState,
+    force: bool,
+) -> Result<UpdateCheckResult, UpdateFetchError> {
+    if !force {
         if let Some((captured_at, cached)) = state.update_cache.read().clone() {
             if captured_at.elapsed() < UPDATE_CACHE_TTL {
-                return Json(cached).into_response();
+                return Ok(cached);
             }
         }
     }
@@ -1858,12 +2029,337 @@ async fn api_check_updates(State(state): State<GatewayState>, Query(query): Quer
         .await
     };
 
-    match res {
-        Ok(result) => {
-            *state.update_cache.write() = Some((Instant::now(), result.clone()));
-            Json(result).into_response()
-        }
+    if let Ok(result) = &res {
+        *state.update_cache.write() = Some((Instant::now(), result.clone()));
+    }
+    res
+}
+
+async fn api_check_updates(State(state): State<GatewayState>, Query(query): Query<UpdateCheckQuery>) -> Response {
+    match resolve_latest_release_checked(&state, query.force).await {
+        Ok(result) => Json(result).into_response(),
         Err(err) => json_error(StatusCode::BAD_GATEWAY, "update_check_failed", err.message),
+    }
+}
+
+fn default_launch_downloaded_update() -> bool {
+    true
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct UpdateDownloadRequest {
+    force: bool,
+    #[serde(default = "default_launch_downloaded_update")]
+    launch: bool,
+}
+
+fn build_update_download_client(proxy_url: Option<&str>, allow_loopback: bool) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(UPDATE_REQUEST_TIMEOUT)
+        .timeout(UPDATE_DOWNLOAD_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .no_proxy();
+    if let Some(proxy) = proxy_url {
+        let p = reqwest::Proxy::all(proxy).map_err(|e| format!("invalid proxy URL: {e}"))?;
+        builder = builder.proxy(p);
+    } else {
+        builder = builder.dns_resolver(Arc::new(PublicOnlyDnsResolver { allow_loopback }));
+    }
+    builder
+        .build()
+        .map_err(|e| format!("failed to build download client: {e}"))
+}
+
+fn resolve_update_download_dir() -> PathBuf {
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    } else {
+        std::env::var_os("HOME")
+    };
+    if let Some(h) = home.filter(|v| !v.is_empty()) {
+        let downloads = PathBuf::from(h).join("Downloads");
+        if downloads.is_dir() {
+            return downloads;
+        }
+    }
+    std::env::temp_dir().join("hide-go-updates")
+}
+
+fn parse_sha256_sidecar(raw: &str) -> Option<String> {
+    for line in raw.lines() {
+        let token = line.split_whitespace().next().unwrap_or("").trim();
+        if token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Some(token.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+async fn download_update_artifact_to_dir(
+    client: &reqwest::Client,
+    version: &str,
+    asset_name: &str,
+    download_url: &str,
+    sha256_url: Option<&str>,
+    dest_dir: &std::path::Path,
+) -> Result<(PathBuf, u64, String, bool), UpdateFetchError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    if !is_safe_asset_name(asset_name) {
+        return Err(UpdateFetchError {
+            is_transport: false,
+            message: "invalid release asset file name".to_string(),
+        });
+    }
+
+    let expected_sha = if let Some(s_url) = sha256_url {
+        match client
+            .get(s_url)
+            .header(header::USER_AGENT, format!("Hide-Go/{}", env!("CARGO_PKG_VERSION")))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => resp.text().await.ok().and_then(|txt| parse_sha256_sidecar(&txt)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let resp = client
+        .get(download_url)
+        .header(header::USER_AGENT, format!("Hide-Go/{}", env!("CARGO_PKG_VERSION")))
+        .send()
+        .await
+        .map_err(|e| UpdateFetchError {
+            is_transport: true,
+            message: if e.is_timeout() {
+                "download timed out".to_string()
+            } else if e.is_connect() {
+                "download host unreachable".to_string()
+            } else {
+                format!("download failed: {e}")
+            },
+        })?;
+
+    if !resp.status().is_success() {
+        return Err(UpdateFetchError {
+            is_transport: false,
+            message: format!("download server returned HTTP {}", resp.status().as_u16()),
+        });
+    }
+
+    std::fs::create_dir_all(dest_dir).map_err(|e| UpdateFetchError {
+        is_transport: false,
+        message: format!("failed to prepare download folder: {e}"),
+    })?;
+
+    let final_path = dest_dir.join(asset_name);
+    let part_path = dest_dir.join(format!(".{asset_name}.{}.part", Uuid::new_v4().simple()));
+    let mut file = std::fs::File::create(&part_path).map_err(|e| UpdateFetchError {
+        is_transport: false,
+        message: format!("failed to create download file: {e}"),
+    })?;
+
+    let mut hasher = Sha256::new();
+    let mut total_bytes: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = match chunk_res {
+            Ok(c) => c,
+            Err(e) => {
+                drop(file);
+                let _ = std::fs::remove_file(&part_path);
+                return Err(UpdateFetchError {
+                    is_transport: true,
+                    message: format!("download interrupted: {e}"),
+                });
+            }
+        };
+        total_bytes = total_bytes.saturating_add(chunk.len() as u64);
+        if total_bytes > MAX_UPDATE_DOWNLOAD_BYTES {
+            drop(file);
+            let _ = std::fs::remove_file(&part_path);
+            return Err(UpdateFetchError {
+                is_transport: false,
+                message: "release package exceeds size limit".to_string(),
+            });
+        }
+        hasher.update(&chunk);
+        if let Err(e) = file.write_all(&chunk) {
+            drop(file);
+            let _ = std::fs::remove_file(&part_path);
+            return Err(UpdateFetchError {
+                is_transport: false,
+                message: format!("failed to write update file: {e}"),
+            });
+        }
+    }
+    if let Err(e) = file.flush() {
+        drop(file);
+        let _ = std::fs::remove_file(&part_path);
+        return Err(UpdateFetchError {
+            is_transport: false,
+            message: format!("failed to flush update file: {e}"),
+        });
+    }
+    drop(file);
+
+    let actual_sha = hex::encode(hasher.finalize());
+    let verified = if let Some(expected) = expected_sha {
+        if !actual_sha.eq_ignore_ascii_case(&expected) {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(UpdateFetchError {
+                is_transport: false,
+                message: format!("SHA-256 verification failed for v{version} (expected {expected}, got {actual_sha})"),
+            });
+        }
+        true
+    } else {
+        false
+    };
+
+    if final_path.exists() {
+        let _ = std::fs::remove_file(&final_path);
+    }
+    if let Err(e) = std::fs::rename(&part_path, &final_path) {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(UpdateFetchError {
+            is_transport: false,
+            message: format!("failed to finalize update file: {e}"),
+        });
+    }
+
+    Ok((final_path, total_bytes, actual_sha, verified))
+}
+
+fn launch_downloaded_update_artifact(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+        {
+            return std::process::Command::new(path).spawn().is_ok();
+        }
+        std::process::Command::new("explorer.exe")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg("-R").arg(path).spawn().is_ok()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target = path.parent().unwrap_or(path);
+        std::process::Command::new("xdg-open").arg(target).spawn().is_ok()
+    }
+}
+
+async fn api_download_update(State(state): State<GatewayState>, body: Option<Json<UpdateDownloadRequest>>) -> Response {
+    let req = body.map(|Json(v)| v).unwrap_or_else(|| UpdateDownloadRequest {
+        force: false,
+        launch: true,
+    });
+
+    let release = match resolve_latest_release_checked(&state, req.force).await {
+        Ok(r) => r,
+        Err(err) => return json_error(StatusCode::BAD_GATEWAY, "update_check_failed", err.message),
+    };
+
+    let (Some(download_url), Some(asset_name)) = (release.download_url.as_deref(), release.asset_name.as_deref())
+    else {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "no_platform_asset",
+            "no downloadable installer package found for this platform",
+        );
+    };
+
+    let allow_loopback = state.allow_loopback_for_tests;
+    if !is_allowed_update_asset_url(download_url, allow_loopback) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_download_url",
+            "release asset URL is not allowed",
+        );
+    }
+
+    let dest_dir = resolve_update_download_dir();
+    let own_port = state.config.read().proxy_port;
+    let direct_client = match build_update_download_client(None, allow_loopback) {
+        Ok(c) => c,
+        Err(msg) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "download_client_failed", msg),
+    };
+
+    let proxied_client = if allow_loopback {
+        None
+    } else {
+        detect_upstream_proxy_for_host(own_port, Some("github.com"))
+            .and_then(|p| build_update_download_client(Some(&p), false).ok())
+    };
+
+    let downloaded = if let Some(proxied) = proxied_client {
+        match download_update_artifact_to_dir(
+            &proxied,
+            &release.latest_version,
+            asset_name,
+            download_url,
+            release.sha256_url.as_deref(),
+            &dest_dir,
+        )
+        .await
+        {
+            Ok(ok) => Ok(ok),
+            Err(err) if err.is_transport => {
+                download_update_artifact_to_dir(
+                    &direct_client,
+                    &release.latest_version,
+                    asset_name,
+                    download_url,
+                    release.sha256_url.as_deref(),
+                    &dest_dir,
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        }
+    } else {
+        download_update_artifact_to_dir(
+            &direct_client,
+            &release.latest_version,
+            asset_name,
+            download_url,
+            release.sha256_url.as_deref(),
+            &dest_dir,
+        )
+        .await
+    };
+
+    match downloaded {
+        Ok((file_path, bytes, sha256, verified)) => {
+            let launched = if req.launch && !state.allow_loopback_for_tests {
+                launch_downloaded_update_artifact(&file_path)
+            } else {
+                false
+            };
+            Json(UpdateDownloadResult {
+                version: release.latest_version,
+                file_name: asset_name.to_string(),
+                file_path: file_path.to_string_lossy().into_owned(),
+                bytes,
+                sha256,
+                verified,
+                launched,
+            })
+            .into_response()
+        }
+        Err(err) => json_error(StatusCode::BAD_GATEWAY, "update_download_failed", err.message),
     }
 }
 
@@ -1975,6 +2471,11 @@ async fn api_connect_all_harnesses(State(state): State<GatewayState>) -> Respons
     let port = state.config.read().proxy_port;
     match tokio::task::spawn_blocking(move || connect_all_detected(port)).await {
         Ok(results) => {
+            for r in &results {
+                if r.ok && r.connected {
+                    state.runtime_monitor.mark_harness_connected(r.kind);
+                }
+            }
             refresh_harness_upstreams_from_disk(&state);
             Json(results).into_response()
         }
@@ -1993,6 +2494,9 @@ async fn api_connect_harness(State(state): State<GatewayState>, Path(kind): Path
     let port = state.config.read().proxy_port;
     match tokio::task::spawn_blocking(move || connect_harness(parsed, port)).await {
         Ok(res) => {
+            if res.ok && res.connected {
+                state.runtime_monitor.mark_harness_connected(parsed);
+            }
             refresh_harness_upstreams_from_disk(&state);
             Json(res).into_response()
         }
@@ -2000,6 +2504,118 @@ async fn api_connect_harness(State(state): State<GatewayState>, Path(kind): Path
             StatusCode::INTERNAL_SERVER_ERROR,
             "connect_failed",
             "harness connect task panicked",
+        ),
+    }
+}
+
+async fn api_runtime_health(State(state): State<GatewayState>) -> Response {
+    let st = state.clone();
+    match tokio::task::spawn_blocking(move || {
+        let cfg = st.get_config();
+        let profiles = st.get_harness_profiles();
+        let snap = st.runtime_monitor.snapshot();
+        let running_harnesses = st.runtime_monitor.inspect_running_harnesses(&profiles);
+        let (peer_relays, conflicts) = inspect_coexistence(&cfg, &profiles, &snap, &st.coexistence);
+        RuntimeHealthResponse {
+            running_harnesses,
+            peer_relays,
+            conflicts,
+        }
+    })
+    .await
+    {
+        Ok(health) => Json(health).into_response(),
+        Err(_) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime_health_failed",
+            "runtime health inspection panicked",
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConflictResolveRequest {
+    conflict_id: String,
+    action: String, // "stop-peer" | "switch-hidego-audit" | "dismiss"
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConflictResolveResponse {
+    ok: bool,
+    action: String,
+    message: String,
+}
+
+async fn api_resolve_conflict(State(state): State<GatewayState>, Json(req): Json<ConflictResolveRequest>) -> Response {
+    match req.action.as_str() {
+        "dismiss" => {
+            state.coexistence.dismiss(&req.conflict_id);
+            Json(ConflictResolveResponse {
+                ok: true,
+                action: req.action,
+                message: "conflict alert dismissed for this session".to_string(),
+            })
+            .into_response()
+        }
+        "switch-hidego-audit" => {
+            let mut cfg = state.get_config();
+            cfg.mode = PrivacyMode::AuditOnly;
+            match state.try_update_config(cfg) {
+                Ok(_) => {
+                    state.coexistence.clear_live_conflicts();
+                    Json(ConflictResolveResponse {
+                        ok: true,
+                        action: req.action,
+                        message: "switched Hide-Go to Audit-Only mode".to_string(),
+                    })
+                    .into_response()
+                }
+                Err(msg) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "config_save_failed", msg),
+            }
+        }
+        "stop-peer" => {
+            let st = state.clone();
+            let target_id = req.conflict_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                let cfg = st.get_config();
+                let profiles = st.get_harness_profiles();
+                let snap = st.runtime_monitor.snapshot();
+                let (_, conflicts) = inspect_coexistence(&cfg, &profiles, &snap, &st.coexistence);
+                let Some(alert) = conflicts.into_iter().find(|c| c.id == target_id) else {
+                    return Err("conflict is no longer active".to_string());
+                };
+                let Some(pid) = alert.pid.filter(|_| alert.can_stop_peer) else {
+                    return Err("no directly stoppable local PID associated with this conflict".to_string());
+                };
+                terminate_local_process(pid)?;
+                st.coexistence.dismiss(&alert.id);
+                Ok(format!(
+                    "stopped conflicting local proxy {} (PID {pid})",
+                    alert.peer_name
+                ))
+            })
+            .await
+            {
+                Ok(Ok(message)) => Json(ConflictResolveResponse {
+                    ok: true,
+                    action: req.action,
+                    message,
+                })
+                .into_response(),
+                Ok(Err(msg)) => json_error(StatusCode::BAD_REQUEST, "stop_peer_failed", msg),
+                Err(_) => json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "stop_peer_failed",
+                    "conflict resolution task panicked",
+                ),
+            }
+        }
+        _ => json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_action",
+            "unsupported conflict resolution action",
         ),
     }
 }
@@ -2139,7 +2755,7 @@ async fn api_simulate(State(state): State<GatewayState>, Json(req): Json<Simulat
 fn is_known_harness_prefix(prefix: &str) -> bool {
     matches!(
         prefix.to_ascii_lowercase().as_str(),
-        "claude-code" | "codex" | "antigravity" | "zcode" | "qoder" | "cursor" | "grok-build"
+        "claude-code" | "codex" | "antigravity" | "zcode" | "qoder" | "cursor" | "grok-build" | "pi"
     )
 }
 
@@ -2214,6 +2830,8 @@ fn detect_harness_for_host(host: &str) -> Option<HarnessKind> {
         || h.ends_with(".z.ai")
     {
         Some(HarnessKind::Zcode)
+    } else if h == "pi.dev" || h.ends_with(".pi.dev") {
+        Some(HarnessKind::Pi)
     } else {
         None
     }
@@ -2527,6 +3145,7 @@ pub(crate) async fn handle_mitm_http_request(
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
+    client_attr: Option<ClientAttribution>,
 ) -> Response {
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let default_port = if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 };
@@ -2548,7 +3167,12 @@ pub(crate) async fn handle_mitm_http_request(
     let cfg = state.get_config();
     let allow_configured_loopback = is_allowed_loopback_proxy_target(host, port, &cfg);
     let path_only = uri.path();
-    let (harness, category, upstream_vendor) = resolve_proxy_harness_and_scope(path_only, &headers, &body, host);
+    let (mut harness, category, upstream_vendor) = resolve_proxy_harness_and_scope(path_only, &headers, &body, host);
+    if harness == HarnessKind::Generic {
+        if let Some(h) = client_attr.as_ref().and_then(|c| c.harness) {
+            harness = h;
+        }
+    }
     execute_proxy_forward(
         &state,
         ForwardContext {
@@ -2562,6 +3186,7 @@ pub(crate) async fn handle_mitm_http_request(
             allow_configured_loopback,
             allow_operator_private_upstream: false,
             preserve_origin_headers: true,
+            client_process: client_attr.as_ref().map(ClientAttribution::display_label),
             start: Instant::now(),
         },
         method,
@@ -2615,6 +3240,7 @@ pub(crate) async fn handle_forward_http_request(
     headers: HeaderMap,
     body: Bytes,
     mitm_inspect: bool,
+    client_attr: Option<ClientAttribution>,
 ) -> Response {
     let Ok(target_url) = reqwest::Url::parse(&uri.to_string()) else {
         return json_error(
@@ -2659,7 +3285,13 @@ pub(crate) async fn handle_forward_http_request(
             .map(str::to_string);
         let body_text = std::str::from_utf8(&body).ok().map(str::to_string);
         let path_only = target_url.path().to_string();
-        let (harness, category, upstream_vendor) = resolve_proxy_harness_and_scope(&path_only, &headers, &body, &host);
+        let (mut harness, category, upstream_vendor) =
+            resolve_proxy_harness_and_scope(&path_only, &headers, &body, &host);
+        if harness == HarnessKind::Generic {
+            if let Some(h) = client_attr.as_ref().and_then(|c| c.harness) {
+                harness = h;
+            }
+        }
         let endpoint_label = format!("{}://{}{}", target_url.scheme(), host, path_only);
         let repeat_count = state.endpoint_repeat_count(&endpoint_label);
         let verdict = crate::audit::analyze_http_request(
@@ -2728,6 +3360,7 @@ pub(crate) async fn handle_forward_http_request(
                     rec.purpose = verdict.purpose;
                     rec.purpose_confidence = verdict.confidence;
                     rec.purpose_detail = verdict.detail;
+                    rec.client_process = client_attr.as_ref().map(ClientAttribution::display_label);
                     state.push_record(rec);
                 }
                 let resp_headers = upstream_binary_response_headers(resp.headers(), true);
@@ -2757,7 +3390,12 @@ pub(crate) async fn handle_forward_http_request(
 
     let scheme = target_url.scheme().to_string();
     let path_only = target_url.path().to_string();
-    let (harness, category, upstream_vendor) = resolve_proxy_harness_and_scope(&path_only, &headers, &body, &host);
+    let (mut harness, category, upstream_vendor) = resolve_proxy_harness_and_scope(&path_only, &headers, &body, &host);
+    if harness == HarnessKind::Generic {
+        if let Some(h) = client_attr.as_ref().and_then(|c| c.harness) {
+            harness = h;
+        }
+    }
     execute_proxy_forward(
         &state,
         ForwardContext {
@@ -2771,6 +3409,7 @@ pub(crate) async fn handle_forward_http_request(
             allow_configured_loopback: explicit_loopback,
             allow_operator_private_upstream: false,
             preserve_origin_headers: true,
+            client_process: client_attr.as_ref().map(ClientAttribution::display_label),
             start: Instant::now(),
         },
         method,
@@ -2791,26 +3430,50 @@ struct ForwardContext {
     allow_configured_loopback: bool,
     allow_operator_private_upstream: bool,
     preserve_origin_headers: bool,
+    client_process: Option<String>,
     start: Instant,
 }
 
 fn join_upstream_url(upstream_base: &str, upstream_path: &str, query: Option<&str>) -> String {
     let base = upstream_base.trim().trim_end_matches('/');
     let mut path = upstream_path;
-    if base.ends_with("/v1") {
-        if path == "/v1" {
-            path = "";
-        } else if let Some(stripped) = path.strip_prefix("/v1/") {
-            return match query {
-                Some(q) => format!("{base}/{stripped}?{q}"),
-                None => format!("{base}/{stripped}"),
-            };
+    for suffix in ["/v1beta", "/v1"] {
+        if base.ends_with(suffix) {
+            if path == suffix {
+                path = "";
+                break;
+            }
+            if let Some(stripped) = path.strip_prefix(&format!("{suffix}/")) {
+                return match query {
+                    Some(q) => format!("{base}/{stripped}?{q}"),
+                    None => format!("{base}/{stripped}"),
+                };
+            }
         }
     }
     match query {
         Some(q) => format!("{base}{path}?{q}"),
         None => format!("{base}{path}"),
     }
+}
+
+/// Resolve Pi provider-scoped sub-routes (`/pi/<provider>/...`) to `(provider_key, default_upstream, stripped_rest)`.
+fn resolve_pi_provider_subroute(rest: &str) -> Option<(&'static str, &'static str, &str)> {
+    let trimmed = rest.trim_start_matches('/');
+    let (seg, tail) = match trimmed.split_once('/') {
+        Some((s, t)) => (s, t),
+        None => (trimmed, ""),
+    };
+    let (provider, default_up) = match seg.to_ascii_lowercase().as_str() {
+        "anthropic" => ("anthropic", "https://api.anthropic.com"),
+        "openai" => ("openai", "https://api.openai.com"),
+        "google" => ("google", "https://generativelanguage.googleapis.com"),
+        "deepseek" => ("deepseek", "https://api.deepseek.com"),
+        "openrouter" => ("openrouter", "https://openrouter.ai/api"),
+        "xai" => ("xai", "https://api.x.ai"),
+        _ => return None,
+    };
+    Some((provider, default_up, tail))
 }
 
 /// Real reverse-proxy handler for `/:harness/*rest`:
@@ -2824,6 +3487,7 @@ async fn proxy_harness_request(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
+    extensions: axum::http::Extensions,
     body: Bytes,
 ) -> Response {
     if !is_local_request(&headers, &uri) {
@@ -2831,10 +3495,17 @@ async fn proxy_harness_request(
     }
     let start = Instant::now();
     let cfg = state.get_config();
+    let peer_addr = extensions.get::<ClientPeerAddr>().map(|a| a.0);
+    let client_attr = state.resolve_peer_attribution(peer_addr);
     let full_path = format!("/{}/{}", harness_prefix, rest);
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
     let text_preview = std::str::from_utf8(&body).ok().unwrap_or("");
-    let (harness, category) = detect_harness_and_category(&full_path, ua, text_preview);
+    let (mut harness, category) = detect_harness_and_category(&full_path, ua, text_preview);
+    if harness == HarnessKind::Generic {
+        if let Some(h) = client_attr.as_ref().and_then(|c| c.harness) {
+            harness = h;
+        }
+    }
 
     let header_upstream = headers
         .get("x-hide-go-upstream")
@@ -2853,17 +3524,46 @@ async fn proxy_harness_request(
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.trim().trim_end_matches('/').to_string());
-    let config_upstream = cfg
-        .harness_upstreams
-        .get(harness.slug())
-        .map(|s| s.trim().trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty());
+    let pi_subroute = if harness == HarnessKind::Pi && harness_prefix.eq_ignore_ascii_case("pi") {
+        resolve_pi_provider_subroute(&rest)
+    } else {
+        None
+    };
+    let config_upstream = if let Some((provider_key, _, _)) = pi_subroute {
+        cfg.harness_upstreams
+            .get(&format!("pi:{provider_key}"))
+            .or_else(|| {
+                if provider_key == "anthropic" {
+                    cfg.harness_upstreams.get("pi")
+                } else {
+                    None
+                }
+            })
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+    } else if harness == HarnessKind::Pi {
+        cfg.harness_upstreams
+            .get("pi:anthropic")
+            .or_else(|| cfg.harness_upstreams.get("pi"))
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        cfg.harness_upstreams
+            .get(harness.slug())
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+    };
     let from_operator_config = header_upstream.is_none() && (env_upstream.is_some() || config_upstream.is_some());
+    let default_upstream = pi_subroute
+        .map(|(_, up, _)| up)
+        .unwrap_or_else(|| GatewayState::default_upstream_for_harness(harness));
     let upstream_base = header_upstream
         .or(env_upstream)
         .or(config_upstream)
-        .unwrap_or_else(|| GatewayState::default_upstream_for_harness(harness).to_string());
-    let upstream_path = if is_known_harness_prefix(&harness_prefix) {
+        .unwrap_or_else(|| default_upstream.to_string());
+    let upstream_path = if let Some((_, _, sub_tail)) = pi_subroute {
+        format!("/{}", sub_tail.trim_start_matches('/'))
+    } else if is_known_harness_prefix(&harness_prefix) {
         format!("/{}", rest.trim_start_matches('/'))
     } else {
         full_path.clone()
@@ -2933,6 +3633,7 @@ async fn proxy_harness_request(
             allow_configured_loopback: from_operator_config,
             allow_operator_private_upstream: from_operator_config,
             preserve_origin_headers: false,
+            client_process: client_attr.as_ref().map(ClientAttribution::display_label),
             start,
         },
         method,
@@ -2993,6 +3694,7 @@ async fn execute_proxy_forward(
         allow_configured_loopback,
         allow_operator_private_upstream,
         preserve_origin_headers,
+        client_process,
         start,
     } = ctx;
 
@@ -3035,6 +3737,7 @@ async fn execute_proxy_forward(
                 vault_scope,
                 cfg,
                 preserve_origin_headers,
+                client_process,
                 idle_timeout,
                 start,
                 client,
@@ -3117,6 +3820,7 @@ async fn execute_proxy_forward(
                 rec.purpose = bin_verdict.purpose;
                 rec.purpose_confidence = bin_verdict.confidence;
                 rec.purpose_detail = bin_verdict.detail;
+                rec.client_process = client_process.clone();
                 state.push_record(rec);
                 let mut out = Response::new(Body::from_stream(stream_with_idle_timeout(
                     resp.bytes_stream(),
@@ -3156,6 +3860,7 @@ async fn execute_proxy_forward(
                 rec.purpose = bin_verdict.purpose;
                 rec.purpose_confidence = bin_verdict.confidence;
                 rec.purpose_detail = bin_verdict.detail;
+                rec.client_process = client_process.clone();
                 state.push_record(rec);
                 json_error(StatusCode::BAD_GATEWAY, reason, err.to_string())
             }
@@ -3185,6 +3890,7 @@ async fn execute_proxy_forward(
                 rec.purpose = bin_verdict.purpose;
                 rec.purpose_confidence = bin_verdict.confidence;
                 rec.purpose_detail = bin_verdict.detail;
+                rec.client_process = client_process.clone();
                 state.push_record(rec);
                 json_error(
                     StatusCode::BAD_GATEWAY,
@@ -3222,7 +3928,7 @@ async fn execute_proxy_forward(
         // A body we cannot read or decompress is a body we cannot clean: fail closed.
         let msg =
             "请求体经过不受支持的压缩或不是 UTF-8 文本，Hide-Go 无法检查其中的敏感数据，已拒绝转发。可切换到“仅审计”模式直通。";
-        state.push_record(build_record(RecordInput {
+        let mut rec = build_record(RecordInput {
             harness,
             category,
             method: method.to_string(),
@@ -3240,16 +3946,37 @@ async fn execute_proxy_forward(
             restored_count: 0,
             withheld_count: 0,
             upstream_vendor,
-        }));
+        });
+        rec.client_process = client_process.clone();
+        state.push_record(rec);
         return json_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "uninspectable_request_body", msg);
     }
     let inspectable_text = text_body;
     let body_text = inspectable_text.unwrap_or_default().to_string();
 
+    if cfg.mode != PrivacyMode::AuditOnly {
+        if let Some(reason) = detect_external_redaction_in_request(&headers, inspectable_text, |slice| {
+            state.vault.has_any_token_in(slice)
+        }) {
+            let peer_label = client_process
+                .clone()
+                .unwrap_or_else(|| harness.display_name().to_string());
+            state.coexistence.record_live_conflict(ConflictAlert {
+                id: format!("live-payload:{}", harness.slug()),
+                source: "live-payload".to_string(),
+                peer_name: peer_label,
+                pid: None,
+                port: None,
+                detail: format!("{reason} ({endpoint_label})"),
+                can_stop_peer: false,
+            });
+        }
+    }
+
     if should_block_telemetry(category, &telemetry_path, &cfg) {
         let ack = serde_json::json!({"status": "ok", "accepted": true}).to_string();
         let findings = scan_telemetry_findings(&body_text, &cfg);
-        state.push_record(build_record(RecordInput {
+        let mut rec = build_record(RecordInput {
             harness,
             category,
             method: method.to_string(),
@@ -3267,7 +3994,9 @@ async fn execute_proxy_forward(
             restored_count: 0,
             withheld_count: 0,
             upstream_vendor,
-        }));
+        });
+        rec.client_process = client_process.clone();
+        state.push_record(rec);
         return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], ack).into_response();
     }
 
@@ -3358,6 +4087,7 @@ async fn execute_proxy_forward(
             rec.purpose = http_verdict.purpose;
             rec.purpose_confidence = http_verdict.confidence;
             rec.purpose_detail = http_verdict.detail.clone();
+            rec.client_process = client_process.clone();
             rec
         };
 
@@ -3644,6 +4374,7 @@ struct ProtobufForwardInput {
     vault_scope: Option<String>,
     cfg: HideConfig,
     preserve_origin_headers: bool,
+    client_process: Option<String>,
     idle_timeout: Duration,
     start: Instant,
     client: reqwest::Client,
@@ -3687,6 +4418,7 @@ async fn execute_protobuf_forward(state: &GatewayState, input: ProtobufForwardIn
         vault_scope,
         cfg,
         preserve_origin_headers,
+        client_process,
         idle_timeout,
         start,
         client,
@@ -3793,6 +4525,7 @@ async fn execute_protobuf_forward(state: &GatewayState, input: ProtobufForwardIn
             rec.purpose = pb_verdict.purpose;
             rec.purpose_confidence = pb_verdict.confidence;
             rec.purpose_detail = pb_verdict.detail.clone();
+            rec.client_process = client_process.clone();
             rec
         };
 
@@ -5216,6 +5949,7 @@ mod tests {
             HeaderMap::new(),
             Bytes::new(),
             false,
+            None,
         )
         .await;
         assert_eq!(ok_resp.status(), StatusCode::OK);
@@ -5230,6 +5964,7 @@ mod tests {
             "/health".parse().unwrap(),
             HeaderMap::new(),
             Bytes::new(),
+            None,
         )
         .await;
         assert_eq!(mitm_ok.status(), StatusCode::OK);
@@ -5242,6 +5977,7 @@ mod tests {
             HeaderMap::new(),
             Bytes::new(),
             false,
+            None,
         )
         .await;
         assert_eq!(blocked_resp.status(), StatusCode::FORBIDDEN);
@@ -5255,6 +5991,7 @@ mod tests {
             "/api/status".parse().unwrap(),
             HeaderMap::new(),
             Bytes::new(),
+            None,
         )
         .await;
         assert_eq!(blocked_mitm.status(), StatusCode::FORBIDDEN);
@@ -5326,6 +6063,16 @@ mod tests {
             checked_at: "2026-11-21T10:01:00+08:00".to_string(),
             release_notes_en: Some("### Added\n- New feature".to_string()),
             release_notes_zh: Some("### 新增\n- 新功能".to_string()),
+            download_url: Some(
+                "https://github.com/Aflydream/hide-go/releases/download/v0.2.5/Hide-Go-Setup-windows-x64.exe"
+                    .to_string(),
+            ),
+            asset_name: Some("Hide-Go-Setup-windows-x64.exe".to_string()),
+            asset_size: Some(12_345_678),
+            sha256_url: Some(
+                "https://github.com/Aflydream/hide-go/releases/download/v0.2.5/Hide-Go-Setup-windows-x64.exe.sha256"
+                    .to_string(),
+            ),
         };
         *state.update_cache.write() = Some((Instant::now(), cached));
 
@@ -5398,6 +6145,115 @@ mod tests {
         let zh_fallback = res.release_notes_zh.as_deref().unwrap();
         assert!(zh_fallback.contains("修复流式刷新"), "{zh_fallback}");
         assert!(!zh_fallback.contains("旧版本条目"), "{zh_fallback}");
+
+        // Top-only Chinese jump link without a bottom section must be stripped cleanly from English notes.
+        let top_link_only = concat!(
+            "> [中文更新日志](https://github.com/Aflydream/hide-go/blob/v0.3.7/CHANGELOG.zh-CN.md#037---2026-11-28)\n\n",
+            "## [0.3.7] - 2026-11-28\n\n### Added\n- Direct update download\n"
+        );
+        let (en_only, zh_none) = split_release_notes_by_language(top_link_only);
+        assert!(zh_none.is_none());
+        let en_only = en_only.unwrap();
+        assert!(!en_only.contains("CHANGELOG.zh-CN.md"), "{en_only}");
+        assert!(en_only.contains("Direct update download"), "{en_only}");
+    }
+
+    #[tokio::test]
+    async fn direct_update_download_verifies_sha256_and_rejects_tampered_artifact() {
+        use sha2::{Digest, Sha256};
+
+        let payload = b"hide-go-installer-test-binary-payload-v0.3.7".to_vec();
+        let valid_sha = hex::encode(Sha256::digest(&payload));
+        let bad_sha = "0".repeat(64);
+
+        let payload_ok = payload.clone();
+        let valid_sha_body = format!("{valid_sha}  Hide-Go-Setup-windows-x64.exe\n");
+        let bad_sha_body = format!("{bad_sha}  Hide-Go-Setup-windows-x64.exe\n");
+
+        let mock_app = Router::new()
+            .route(
+                "/pkg/Hide-Go-Setup-windows-x64.exe",
+                get(move || {
+                    let data = payload_ok.clone();
+                    async move { data }
+                }),
+            )
+            .route(
+                "/pkg/Hide-Go-Setup-windows-x64.exe.sha256",
+                get(move || {
+                    let s = valid_sha_body.clone();
+                    async move { s }
+                }),
+            )
+            .route(
+                "/pkg/bad.sha256",
+                get(move || {
+                    let s = bad_sha_body.clone();
+                    async move { s }
+                }),
+            );
+        let mock_base = serve(mock_app).await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        // Asset selection picks matching platform + .sha256 sidecar and rejects untrusted URLs.
+        let assets = vec![
+            GithubReleaseAsset {
+                name: "Hide-Go-Setup-windows-x64.exe".to_string(),
+                browser_download_url:
+                    "https://github.com/Aflydream/hide-go/releases/download/v0.3.7/Hide-Go-Setup-windows-x64.exe"
+                        .to_string(),
+                size: 1234,
+            },
+            GithubReleaseAsset {
+                name: "Hide-Go-Setup-windows-x64.exe.sha256".to_string(),
+                browser_download_url:
+                    "https://github.com/Aflydream/hide-go/releases/download/v0.3.7/Hide-Go-Setup-windows-x64.exe.sha256"
+                        .to_string(),
+                size: 96,
+            },
+            GithubReleaseAsset {
+                name: "Hide-Go-Setup-macos-arm64.tar.gz".to_string(),
+                browser_download_url: "https://evil.example.com/Hide-Go-Setup-macos-arm64.tar.gz".to_string(),
+                size: 1234,
+            },
+        ];
+        let (win_url, win_name, win_size, win_sha) =
+            select_platform_release_assets(&assets, "windows", "x86_64", false);
+        assert_eq!(win_name.as_deref(), Some("Hide-Go-Setup-windows-x64.exe"));
+        assert_eq!(win_size, Some(1234));
+        assert!(win_url.unwrap().ends_with("Hide-Go-Setup-windows-x64.exe"));
+        assert!(win_sha.unwrap().ends_with("Hide-Go-Setup-windows-x64.exe.sha256"));
+        let (mac_url, _, _, _) = select_platform_release_assets(&assets, "macos", "aarch64", false);
+        assert!(mac_url.is_none(), "untrusted third-party URL must be rejected");
+
+        let tmp_dir = std::env::temp_dir().join(format!("hide-go-dl-test-{}", Uuid::new_v4().simple()));
+        let (saved_path, bytes, sha, verified) = download_update_artifact_to_dir(
+            &http,
+            "0.3.7",
+            "Hide-Go-Setup-windows-x64.exe",
+            &format!("{mock_base}/pkg/Hide-Go-Setup-windows-x64.exe"),
+            Some(&format!("{mock_base}/pkg/Hide-Go-Setup-windows-x64.exe.sha256")),
+            &tmp_dir,
+        )
+        .await
+        .expect("verified update download should succeed");
+        assert!(verified);
+        assert_eq!(bytes, payload.len() as u64);
+        assert_eq!(sha, valid_sha);
+        assert_eq!(std::fs::read(&saved_path).unwrap(), payload);
+
+        let mismatch = download_update_artifact_to_dir(
+            &http,
+            "0.3.7",
+            "Hide-Go-Setup-windows-x64-bad.exe",
+            &format!("{mock_base}/pkg/Hide-Go-Setup-windows-x64.exe"),
+            Some(&format!("{mock_base}/pkg/bad.sha256")),
+            &tmp_dir,
+        )
+        .await;
+        assert!(mismatch.is_err());
+        assert!(!tmp_dir.join("Hide-Go-Setup-windows-x64-bad.exe").exists());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
@@ -5929,5 +6785,157 @@ mod tests {
         let records = state.get_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].restored_count, 1);
+    }
+
+    #[tokio::test]
+    async fn pi_provider_subroutes_route_independently_without_codex_collision() {
+        let mut cfg = HideConfig::default();
+        cfg.mode = PrivacyMode::AutoDesensitize;
+
+        let anth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let anth_addr = anth_listener.local_addr().unwrap();
+        let anth_app = Router::new().fallback(|uri: Uri, body: Bytes| async move {
+            let p = uri.path().to_string();
+            let text = String::from_utf8_lossy(&body).into_owned();
+            Json(serde_json::json!({ "provider": "anthropic", "path": p, "echo": text }))
+        });
+        tokio::spawn(async move {
+            axum::serve(anth_listener, anth_app).await.unwrap();
+        });
+
+        let oai_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let oai_addr = oai_listener.local_addr().unwrap();
+        let oai_app = Router::new().fallback(|uri: Uri, body: Bytes| async move {
+            let p = uri.path().to_string();
+            let text = String::from_utf8_lossy(&body).into_owned();
+            Json(serde_json::json!({ "provider": "openai", "path": p, "echo": text }))
+        });
+        tokio::spawn(async move {
+            axum::serve(oai_listener, oai_app).await.unwrap();
+        });
+
+        cfg.harness_upstreams
+            .insert("pi:anthropic".to_string(), format!("http://{anth_addr}"));
+        cfg.harness_upstreams
+            .insert("pi:openai".to_string(), format!("http://{oai_addr}/v1"));
+        cfg.harness_upstreams
+            .insert("codex".to_string(), "http://127.0.0.1:1".to_string());
+
+        let state = GatewayState::with_admin_token(cfg, TEST_TOKEN).with_loopback_for_tests(true);
+        let gateway = serve(build_router(state.clone())).await;
+
+        let r_anth = client()
+            .post(format!("{gateway}/pi/anthropic/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"messages":[{"role":"user","content":"key sk-ant-api03-11223344556677889900aabbcc"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_anth.status(), StatusCode::OK);
+        let v_anth: Value = r_anth.json().await.unwrap();
+        assert_eq!(v_anth["provider"], "anthropic");
+        assert_eq!(v_anth["path"], "/v1/messages");
+        assert!(v_anth["echo"]
+            .as_str()
+            .unwrap()
+            .contains("sk-ant-api03-11223344556677889900aabbcc"));
+
+        let r_oai = client()
+            .post(format!("{gateway}/pi/openai/v1/responses"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"gpt-5","input":"check sk-proj-99887766554433221100ffeeddcc"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_oai.status(), StatusCode::OK);
+        let v_oai: Value = r_oai.json().await.unwrap();
+        assert_eq!(v_oai["provider"], "openai");
+        assert_eq!(v_oai["path"], "/v1/responses");
+        assert!(v_oai["echo"]
+            .as_str()
+            .unwrap()
+            .contains("sk-proj-99887766554433221100ffeeddcc"));
+
+        let records = state.get_records();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.harness == HarnessKind::Pi));
+    }
+
+    #[tokio::test]
+    async fn runtime_health_detects_live_external_redaction_and_resolves_conflict() {
+        let mut cfg = HideConfig::default();
+        cfg.mode = PrivacyMode::AutoDesensitize;
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().fallback(|| async {
+            Json(serde_json::json!({ "id": "msg_conflict", "content": [{"type": "text", "text": "ok"}] }))
+        });
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+        cfg.harness_upstreams.insert(
+            HarnessKind::ClaudeCode.slug().to_string(),
+            format!("http://{upstream_addr}"),
+        );
+
+        let state = GatewayState::with_admin_token(cfg, TEST_TOKEN).with_loopback_for_tests(true);
+        let gateway = serve(build_router(state.clone())).await;
+
+        // Request arriving with another local proxy's redaction placeholder triggers a conflict alert.
+        let resp = client()
+            .post(format!("{gateway}/claude-code/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"messages":[{"role":"user","content":"token [[REDACTED_API_KEY_01]]"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let health: crate::coexistence::RuntimeHealthResponse = client()
+            .get(format!("{gateway}/api/runtime/health"))
+            .header("x-hide-go-token", TEST_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            health.conflicts.iter().any(|c| c.id == "live-payload:claude-code"),
+            "expected live external redaction conflict alert, got {:?}",
+            health.conflicts
+        );
+
+        // Switching Hide-Go to AuditOnly clears active masking conflicts cleanly.
+        let res = client()
+            .post(format!("{gateway}/api/runtime/conflict/resolve"))
+            .header("x-hide-go-token", TEST_TOKEN)
+            .json(&serde_json::json!({
+                "conflictId": "live-payload:claude-code",
+                "action": "switch-hidego-audit"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(state.get_config().mode, PrivacyMode::AuditOnly);
+
+        let health_after: crate::coexistence::RuntimeHealthResponse = client()
+            .get(format!("{gateway}/api/runtime/health"))
+            .header("x-hide-go-token", TEST_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            !health_after
+                .conflicts
+                .iter()
+                .any(|c| c.id == "live-payload:claude-code"),
+            "resolved conflict should no longer be reported"
+        );
     }
 }

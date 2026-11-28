@@ -14,6 +14,7 @@ pub enum HarnessKind {
     Qoder,
     Cursor,
     GrokBuild,
+    Pi,
     Generic,
 }
 
@@ -27,6 +28,7 @@ impl HarnessKind {
             HarnessKind::Qoder,
             HarnessKind::Cursor,
             HarnessKind::GrokBuild,
+            HarnessKind::Pi,
         ]
     }
 
@@ -39,6 +41,7 @@ impl HarnessKind {
             HarnessKind::Qoder => "Qoder",
             HarnessKind::Cursor => "Cursor",
             HarnessKind::GrokBuild => "Grok Build",
+            HarnessKind::Pi => "Pi",
             HarnessKind::Generic => "Generic Harness",
         }
     }
@@ -52,6 +55,7 @@ impl HarnessKind {
             HarnessKind::Qoder => "qoder",
             HarnessKind::Cursor => "cursor",
             HarnessKind::GrokBuild => "grok-build",
+            HarnessKind::Pi => "pi",
             HarnessKind::Generic => "generic",
         }
     }
@@ -446,6 +450,9 @@ pub struct TrafficAuditRecord {
     pub restored_count: usize,
     /// Credential placeholders deliberately left unresolved inside tool-call arguments
     pub withheld_count: usize,
+    /// Originating local process (or companion process) attributed via TCP socket ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_process: Option<String>,
 }
 
 /// Payload-free view of an audit record for list rendering.
@@ -480,6 +487,8 @@ pub struct TrafficAuditSummary {
     pub audit_signals: Vec<crate::audit::AuditSignal>,
     pub restored_count: usize,
     pub withheld_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_process: Option<String>,
 }
 
 impl From<&TrafficAuditRecord> for TrafficAuditSummary {
@@ -512,6 +521,7 @@ impl From<&TrafficAuditRecord> for TrafficAuditSummary {
             audit_signals: r.audit_signals.clone(),
             restored_count: r.restored_count,
             withheld_count: r.withheld_count,
+            client_process: r.client_process.clone(),
         }
     }
 }
