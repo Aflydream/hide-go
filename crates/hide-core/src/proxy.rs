@@ -244,6 +244,7 @@ pub struct GatewayState {
     pub ca: Arc<CaManager>,
     pub audit_logs: Arc<RwLock<VecDeque<TrafficAuditRecord>>>,
     pub audit_logs_seq: Arc<AtomicU64>,
+    pub etag_nonce: Arc<String>,
     pub harness_stats: Arc<RwLock<HashMap<HarnessKind, (u64, String)>>>,
     pub observed_connect_hosts: Arc<RwLock<HashMap<String, ObservedConnectHost>>>,
     pub observed_connect_seq: Arc<AtomicU64>,
@@ -363,6 +364,7 @@ impl GatewayState {
             ca: default_ca_manager(),
             audit_logs: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_AUDIT_LOGS))),
             audit_logs_seq: Arc::new(AtomicU64::new(1)),
+            etag_nonce: Arc::new(Uuid::new_v4().simple().to_string()[..8].to_string()),
             harness_stats: Arc::new(RwLock::new(HashMap::new())),
             observed_connect_hosts: Arc::new(RwLock::new(HashMap::new())),
             observed_connect_seq: Arc::new(AtomicU64::new(1)),
@@ -508,6 +510,16 @@ impl GatewayState {
         self.audit_logs_seq.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count recent hits to the same endpoint path for behavioral beacon cadence scoring.
+    fn endpoint_repeat_count(&self, endpoint_label: &str) -> u32 {
+        self.audit_logs
+            .read()
+            .iter()
+            .take(64)
+            .filter(|r| r.endpoint == endpoint_label)
+            .count() as u32
+    }
+
     /// Record a `CONNECT host:port` destination in memory (hostname/port metadata only).
     pub fn record_connect_host(&self, host: &str, port: u16, mitm: bool, tls_failed: bool) {
         let key = format!("{}:{port}", host.trim().to_ascii_lowercase());
@@ -642,7 +654,13 @@ impl GatewayState {
             upstream_vendor: Some(host.to_string()),
         });
         let id = rec.id.clone();
-        rec.purpose = purpose;
+        let host_cls = crate::classifier::RequestClassifier::classify_host_only(host);
+        rec.purpose = if !is_telemetry && purpose == crate::audit::RequestPurpose::OtherApi {
+            crate::audit::RequestPurpose::FileUpload
+        } else {
+            purpose
+        };
+        rec.purpose_confidence = host_cls.confidence.max(0.75);
         rec.purpose_detail = summary;
         rec.request_bytes = bytes_sent.min(usize::MAX as u64) as usize;
         rec.response_bytes = bytes_received.min(usize::MAX as u64) as usize;
@@ -723,6 +741,7 @@ impl GatewayState {
         });
         let id = rec.id.clone();
         rec.purpose = crate::audit::RequestPurpose::RealtimeSync;
+        rec.purpose_confidence = 0.99;
         rec.purpose_detail = format!("WebSocket channel ({host})");
         rec.request_bytes = 0;
         rec.response_bytes = 0;
@@ -758,6 +777,7 @@ impl GatewayState {
         next.upstream_idle_timeout_secs = next
             .upstream_idle_timeout_secs
             .clamp(MIN_UPSTREAM_IDLE_TIMEOUT_SECS, MAX_UPSTREAM_IDLE_TIMEOUT_SECS);
+        next.guard_threshold = next.effective_guard_threshold();
         *self.config.write() = next.clone();
         if let Some(path) = &self.config_path {
             next.save(path)
@@ -1137,10 +1157,16 @@ fn build_record(i: RecordInput) -> TrafficAuditRecord {
                 None
             }
         });
-    let audit_signals = if i.action_taken == "tls-handshake-failed" {
-        Vec::new()
+    let (audit_signals, purpose, purpose_confidence, purpose_detail) = if i.action_taken == "tls-handshake-failed" {
+        (
+            Vec::new(),
+            crate::audit::RequestPurpose::OtherApi,
+            1.0,
+            "TLS handshake rejected".to_string(),
+        )
     } else {
-        crate::audit::inspect_http_audit_signals(
+        let verdict = crate::audit::analyze_http_request(
+            &i.method,
             inferred_host.as_deref(),
             &i.endpoint,
             None,
@@ -1150,23 +1176,9 @@ fn build_record(i: RecordInput) -> TrafficAuditRecord {
             Some(i.local_request),
             i.category,
             finding_total,
-        )
-    };
-    let (purpose, purpose_detail) = if i.action_taken == "tls-handshake-failed" {
-        (
-            crate::audit::RequestPurpose::OtherApi,
-            "TLS handshake rejected".to_string(),
-        )
-    } else {
-        crate::audit::classify_request_purpose(
-            &i.method,
-            inferred_host.as_deref(),
-            &i.endpoint,
-            None,
-            Some(i.local_request),
-            i.category,
-            &audit_signals,
-        )
+            0,
+        );
+        (verdict.signals, verdict.purpose, verdict.confidence, verdict.detail)
     };
     TrafficAuditRecord {
         id: Uuid::new_v4().to_string(),
@@ -1174,6 +1186,7 @@ fn build_record(i: RecordInput) -> TrafficAuditRecord {
         harness: i.harness,
         category: i.category,
         purpose,
+        purpose_confidence,
         purpose_detail,
         method: i.method,
         endpoint: i.endpoint,
@@ -1232,6 +1245,10 @@ pub struct UpdateCheckResult {
     pub release_url: String,
     pub published_at: Option<String>,
     pub checked_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_notes_en: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_notes_zh: Option<String>,
 }
 
 /// Build the full Axum Router serving both:
@@ -1536,6 +1553,9 @@ struct UpdateCheckQuery {
     force: bool,
 }
 
+const MAX_RELEASE_NOTES_BYTES: usize = 16 * 1024;
+const UPDATE_ZH_CHANGELOG_RAW_BASE: &str = "https://raw.githubusercontent.com/Aflydream/hide-go";
+
 #[derive(Deserialize)]
 struct GithubLatestRelease {
     tag_name: String,
@@ -1543,6 +1563,100 @@ struct GithubLatestRelease {
     html_url: String,
     #[serde(default)]
     published_at: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+fn cap_release_notes(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= MAX_RELEASE_NOTES_BYTES {
+        return Some(trimmed.to_string());
+    }
+    let mut end = MAX_RELEASE_NOTES_BYTES;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{}…", trimmed[..end].trim_end()))
+}
+
+fn is_language_banner_line(line: &str) -> bool {
+    let t = line.trim();
+    let lower = t.to_ascii_lowercase();
+    (lower.contains("language") && (t.contains("中文") || lower.contains("english")))
+        || (t.contains("CHANGELOG.zh-CN.md") && (t.starts_with('>') || t.starts_with('*') || t.starts_with('[')))
+        || (t.starts_with('[') && t.contains("English") && t.contains("中文"))
+}
+
+fn is_zh_release_heading(line: &str) -> bool {
+    let t = line.trim();
+    matches!(
+        t,
+        "## 中文更新日志" | "### 中文更新日志" | "## 简体中文" | "## 中文" | "## 更新日志"
+    )
+}
+
+/// Split a bilingual GitHub Release body into `(english_notes, chinese_notes)`, stripping any
+/// top language-switcher link banner so the desktop console displays clean localized notes.
+fn split_release_notes_by_language(body: &str) -> (Option<String>, Option<String>) {
+    let mut en_lines: Vec<&str> = Vec::new();
+    let mut zh_lines: Vec<&str> = Vec::new();
+    let mut in_zh = false;
+
+    for raw_line in body.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if !in_zh && en_lines.is_empty() && (line.trim().is_empty() || is_language_banner_line(line)) {
+            continue;
+        }
+        if !in_zh && is_zh_release_heading(line) {
+            while en_lines.last().is_some_and(|l| {
+                let t = l.trim();
+                t.is_empty() || t == "---" || t == "***"
+            }) {
+                en_lines.pop();
+            }
+            in_zh = true;
+            continue;
+        }
+        if in_zh {
+            if zh_lines.is_empty() && (line.trim().is_empty() || is_language_banner_line(line)) {
+                continue;
+            }
+            zh_lines.push(line);
+        } else {
+            en_lines.push(line);
+        }
+    }
+
+    let en = cap_release_notes(&en_lines.join("\n"));
+    let zh = cap_release_notes(&zh_lines.join("\n"));
+    (en, zh)
+}
+
+/// Extract a single `## [<version>]` section from a Keep-a-Changelog markdown document.
+fn extract_changelog_section(markdown: &str, version: &str) -> Option<String> {
+    let needle = format!("## [{version}]");
+    let mut lines: Vec<&str> = Vec::new();
+    let mut found = false;
+    for raw_line in markdown.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if !found {
+            if line.starts_with(&needle) {
+                found = true;
+                lines.push(line);
+            }
+        } else if line.starts_with("## [") {
+            break;
+        } else {
+            lines.push(line);
+        }
+    }
+    if !found {
+        return None;
+    }
+    cap_release_notes(&lines.join("\n"))
 }
 
 fn parse_semver_parts(raw: &str) -> Option<(u64, u64, u64, bool)> {
@@ -1597,10 +1711,38 @@ struct UpdateFetchError {
     message: String,
 }
 
+async fn fetch_zh_changelog_section(
+    client: &reqwest::Client,
+    zh_changelog_url: &str,
+    version: &str,
+    current_version: &str,
+) -> Option<String> {
+    let resp = client
+        .get(zh_changelog_url)
+        .header(header::USER_AGENT, format!("Hide-Go/{current_version}"))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let text = resp.text().await.ok()?;
+    extract_changelog_section(&text, version)
+}
+
 async fn fetch_latest_release_from(
     client: &reqwest::Client,
     url: &str,
     current_version: &str,
+) -> Result<UpdateCheckResult, UpdateFetchError> {
+    fetch_latest_release_with_zh_fallback(client, url, current_version, None).await
+}
+
+async fn fetch_latest_release_with_zh_fallback(
+    client: &reqwest::Client,
+    url: &str,
+    current_version: &str,
+    zh_changelog_url_override: Option<&str>,
 ) -> Result<UpdateCheckResult, UpdateFetchError> {
     let resp = client
         .get(url)
@@ -1631,7 +1773,8 @@ async fn fetch_latest_release_from(
         message: format!("invalid release metadata: {e}"),
     })?;
 
-    let latest_version = release.tag_name.trim().trim_start_matches(['v', 'V']).to_string();
+    let raw_tag = release.tag_name.trim().to_string();
+    let latest_version = raw_tag.trim_start_matches(['v', 'V']).to_string();
     if parse_semver_parts(&latest_version).is_none() {
         return Err(UpdateFetchError {
             is_transport: false,
@@ -1649,13 +1792,35 @@ async fn fetch_latest_release_from(
         UPDATE_RELEASE_FALLBACK_URL.to_string()
     };
 
+    let (release_notes_en, mut release_notes_zh) = release
+        .body
+        .as_deref()
+        .map(split_release_notes_by_language)
+        .unwrap_or((None, None));
+
+    let update_available = is_newer_version(current_version, &latest_version);
+    if release_notes_zh.is_none() && update_available {
+        let fallback_url = zh_changelog_url_override.map(str::to_owned).or_else(|| {
+            if url.starts_with("https://api.github.com/") {
+                Some(format!("{UPDATE_ZH_CHANGELOG_RAW_BASE}/{raw_tag}/CHANGELOG.zh-CN.md"))
+            } else {
+                None
+            }
+        });
+        if let Some(zh_url) = fallback_url {
+            release_notes_zh = fetch_zh_changelog_section(client, &zh_url, &latest_version, current_version).await;
+        }
+    }
+
     Ok(UpdateCheckResult {
         current_version: current_version.trim().trim_start_matches(['v', 'V']).to_string(),
-        update_available: is_newer_version(current_version, &latest_version),
+        update_available,
         latest_version,
         release_url,
         published_at: release.published_at,
         checked_at: Local::now().to_rfc3339(),
+        release_notes_en,
+        release_notes_zh,
     })
 }
 
@@ -1750,7 +1915,7 @@ fn if_none_match_hit(headers: &HeaderMap, etag: &str) -> bool {
 
 async fn api_get_logs(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
     let seq = state.audit_logs_seq.load(Ordering::Relaxed);
-    let etag = format!("W/\"logs-{seq}\"");
+    let etag = format!("W/\"logs-{}-{seq}\"", state.etag_nonce);
     if if_none_match_hit(&headers, &etag) {
         return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
     }
@@ -1858,7 +2023,7 @@ async fn api_disconnect_harness(State(state): State<GatewayState>, Path(kind): P
 
 async fn api_get_vault(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
     let (gen, tick) = state.vault.revision();
-    let etag = format!("W/\"vault-{gen}-{tick}\"");
+    let etag = format!("W/\"vault-{}-{gen}-{tick}\"", state.etag_nonce);
     if if_none_match_hit(&headers, &etag) {
         return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
     }
@@ -1908,7 +2073,16 @@ async fn api_ca_trust(State(state): State<GatewayState>) -> Response {
 async fn api_ca_untrust(State(state): State<GatewayState>) -> Response {
     let ca = state.ca.clone();
     match tokio::task::spawn_blocking(move || ca.remove_trust()).await {
-        Ok(Ok(status)) => Json(status).into_response(),
+        Ok(Ok(status)) => {
+            let (sys_proxy_enabled, proxy_port) = {
+                let cfg = state.config.read();
+                (cfg.system_proxy_chain, cfg.proxy_port)
+            };
+            if sys_proxy_enabled && state.use_system_upstream_proxy && !state.allow_loopback_for_tests {
+                sync_system_proxy_runtime(true, proxy_port);
+            }
+            Json(status).into_response()
+        }
         Ok(Err(msg)) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "ca_untrust_failed", msg),
         Err(_) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2486,7 +2660,10 @@ pub(crate) async fn handle_forward_http_request(
         let body_text = std::str::from_utf8(&body).ok().map(str::to_string);
         let path_only = target_url.path().to_string();
         let (harness, category, upstream_vendor) = resolve_proxy_harness_and_scope(&path_only, &headers, &body, &host);
-        let audit_signals = crate::audit::inspect_http_audit_signals(
+        let endpoint_label = format!("{}://{}{}", target_url.scheme(), host, path_only);
+        let repeat_count = state.endpoint_repeat_count(&endpoint_label);
+        let verdict = crate::audit::analyze_http_request(
+            method.as_str(),
             Some(&host),
             &path_only,
             req_ct.as_deref(),
@@ -2496,18 +2673,9 @@ pub(crate) async fn handle_forward_http_request(
             body_text.as_deref(),
             category,
             0,
+            repeat_count,
         );
-        let (purpose, purpose_detail) = crate::audit::classify_request_purpose(
-            method.as_str(),
-            Some(&host),
-            &path_only,
-            req_ct.as_deref(),
-            body_text.as_deref(),
-            category,
-            &audit_signals,
-        );
-        let should_log_audit = !audit_signals.is_empty();
-        let endpoint_label = format!("{}://{}{}", target_url.scheme(), host, path_only);
+        let should_log_audit = !verdict.signals.is_empty();
         let idle_timeout = cfg.effective_upstream_idle_timeout();
         let is_loopback = allow_loopback && is_loopback_host_str(&host);
         let (client, fallback) = state.resolve_http_clients(&host, is_loopback, false);
@@ -2526,7 +2694,7 @@ pub(crate) async fn handle_forward_http_request(
             Ok(Ok(resp)) => {
                 let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 if should_log_audit {
-                    let is_tel = crate::audit::has_telemetry_signal(&audit_signals);
+                    let is_tel = crate::audit::has_telemetry_signal(&verdict.signals);
                     let req_preview = body_text.as_deref().unwrap_or("[binary plain-HTTP proxy request]");
                     let mut rec = build_record(RecordInput {
                         harness,
@@ -2556,9 +2724,10 @@ pub(crate) async fn handle_forward_http_request(
                         upstream_vendor,
                     });
                     rec.request_bytes = req_len;
-                    rec.audit_signals = audit_signals;
-                    rec.purpose = purpose;
-                    rec.purpose_detail = purpose_detail;
+                    rec.audit_signals = verdict.signals;
+                    rec.purpose = verdict.purpose;
+                    rec.purpose_confidence = verdict.confidence;
+                    rec.purpose_detail = verdict.detail;
                     state.push_record(rec);
                 }
                 let resp_headers = upstream_binary_response_headers(resp.headers(), true);
@@ -2883,7 +3052,9 @@ async fn execute_proxy_forward(
         let req_len = body.len();
         let req_ce = headers.get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok());
         let bin_host = target_url.host_str().map(str::to_string);
-        let bin_signals = crate::audit::inspect_http_audit_signals(
+        let repeat_count = state.endpoint_repeat_count(&endpoint_label);
+        let bin_verdict = crate::audit::analyze_http_request(
+            method.as_str(),
             bin_host.as_deref(),
             &telemetry_path,
             req_ct,
@@ -2893,15 +3064,7 @@ async fn execute_proxy_forward(
             None,
             category,
             0,
-        );
-        let (bin_purpose, bin_purpose_detail) = crate::audit::classify_request_purpose(
-            method.as_str(),
-            bin_host.as_deref(),
-            &telemetry_path,
-            req_ct,
-            None,
-            category,
-            &bin_signals,
+            repeat_count,
         );
         let req_note = format!(
             "[binary RPC payload ({}, {} bytes) — passed through untouched]",
@@ -2950,9 +3113,10 @@ async fn execute_proxy_forward(
                     upstream_vendor,
                 });
                 rec.request_bytes = req_len;
-                rec.audit_signals = bin_signals;
-                rec.purpose = bin_purpose;
-                rec.purpose_detail = bin_purpose_detail;
+                rec.audit_signals = bin_verdict.signals;
+                rec.purpose = bin_verdict.purpose;
+                rec.purpose_confidence = bin_verdict.confidence;
+                rec.purpose_detail = bin_verdict.detail;
                 state.push_record(rec);
                 let mut out = Response::new(Body::from_stream(stream_with_idle_timeout(
                     resp.bytes_stream(),
@@ -2988,9 +3152,10 @@ async fn execute_proxy_forward(
                     upstream_vendor,
                 });
                 rec.request_bytes = req_len;
-                rec.audit_signals = bin_signals;
-                rec.purpose = bin_purpose;
-                rec.purpose_detail = bin_purpose_detail;
+                rec.audit_signals = bin_verdict.signals;
+                rec.purpose = bin_verdict.purpose;
+                rec.purpose_confidence = bin_verdict.confidence;
+                rec.purpose_detail = bin_verdict.detail;
                 state.push_record(rec);
                 json_error(StatusCode::BAD_GATEWAY, reason, err.to_string())
             }
@@ -3016,9 +3181,10 @@ async fn execute_proxy_forward(
                     upstream_vendor,
                 });
                 rec.request_bytes = req_len;
-                rec.audit_signals = bin_signals;
-                rec.purpose = bin_purpose;
-                rec.purpose_detail = bin_purpose_detail;
+                rec.audit_signals = bin_verdict.signals;
+                rec.purpose = bin_verdict.purpose;
+                rec.purpose_confidence = bin_verdict.confidence;
+                rec.purpose_detail = bin_verdict.detail;
                 state.push_record(rec);
                 json_error(
                     StatusCode::BAD_GATEWAY,
@@ -3152,7 +3318,9 @@ async fn execute_proxy_forward(
         .map(str::to_string);
     let req_host = target_url.host_str().map(str::to_string);
     let finding_total: usize = findings.iter().map(|f| f.count).sum();
-    let http_audit_signals = crate::audit::inspect_http_audit_signals(
+    let repeat_count = state.endpoint_repeat_count(&endpoint_label);
+    let http_verdict = crate::audit::analyze_http_request(
+        method.as_str(),
         req_host.as_deref(),
         &telemetry_path,
         req_content_type.as_deref(),
@@ -3162,15 +3330,7 @@ async fn execute_proxy_forward(
         inspectable_text,
         category,
         finding_total,
-    );
-    let (http_purpose, http_purpose_detail) = crate::audit::classify_request_purpose(
-        method.as_str(),
-        req_host.as_deref(),
-        &telemetry_path,
-        req_content_type.as_deref(),
-        inspectable_text,
-        category,
-        &http_audit_signals,
+        repeat_count,
     );
     let record_base =
         |status: u16, vendor_response: &str, local_response: &str, restored: usize, withheld: usize, action: String| {
@@ -3194,9 +3354,10 @@ async fn execute_proxy_forward(
                 upstream_vendor: upstream_vendor.clone(),
             });
             rec.request_bytes = raw_request_len;
-            rec.audit_signals = http_audit_signals.clone();
-            rec.purpose = http_purpose;
-            rec.purpose_detail = http_purpose_detail.clone();
+            rec.audit_signals = http_verdict.signals.clone();
+            rec.purpose = http_verdict.purpose;
+            rec.purpose_confidence = http_verdict.confidence;
+            rec.purpose_detail = http_verdict.detail.clone();
             rec
         };
 
@@ -3591,7 +3752,9 @@ async fn execute_protobuf_forward(state: &GatewayState, input: ProtobufForwardIn
     let findings = transformed.findings;
     let pb_host = target_url.host_str().map(str::to_string);
     let pb_finding_total: usize = findings.iter().map(|f| f.count).sum();
-    let pb_audit_signals = crate::audit::inspect_http_audit_signals(
+    let pb_repeat = state.endpoint_repeat_count(&endpoint_label);
+    let pb_verdict = crate::audit::analyze_http_request(
+        method.as_str(),
         pb_host.as_deref(),
         &endpoint_label,
         Some(&req_ct_str),
@@ -3601,15 +3764,7 @@ async fn execute_protobuf_forward(state: &GatewayState, input: ProtobufForwardIn
         Some(&local_req_preview),
         category,
         pb_finding_total,
-    );
-    let (pb_purpose, pb_purpose_detail) = crate::audit::classify_request_purpose(
-        method.as_str(),
-        pb_host.as_deref(),
-        &endpoint_label,
-        Some(&req_ct_str),
-        Some(&local_req_preview),
-        category,
-        &pb_audit_signals,
+        pb_repeat,
     );
 
     let make_record =
@@ -3634,9 +3789,10 @@ async fn execute_protobuf_forward(state: &GatewayState, input: ProtobufForwardIn
                 upstream_vendor: upstream_vendor.clone(),
             });
             rec.request_bytes = raw_req_len;
-            rec.audit_signals = pb_audit_signals.clone();
-            rec.purpose = pb_purpose;
-            rec.purpose_detail = pb_purpose_detail.clone();
+            rec.audit_signals = pb_verdict.signals.clone();
+            rec.purpose = pb_verdict.purpose;
+            rec.purpose_confidence = pb_verdict.confidence;
+            rec.purpose_detail = pb_verdict.detail.clone();
             rec
         };
 
@@ -4052,7 +4208,8 @@ impl GrpcProxyStreamState {
             let host = reqwest::Url::parse(&record.endpoint)
                 .ok()
                 .and_then(|u| u.host_str().map(str::to_string));
-            let mut signals = crate::audit::inspect_http_audit_signals(
+            let mut verdict = crate::audit::analyze_http_request(
+                &record.method,
                 host.as_deref(),
                 &record.endpoint,
                 Some(req_ct),
@@ -4062,30 +4219,24 @@ impl GrpcProxyStreamState {
                 Some(&record.local_request_payload),
                 record.category,
                 finding_total,
+                0,
             );
             if m.request_bytes >= 1024 * 1024
-                && !signals
+                && !verdict
+                    .signals
                     .iter()
                     .any(|s| s.kind == crate::audit::AuditSignalKind::LargeOutboundPayload)
             {
-                signals.push(crate::audit::AuditSignal {
+                verdict.signals.push(crate::audit::AuditSignal {
                     kind: crate::audit::AuditSignalKind::LargeOutboundPayload,
                     severity: crate::audit::AuditSeverity::Warn,
                     detail: format!("Large streaming RPC payload ({} bytes)", m.request_bytes),
                 });
             }
-            let (purpose, purpose_detail) = crate::audit::classify_request_purpose(
-                &record.method,
-                host.as_deref(),
-                &record.endpoint,
-                Some(req_ct),
-                Some(&record.local_request_payload),
-                record.category,
-                &signals,
-            );
-            record.purpose = purpose;
-            record.purpose_detail = purpose_detail;
-            record.audit_signals = signals;
+            record.purpose = verdict.purpose;
+            record.purpose_confidence = verdict.confidence;
+            record.purpose_detail = verdict.detail;
+            record.audit_signals = verdict.signals;
         }
         let fallback_note = format!("[{}, {} bytes]", self.resp_ct, record.response_bytes);
         let vendor_prev = self.restorer.vendor_preview();
@@ -5173,6 +5324,8 @@ mod tests {
             release_url: UPDATE_RELEASE_FALLBACK_URL.to_string(),
             published_at: Some("2026-11-21T10:00:00Z".to_string()),
             checked_at: "2026-11-21T10:01:00+08:00".to_string(),
+            release_notes_en: Some("### Added\n- New feature".to_string()),
+            release_notes_zh: Some("### 新增\n- 新功能".to_string()),
         };
         *state.update_cache.write() = Some((Instant::now(), cached));
 
@@ -5193,6 +5346,58 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["latestVersion"], "0.2.5");
         assert_eq!(json["updateAvailable"], true);
+        assert_eq!(json["releaseNotesEn"], "### Added\n- New feature");
+        assert_eq!(json["releaseNotesZh"], "### 新增\n- 新功能");
+    }
+
+    #[tokio::test]
+    async fn release_notes_split_bilingual_body_and_fallback_to_zh_changelog() {
+        let bilingual = concat!(
+            "> **Language / 语言**: **English** | [简体中文](#中文更新日志) · [CHANGELOG.zh-CN.md](https://github.com/Aflydream/hide-go/blob/v0.3.6/CHANGELOG.zh-CN.md)\n\n",
+            "## [0.3.6] - 2026-11-22\n\n### Added\n- Statistical classifier\n\n---\n\n## 中文更新日志\n\n## [0.3.6] - 2026-11-22\n\n### 新增\n- 内置统计分类器\n"
+        );
+        let (en, zh) = split_release_notes_by_language(bilingual);
+        let en = en.expect("en notes");
+        let zh = zh.expect("zh notes");
+        assert!(!en.contains("Language / 语言"), "{en}");
+        assert!(en.contains("Statistical classifier"), "{en}");
+        assert!(!en.contains("内置统计分类器"), "{en}");
+        assert!(zh.contains("内置统计分类器"), "{zh}");
+
+        // Mock server: English-only release body + separate CHANGELOG.zh-CN.md fallback
+        let mock_app = Router::new()
+            .route(
+                "/latest",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "tag_name": "v0.3.6",
+                        "html_url": "https://github.com/Aflydream/hide-go/releases/tag/v0.3.6",
+                        "published_at": "2026-11-22T12:00:00Z",
+                        "body": "## [0.3.6] - 2026-11-22\n\n### Fixed\n- Fix streaming flush"
+                    }))
+                }),
+            )
+            .route(
+                "/CHANGELOG.zh-CN.md",
+                get(|| async {
+                    "# 更新日志\n\n## [0.3.6] - 2026-11-22\n\n### 修复\n- 修复流式刷新\n\n## [0.3.5] - 2026-11-22\n\n### 新增\n- 旧版本条目\n"
+                }),
+            );
+        let mock_base = serve(mock_app).await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let res = fetch_latest_release_with_zh_fallback(
+            &http,
+            &format!("{mock_base}/latest"),
+            "0.3.5",
+            Some(&format!("{mock_base}/CHANGELOG.zh-CN.md")),
+        )
+        .await
+        .unwrap();
+        assert!(res.update_available);
+        assert!(res.release_notes_en.as_deref().unwrap().contains("Fix streaming flush"));
+        let zh_fallback = res.release_notes_zh.as_deref().unwrap();
+        assert!(zh_fallback.contains("修复流式刷新"), "{zh_fallback}");
+        assert!(!zh_fallback.contains("旧版本条目"), "{zh_fallback}");
     }
 
     #[test]
@@ -5648,6 +5853,22 @@ mod tests {
             .unwrap();
         assert_eq!(v3.status(), StatusCode::OK);
         assert_ne!(v3.headers().get(header::ETAG).unwrap().to_str().unwrap(), vault_etag);
+
+        // A freshly restarted gateway instance must not match the old process's ETag.
+        let fresh_state = GatewayState::with_admin_token(HideConfig::default(), TEST_TOKEN);
+        let fresh_gw = serve(build_router(fresh_state)).await;
+        let fresh_r = client()
+            .get(format!("{fresh_gw}/api/logs"))
+            .header("x-hide-go-token", TEST_TOKEN)
+            .header(header::IF_NONE_MATCH, &logs_etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(fresh_r.status(), StatusCode::OK);
+        assert_ne!(
+            fresh_r.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+            logs_etag
+        );
     }
 
     #[tokio::test]

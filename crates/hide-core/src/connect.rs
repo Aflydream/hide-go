@@ -695,7 +695,11 @@ async fn handle_connect_tunnel(state: GatewayState, req: Request<Body>) -> Respo
                     match tokio::io::copy_bidirectional(&mut client_io, &mut upstream).await {
                         Ok((to_upstream, to_client)) => {
                             let elapsed = started_at.elapsed().as_millis() as u64;
-                            let signals = crate::audit::inspect_connect_tunnel_audit(&audit_host, to_upstream);
+                            let signals = crate::audit::inspect_connect_tunnel_audit_with_recv(
+                                &audit_host,
+                                to_upstream,
+                                to_client,
+                            );
                             if let Some(id) = active_record_id.as_deref() {
                                 audit_state.update_passthrough_tunnel_audit(
                                     id,

@@ -3,9 +3,11 @@
 pub mod all_hide;
 pub mod audit;
 pub mod ca;
+pub mod classifier;
 pub mod config;
 pub mod connect;
 pub mod desensitizer;
+pub mod guard_model;
 pub mod harness;
 pub mod harness_detect;
 pub mod ndjson_restorer;

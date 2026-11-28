@@ -185,6 +185,15 @@ fn percent_encode_rfc3986(raw: &str) -> String {
     out
 }
 
+#[inline]
+fn overlaps_sorted_range(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
+    if ranges.is_empty() {
+        return false;
+    }
+    let idx = ranges.partition_point(|&(a, _)| a < end);
+    idx > 0 && ranges[idx - 1].1 > start
+}
+
 fn pct_matches_slice(haystack: &[u8], pattern: &[u8]) -> bool {
     if haystack.len() < pattern.len() {
         return false;
@@ -353,6 +362,10 @@ impl Matcher {
         self.pairs.is_empty()
     }
 
+    pub fn has_remaskable_secrets(&self) -> bool {
+        self.has_remaskable_secrets
+    }
+
     pub fn pairs(&self) -> &[Pair] {
         &self.pairs
     }
@@ -515,9 +528,7 @@ impl Matcher {
                         && p.original.len() >= 6
                         && !matches!(p.original.as_str(), "true" | "false" | "null")
                         && rem.starts_with(p.original.as_str())
-                        && !existing_ranges
-                            .iter()
-                            .any(|&(a, b)| pos < b && a < pos + p.original.len())
+                        && !overlaps_sorted_range(existing_ranges, pos, pos + p.original.len())
                         && is_valid_token_boundary_with_left(text, pos, &p.original, None)
                 }) {
                     let buf = out.get_or_insert_with(|| String::with_capacity(text.len()));
@@ -559,9 +570,7 @@ impl Matcher {
             let hit = self.pct_secrets.iter().find(|&(_pair_idx, pct)| {
                 let pct_bytes = pct.as_bytes();
                 if pct_bytes[0] != cur_b
-                    || existing_ranges
-                        .iter()
-                        .any(|&(a, b)| pos < b && a < pos + pct_bytes.len())
+                    || overlaps_sorted_range(existing_ranges, pos, pos + pct_bytes.len())
                     || !pct_matches_slice(&bytes[pos..], pct_bytes)
                 {
                     return false;

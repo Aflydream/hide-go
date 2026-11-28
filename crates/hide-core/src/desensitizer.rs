@@ -55,6 +55,15 @@ impl<'a> DesensitizeCtx<'a> {
     }
 }
 
+#[inline]
+fn overlaps_sorted(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
+    if ranges.is_empty() {
+        return false;
+    }
+    let idx = ranges.partition_point(|&(a, _)| a < end);
+    idx > 0 && ranges[idx - 1].1 > start
+}
+
 /// Format-preserving bidirectional semantic desensitizer.
 ///
 /// JSON payloads are walked structurally (protocol identifiers, signed reasoning and binary
@@ -243,15 +252,21 @@ impl SemanticDesensitizer {
                 .collect(),
             None => scan_spans_with_scanner(text, dctx.config, dctx.scanner),
         };
-        let existing = dctx.current_matcher().token_ranges(text);
+        let matcher = dctx.current_matcher();
+        let has_remask = matcher.has_remaskable_secrets();
+        if spans.is_empty() && !has_remask {
+            return text.to_string();
+        }
+        let existing = matcher.token_ranges(text);
+        drop(matcher);
         let (after_regex, did_replace_spans) = if spans.is_empty() {
             (text.to_string(), false)
         } else {
-            spans.retain(|s| !existing.iter().any(|&(a, b)| s.start < b && a < s.end));
+            spans.retain(|s| !overlaps_sorted(&existing, s.start, s.end));
             for span in &mut spans {
                 Self::extend_to_token_boundary(text, span, dctx.config);
             }
-            spans.retain(|s| !existing.iter().any(|&(a, b)| s.start < b && a < s.end));
+            spans.retain(|s| !overlaps_sorted(&existing, s.start, s.end));
 
             let mut out = String::with_capacity(text.len());
             let mut last = 0;
@@ -272,6 +287,12 @@ impl SemanticDesensitizer {
         };
 
         let matcher = dctx.current_matcher();
+        if !matcher.has_remaskable_secrets() {
+            if did_replace_spans {
+                dctx.mutated = true;
+            }
+            return after_regex;
+        }
         let remask_existing = if did_replace_spans {
             matcher.token_ranges(&after_regex)
         } else {
@@ -462,12 +483,7 @@ impl SemanticDesensitizer {
                     format!("/opt/work/{dir_tag}")
                 }
             }
-            FindingKind::EmailOrPii => {
-                let first = FIRST_NAMES[(digest[0] as usize) % FIRST_NAMES.len()];
-                let domain = MAIL_DOMAINS[(digest[1] as usize) % MAIL_DOMAINS.len()];
-                let tag6 = encode_from_digest(digest, 6, LOWER_ALNUM, b"em");
-                format!("{first}.{tag6}@{domain}.example")
-            }
+            FindingKind::EmailOrPii => format_email_or_pii_token(raw_val, digest),
             FindingKind::GitMetadata => format!("ref_{}", encode_from_digest(digest, 10, LOWER_ALNUM, b"gm")),
             FindingKind::EnvSecret => format!("sec_{}", encode_from_digest(digest, 18, BASE62, b"es")),
             FindingKind::CustomKeyword => {
@@ -541,6 +557,108 @@ fn register_windows_path_restore_aliases(
         }
     }
     inserted
+}
+
+fn format_email_or_pii_token(raw_val: &str, digest: &[u8; 32]) -> String {
+    if raw_val.contains('@') {
+        let first = FIRST_NAMES[(digest[0] as usize) % FIRST_NAMES.len()];
+        let domain = MAIL_DOMAINS[(digest[1] as usize) % MAIL_DOMAINS.len()];
+        let tag6 = encode_from_digest(digest, 6, LOWER_ALNUM, b"em");
+        return format!("{first}.{tag6}@{domain}.example");
+    }
+    if crate::guard_model::is_valid_cn_resident_id(raw_val) {
+        // Synthetic non-existent province `99` + valid ISO 7064 Mod 11-2 check digit
+        let d3 = encode_from_digest(digest, 3, DIGITS, b"id");
+        let prefix = format!("99010119900101{d3}");
+        let arr: [u8; 17] = prefix.as_bytes().try_into().expect("17-byte id prefix");
+        let check = crate::guard_model::cn_id_check_char(&arr);
+        return format!("{prefix}{check}");
+    }
+    if crate::guard_model::is_valid_luhn_payment_card(raw_val) {
+        // Synthetic reserved test BIN (`400000` / `620000`) with exact Luhn check digit,
+        // preserving the original separator grouping (` ` or `-`).
+        let total_digits = raw_val.bytes().filter(u8::is_ascii_digit).count();
+        let bin: &[u8] = if raw_val.trim_start().starts_with('6') {
+            &[6, 2, 0, 0, 0, 0]
+        } else {
+            &[4, 0, 0, 0, 0, 0]
+        };
+        let mut digits = Vec::with_capacity(total_digits);
+        digits.extend_from_slice(bin);
+        let fill = total_digits.saturating_sub(bin.len() + 1);
+        let fill_str = encode_from_digest(digest, fill, DIGITS, b"cc");
+        digits.extend(fill_str.bytes().map(|b| b - b'0'));
+        digits.push(crate::guard_model::luhn_check_digit(&digits));
+        let mut out = String::with_capacity(raw_val.len());
+        let mut di = 0usize;
+        for ch in raw_val.chars() {
+            if ch.is_ascii_digit() {
+                if let Some(&d) = digits.get(di) {
+                    out.push((b'0' + d) as char);
+                    di += 1;
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        return out;
+    }
+    let digit_count = raw_val.bytes().filter(u8::is_ascii_digit).count();
+    let only_phone_chars = raw_val
+        .bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b' ' | b'(' | b')'));
+    if digit_count >= 10 && only_phone_chars {
+        let tail6 = encode_from_digest(digest, 6, DIGITS, b"ph");
+        if raw_val.starts_with("+86") {
+            let sep = if raw_val.contains('-') { '-' } else { ' ' };
+            return format!("+86{sep}199{sep}00{}{sep}{}", &tail6[..2], &tail6[2..]);
+        }
+        if raw_val.starts_with('+') {
+            return format!("+1-555-01{}-{}", &tail6[..2], &tail6[2..6]);
+        }
+        if raw_val.contains('-') {
+            return format!("199-00{}-{}", &tail6[..2], &tail6[2..]);
+        }
+        if raw_val.contains(' ') {
+            return format!("199 00{} {}", &tail6[..2], &tail6[2..]);
+        }
+        return format!("19900{tail6}");
+    }
+    if !raw_val.is_ascii() {
+        let char_count = raw_val.chars().count();
+        if char_count <= 4 && raw_val.chars().all(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+            const CJK_SURNAMES: &[&str] = &["林", "沈", "苏", "顾", "周", "陆", "许", "程", "宋", "唐", "梁", "谢"];
+            const CJK_GIVEN_A: &[&str] = &["清", "知", "明", "言", "景", "安", "思", "予", "文", "柏", "青", "云"];
+            const CJK_GIVEN_B: &[&str] = &["远", "行", "轩", "川", "宁", "然", "禾", "舟", "林", "溪", "松", "岚"];
+            let s = CJK_SURNAMES[(digest[0] as usize) % CJK_SURNAMES.len()];
+            let a = CJK_GIVEN_A[(digest[1] as usize) % CJK_GIVEN_A.len()];
+            let b = CJK_GIVEN_B[(digest[2] as usize) % CJK_GIVEN_B.len()];
+            return format!("{s}{a}{b}");
+        }
+        // Physical CJK address
+        const CITIES: &[&str] = &["松柏市", "青溪市", "云杉市", "林岚市", "清河市", "南枫市"];
+        const DISTRICTS: &[&str] = &["翠微区", "竹影区", "禾风区", "杏林区", "槐安区", "柳岸区"];
+        const ROADS: &[&str] = &["林荫路", "清风路", "云杉大道", "松涛街", "溪畔路", "晨光街"];
+        let city = CITIES[(digest[0] as usize) % CITIES.len()];
+        let dist = DISTRICTS[(digest[1] as usize) % DISTRICTS.len()];
+        let road = ROADS[(digest[2] as usize) % ROADS.len()];
+        let num = 10 + (digest[3] as usize % 89);
+        return format!("{city}{dist}{road}{num}号");
+    }
+    if raw_val.contains(' ') {
+        if raw_val.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            const STREETS: &[&str] = &["Maple", "Cedar", "Birch", "Willow", "Alder", "Spruce"];
+            let num = 100 + ((digest[0] as usize * 7 + digest[1] as usize) % 880);
+            let st = STREETS[(digest[2] as usize) % STREETS.len()];
+            return format!("{num} {st} Ave");
+        }
+        const LAST_NAMES: &[&str] = &["Reed", "Hayes", "Brooks", "Cole", "Lane", "Shaw", "West", "Grant"];
+        let first = FIRST_NAMES[(digest[0] as usize) % FIRST_NAMES.len()];
+        let cap_first = format!("{}{}", first[..1].to_ascii_uppercase(), &first[1..]);
+        let last = LAST_NAMES[(digest[1] as usize) % LAST_NAMES.len()];
+        return format!("{cap_first} {last}");
+    }
+    format!("acct_{}", encode_from_digest(digest, 8, LOWER_ALNUM, b"ac"))
 }
 
 fn format_api_key_token(raw_val: &str, digest: &[u8; 32]) -> String {

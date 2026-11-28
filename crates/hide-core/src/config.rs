@@ -183,6 +183,10 @@ pub const MIN_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 30;
 pub const MAX_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 3600;
 pub const DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 900;
 
+pub const MIN_GUARD_THRESHOLD: f32 = 0.50;
+pub const MAX_GUARD_THRESHOLD: f32 = 0.95;
+pub const DEFAULT_GUARD_THRESHOLD: f32 = 0.80;
+
 fn default_allowed_connect_ports() -> Vec<u16> {
     vec![443, 8443]
 }
@@ -193,6 +197,18 @@ fn default_upstream_idle_timeout_secs() -> u64 {
 
 fn default_auto_check_updates() -> bool {
     true
+}
+
+fn default_protect_personal_info() -> bool {
+    true
+}
+
+fn default_guard_model_enabled() -> bool {
+    true
+}
+
+fn default_guard_threshold() -> f32 {
+    DEFAULT_GUARD_THRESHOLD
 }
 
 /// Interface language preference persisted in `config.json`.
@@ -228,6 +244,12 @@ pub struct HideConfig {
     pub protect_project_paths: bool,
     pub protect_secrets_and_keys: bool,
     pub protect_internal_network: bool,
+    #[serde(default = "default_protect_personal_info")]
+    pub protect_personal_info: bool,
+    #[serde(default = "default_guard_model_enabled")]
+    pub guard_model_enabled: bool,
+    #[serde(default = "default_guard_threshold")]
+    pub guard_threshold: f32,
     pub project_salt: String,
     pub tool_call_secret_policy: ToolCallSecretPolicy,
     pub custom_rules: Vec<CustomRule>,
@@ -263,6 +285,9 @@ impl Default for HideConfig {
             protect_project_paths: true,
             protect_secrets_and_keys: true,
             protect_internal_network: true,
+            protect_personal_info: default_protect_personal_info(),
+            guard_model_enabled: default_guard_model_enabled(),
+            guard_threshold: default_guard_threshold(),
             // Per-install random salt: a public constant would let the vendor precompute the
             // camouflage mapping for common identifiers.
             project_salt: format!("hg-{}", Uuid::new_v4().simple()),
@@ -361,6 +386,15 @@ impl HideConfig {
                 .clamp(MIN_UPSTREAM_IDLE_TIMEOUT_SECS, MAX_UPSTREAM_IDLE_TIMEOUT_SECS),
         )
     }
+
+    /// Calibrated guard-model confidence threshold clamped to `[0.50, 0.95]`.
+    pub fn effective_guard_threshold(&self) -> f32 {
+        if self.guard_threshold.is_finite() {
+            self.guard_threshold.clamp(MIN_GUARD_THRESHOLD, MAX_GUARD_THRESHOLD)
+        } else {
+            DEFAULT_GUARD_THRESHOLD
+        }
+    }
 }
 
 /// Recorded audit log entry for a single intercepted Harness request/response cycle.
@@ -375,6 +409,9 @@ pub struct TrafficAuditRecord {
     /// Exact functional purpose classification for this request.
     #[serde(default)]
     pub purpose: crate::audit::RequestPurpose,
+    /// Calibrated classifier confidence (`0.0..=1.0`).
+    #[serde(default)]
+    pub purpose_confidence: f32,
     /// Concise detail describing why this request received its purpose classification.
     #[serde(default)]
     pub purpose_detail: String,
@@ -422,6 +459,9 @@ pub struct TrafficAuditSummary {
     /// Exact functional purpose classification for this request.
     #[serde(default)]
     pub purpose: crate::audit::RequestPurpose,
+    /// Calibrated classifier confidence (`0.0..=1.0`).
+    #[serde(default)]
+    pub purpose_confidence: f32,
     /// Concise detail describing why this request received its purpose classification.
     #[serde(default)]
     pub purpose_detail: String,
@@ -456,6 +496,7 @@ impl From<&TrafficAuditRecord> for TrafficAuditSummary {
             harness: r.harness,
             category: r.category,
             purpose: r.purpose,
+            purpose_confidence: r.purpose_confidence,
             purpose_detail: r.purpose_detail.clone(),
             method: r.method.clone(),
             endpoint: r.endpoint.clone(),

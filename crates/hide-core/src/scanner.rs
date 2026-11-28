@@ -980,7 +980,8 @@ fn rule_enabled(kind: FindingKind, config: &HideConfig) -> bool {
             config.protect_secrets_and_keys
         }
         FindingKind::InternalIp | FindingKind::InternalDomain => config.protect_internal_network,
-        FindingKind::ProjectPath | FindingKind::EmailOrPii => config.protect_project_paths,
+        FindingKind::ProjectPath => config.protect_project_paths,
+        FindingKind::EmailOrPii => config.protect_personal_info,
         _ => true,
     }
 }
@@ -1054,7 +1055,18 @@ pub fn scan_spans(text: &str, config: &HideConfig) -> Vec<Span> {
 pub fn scan_spans_with_scanner(text: &str, config: &HideConfig, scanner: &CompiledScanner) -> Vec<Span> {
     let custom_hits = scanner.custom_set.as_ref().map(|set| set.matches(text));
     let builtin_hits = BUILTIN_PREFILTER_SET.matches(text);
-    if !builtin_hits.matched_any() && !custom_hits.as_ref().is_some_and(|m| m.matched_any()) {
+    let run_entropy = config.protect_secrets_and_keys
+        && text.len() >= 32
+        && (text.contains('=') || text.contains(':'))
+        && has_token_run_28(text.as_bytes());
+    let run_guard = config.guard_model_enabled
+        && text.len() >= 6
+        && (config.protect_secrets_and_keys || config.protect_personal_info);
+    if !builtin_hits.matched_any()
+        && !custom_hits.as_ref().is_some_and(|m| m.matched_any())
+        && !run_entropy
+        && !run_guard
+    {
         return Vec::new();
     }
 
@@ -1128,7 +1140,166 @@ pub fn scan_spans_with_scanner(text: &str, config: &HideConfig, scanner: &Compil
             });
         }
     }
+    if run_entropy {
+        scan_high_entropy_assignments(text, &mut spans);
+    }
+    if config.guard_model_enabled {
+        return crate::guard_model::SpanGuardModel::fuse_and_filter(text, spans, config);
+    }
     spans
+}
+
+#[inline]
+fn has_token_run_28(bytes: &[u8]) -> bool {
+    let mut run = 0usize;
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-') {
+            run += 1;
+            if run >= 28 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+static ENTROPY_ASSIGN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?m)["']?([A-Za-z][A-Za-z0-9_.-]{2,48})["']?\s*[=:]\s*["']?([A-Za-z0-9+/=_-]{28,128})["']?"#)
+        .expect("valid entropy assignment regex")
+});
+
+fn is_excluded_entropy_key(key: &str) -> bool {
+    let norm = normalize_key_snake(key);
+    if norm.is_empty() || is_non_secret_normalized_key(&norm) {
+        return true;
+    }
+    matches!(
+        norm.as_str(),
+        "id" | "hash"
+            | "sha"
+            | "sha256"
+            | "sha512"
+            | "md5"
+            | "digest"
+            | "etag"
+            | "nonce"
+            | "signature"
+            | "thought_signature"
+            | "encrypted_content"
+            | "data"
+            | "content"
+            | "text"
+            | "body"
+            | "path"
+            | "file"
+            | "url"
+            | "uri"
+            | "href"
+            | "src"
+            | "model"
+            | "version"
+            | "commit"
+            | "revision"
+            | "cursor"
+            | "trace_id"
+            | "request_id"
+            | "response_id"
+            | "session_id"
+            | "tool_use_id"
+            | "tool_call_id"
+            | "call_id"
+            | "item_id"
+            | "system_fingerprint"
+            | "project_salt"
+    ) || norm.ends_with("_id")
+        || norm.ends_with("_hash")
+        || norm.ends_with("_sha")
+        || norm.ends_with("_sha256")
+        || norm.ends_with("_signature")
+        || norm.ends_with("_digest")
+        || norm.ends_with("_path")
+        || norm.ends_with("_url")
+        || norm.ends_with("_cursor")
+}
+
+fn looks_like_high_entropy_credential(raw: &str) -> bool {
+    if raw.len() < 28 || raw.len() > 128 || is_placeholder_token(raw) || is_placeholder_or_template_secret(raw) {
+        return false;
+    }
+    let mut has_lower = false;
+    let mut has_upper = false;
+    let mut digit_count = 0usize;
+    let mut distinct = [false; 128];
+    let mut distinct_count = 0usize;
+    for &b in raw.as_bytes() {
+        if b >= 128 {
+            return false;
+        }
+        if !distinct[b as usize] {
+            distinct[b as usize] = true;
+            distinct_count += 1;
+        }
+        if b.is_ascii_lowercase() {
+            has_lower = true;
+        } else if b.is_ascii_uppercase() {
+            has_upper = true;
+        } else if b.is_ascii_digit() {
+            digit_count += 1;
+        }
+    }
+    if !(has_lower && has_upper && digit_count >= 3 && distinct_count >= 16) {
+        return false;
+    }
+    // Reject camelCase/snake_case code identifiers or long English paths with few digits.
+    let lower_count = raw.bytes().filter(u8::is_ascii_lowercase).count();
+    if lower_count * 100 / raw.len() > 78 && digit_count < 4 {
+        return false;
+    }
+    crate::classifier::shannon_entropy_bits(raw.as_bytes()) >= 4.2
+}
+
+fn scan_high_entropy_assignments(text: &str, spans: &mut Vec<Span>) {
+    // Merge existing intervals into sorted disjoint ranges so overlap checks run in O(log K).
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    if !spans.is_empty() {
+        let mut raw: Vec<(usize, usize)> = spans.iter().map(|s| (s.start, s.end)).collect();
+        raw.sort_unstable();
+        for (s, e) in raw {
+            if let Some(last) = merged.last_mut() {
+                if s <= last.1 {
+                    last.1 = last.1.max(e);
+                    continue;
+                }
+            }
+            merged.push((s, e));
+        }
+    }
+    let mut added = Vec::new();
+    for caps in ENTROPY_ASSIGN_RE.captures_iter(text) {
+        let Some(k) = caps.get(1) else { continue };
+        let Some(v) = caps.get(2) else { continue };
+        if is_excluded_entropy_key(k.as_str()) {
+            continue;
+        }
+        let vs = v.start();
+        let ve = v.end();
+        let idx = merged.partition_point(|&(a, _)| a < ve);
+        if idx > 0 && merged[idx - 1].1 > vs {
+            continue;
+        }
+        if looks_like_high_entropy_credential(v.as_str()) {
+            added.push(Span {
+                start: vs,
+                end: ve,
+                kind: FindingKind::EnvSecret,
+                label: "High-Entropy Credential".to_string(),
+                severity: "high".to_string(),
+            });
+        }
+    }
+    spans.extend(added);
 }
 
 /// Pick non-overlapping spans: earliest start first, longer span on ties, custom rules on equal extent.
@@ -1418,5 +1589,23 @@ mod tests {
         let fwd = scan_matches("edit D:/Projects/secret-app/src/lib.rs", &cfg);
         assert_eq!(fwd.len(), 1);
         assert_eq!(fwd[0].2, "D:/Projects");
+    }
+
+    #[test]
+    fn high_entropy_unknown_prefix_credentials_detected_without_false_positives() {
+        let cfg = HideConfig::default();
+        let secret = scan_matches("SETTLEMENT_HMAC = \"k9P2mX7vQ4nR8wL3tY6bF1zJ5cH0dS9a\"", &cfg);
+        assert_eq!(secret.len(), 1);
+        assert_eq!(secret[0].0, FindingKind::EnvSecret);
+        assert_eq!(secret[0].2, "k9P2mX7vQ4nR8wL3tY6bF1zJ5cH0dS9a");
+
+        for safe in [
+            "commit_sha = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"",
+            "thoughtSignature = \"k9P2mX7vQ4nR8wL3tY6bF1zJ5cH0dS9a\"",
+            "component_name = \"DefaultUserConfigurationSettingsManager\"",
+        ] {
+            let found = scan_matches(safe, &cfg);
+            assert!(found.is_empty(), "false positive on `{safe}`: {found:?}");
+        }
     }
 }
