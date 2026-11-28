@@ -318,6 +318,8 @@ impl NdjsonRestorer {
 fn synthesize_tail_frame(envelope: &Value, field: TextField, tail: &str) -> Option<String> {
     let mut obj = envelope.as_object().cloned().unwrap_or_default();
     obj.insert("done".to_string(), Value::Bool(false));
+    obj.remove("tool_calls");
+    obj.remove("done_reason");
     match field {
         TextField::MessageContent => {
             let msg = obj
@@ -325,6 +327,7 @@ fn synthesize_tail_frame(envelope: &Value, field: TextField, tail: &str) -> Opti
                 .or_insert_with(|| json!({"role": "assistant"}))
                 .as_object_mut()?;
             msg.remove("thinking");
+            msg.remove("tool_calls");
             msg.insert("content".to_string(), Value::String(tail.to_string()));
         }
         TextField::MessageThinking => {
@@ -333,6 +336,7 @@ fn synthesize_tail_frame(envelope: &Value, field: TextField, tail: &str) -> Opti
                 .or_insert_with(|| json!({"role": "assistant"}))
                 .as_object_mut()?;
             msg.remove("content");
+            msg.remove("tool_calls");
             msg.insert("thinking".to_string(), Value::String(tail.to_string()));
         }
         TextField::TopResponse => {
@@ -416,5 +420,37 @@ mod tests {
         }
         assert_eq!(assembled, "prefix sk-sem");
         assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn synthesize_tail_frame_does_not_duplicate_tool_calls() {
+        let vault = PrivacyVault::new();
+        vault.insert_explicit("secret-val", "sk-sem-placeholder-key-001", "ApiKey");
+
+        let mut restorer = NdjsonRestorer::with_policy_scoped(vault, None, ToolCallSecretPolicy::Always);
+        let c1 = restorer
+            .push_bytes(
+                br#"{"model":"qwen","message":{"role":"assistant","content":"hi sk-sem","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"a.rs"}}}]},"done":false}
+"#,
+            )
+            .unwrap();
+        let (tail, _) = restorer.finish().unwrap();
+        let full = format!("{c1}{tail}");
+        let lines: Vec<Value> = full.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0]["message"].get("tool_calls").is_some());
+        assert!(
+            lines[1]["message"].get("tool_calls").is_none(),
+            "synthesized tail frame must not duplicate tool_calls: {}",
+            lines[1]
+        );
+        assert_eq!(
+            format!(
+                "{}{}",
+                lines[0]["message"]["content"].as_str().unwrap_or(""),
+                lines[1]["message"]["content"].as_str().unwrap_or("")
+            ),
+            "hi sk-sem"
+        );
     }
 }
