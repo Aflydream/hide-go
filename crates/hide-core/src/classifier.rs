@@ -1,19 +1,20 @@
-//! Lightweight on-device statistical request classifier.
+//! Embedded neural + statistical request classifier for outbound traffic auditing.
 //!
 //! Extracts continuous structural, lexical, header, entropy, and behavioral features from
-//! each outbound HTTP, MITM, Protobuf, WebSocket, or `CONNECT` request and scores all 14
-//! `RequestPurpose` classes with a multi-class linear model + temperature-scaled Softmax.
-//! Runs in sub-millisecond time with zero external dependencies and generalizes to unseen
-//! hosts and custom API endpoints without relying on brittle domain lists.
+//! each outbound HTTP, MITM, Protobuf, WebSocket, or `CONNECT` request and runs the
+//! pre-trained multi-task `AuditModel` MLP to score all 14 `RequestPurpose` classes plus
+//! calibrated telemetry, bulk-upload, and overall audit risk probabilities.
 
 use crate::audit::RequestPurpose;
+use crate::audit_model::{AuditModel, AuditModelInput};
 use crate::connect::is_builtin_ai_mitm_host;
 use axum::http::HeaderMap;
+use once_cell::sync::Lazy;
+use regex::RegexSet;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 const NUM_CLASSES: usize = 14;
-const SOFTMAX_TEMPERATURE: f64 = 1.15;
 const MAX_JSON_INSPECT_BYTES: usize = 64 * 1024;
 const MAX_AST_PARSE_BYTES: usize = 128 * 1024;
 const MAX_ENTROPY_SAMPLE_BYTES: usize = 16 * 1024;
@@ -105,7 +106,7 @@ pub struct ExtractedFeatures {
     pub catalog_schema: f32,
 }
 
-/// Output of `RequestClassifier::classify` with calibrated Softmax probabilities.
+/// Output of `RequestClassifier::classify` with calibrated Softmax and audit risk probabilities.
 #[derive(Debug, Clone)]
 pub struct ClassificationResult {
     pub purpose: RequestPurpose,
@@ -113,166 +114,149 @@ pub struct ClassificationResult {
     pub telemetry_prob: f32,
     pub bulk_upload_prob: f32,
     pub inference_prob: f32,
+    pub audit_risk_score: f32,
     pub detail: String,
     pub features: ExtractedFeatures,
 }
 
-/// Lightweight multi-class statistical classifier for outbound harness traffic.
+/// Multi-class neural + statistical classifier for outbound harness traffic.
 pub struct RequestClassifier;
 
 impl RequestClassifier {
     /// Classify a full HTTP / MITM / Protobuf / WebSocket / `CONNECT` request.
     pub fn classify(input: &ClassificationInput<'_>) -> ClassificationResult {
-        let features = extract_features(input);
-        let mut logits = [0.0f64; NUM_CLASSES];
-        // Slight prior toward OtherApi when zero informative features fire.
-        logits[class_idx(RequestPurpose::OtherApi)] = 0.65;
+        Self::classify_with_findings(input, 0)
+    }
 
+    /// Classify a request together with the count of sensitive findings detected in its payload.
+    pub fn classify_with_findings(input: &ClassificationInput<'_>, findings_count: usize) -> ClassificationResult {
+        let features = extract_features(input);
+        let mut morph_scores = [0.0f64; NUM_CLASSES];
         let mut reasons: Vec<(usize, f64, &'static str)> = Vec::with_capacity(16);
-        let mut add = |p: RequestPurpose, weight: f64, tag: &'static str| {
-            let idx = class_idx(p);
-            logits[idx] += weight;
+
+        // Collect explainable structural reason tags (used for human-readable detail strings).
+        let mut note = |p: RequestPurpose, weight: f64, tag: &'static str| {
             if weight > 0.35 && !tag.is_empty() {
-                reasons.push((idx, weight, tag));
+                reasons.push((class_idx(p), weight, tag));
             }
         };
-
-        // 1. Structural JSON AST signals (highest authority: generalizes across any host/URL)
         if features.conversation_schema > 0.0 {
-            let w = 4.6 * features.conversation_schema as f64;
-            add(RequestPurpose::ChatInference, w, "conversation schema");
+            note(
+                RequestPurpose::ChatInference,
+                4.6 * features.conversation_schema as f64,
+                "conversation schema",
+            );
             if features.tool_result_schema > 0.0 {
-                let tw = w + 3.4 * features.tool_result_schema as f64;
-                add(RequestPurpose::ToolResultSync, tw, "tool result payload");
+                note(
+                    RequestPurpose::ToolResultSync,
+                    6.0 * features.tool_result_schema as f64,
+                    "tool result payload",
+                );
             }
-            // Strong negative coupling: a real chat conversation is not telemetry.
-            add(
-                RequestPurpose::Telemetry,
-                -3.2 * features.conversation_schema as f64,
-                "",
-            );
-            add(
-                RequestPurpose::CrashReport,
-                -2.4 * features.conversation_schema as f64,
-                "",
-            );
-            add(
-                RequestPurpose::FeatureFlags,
-                -2.4 * features.conversation_schema as f64,
-                "",
-            );
         }
         if features.llm_params_schema > 0.0 {
-            let w = 2.4 * features.llm_params_schema as f64;
-            add(RequestPurpose::ChatInference, w, "model inference parameters");
-            if features.tool_result_schema > 0.0 {
-                add(RequestPurpose::ToolResultSync, w * 0.9, "");
-            }
-            if features.fim_schema > 0.0 {
-                add(RequestPurpose::InlineCompletion, w * 0.9, "");
-            }
+            note(
+                RequestPurpose::ChatInference,
+                2.4 * features.llm_params_schema as f64,
+                "model inference parameters",
+            );
         }
         if features.fim_schema > 0.0 {
-            add(
+            note(
                 RequestPurpose::InlineCompletion,
                 4.8 * features.fim_schema as f64,
                 "FIM/cursor completion schema",
             );
         }
         if features.otel_schema > 0.0 {
-            add(
+            note(
                 RequestPurpose::Telemetry,
                 6.8 * features.otel_schema as f64,
                 "OpenTelemetry envelope",
             );
         }
         if features.event_batch_schema > 0.0 {
-            add(
+            note(
                 RequestPurpose::Telemetry,
                 3.9 * features.event_batch_schema as f64,
                 "structured event batch",
             );
         }
         if features.device_fingerprint_score > 0.0 {
-            let w = 2.8 * features.device_fingerprint_score as f64;
-            add(RequestPurpose::Telemetry, w, "device/env fingerprint fields");
-            add(RequestPurpose::FeatureFlags, w * 0.45, "");
-            add(RequestPurpose::CrashReport, w * 0.45, "");
+            note(
+                RequestPurpose::Telemetry,
+                2.8 * features.device_fingerprint_score as f64,
+                "device/env fingerprint fields",
+            );
         }
         if features.feature_flag_schema > 0.0 {
-            add(
+            note(
                 RequestPurpose::FeatureFlags,
                 4.6 * features.feature_flag_schema as f64,
                 "feature-flag/experiment payload",
             );
         }
         if features.crash_schema > 0.0 {
-            add(
+            note(
                 RequestPurpose::CrashReport,
                 5.0 * features.crash_schema as f64,
                 "crash/stacktrace payload",
             );
         }
         if features.codebase_batch_schema > 0.0 {
-            add(
+            note(
                 RequestPurpose::CodebaseIndexing,
                 4.8 * features.codebase_batch_schema as f64,
                 "multi-file/chunk index batch",
             );
         }
         if features.auth_schema > 0.0 {
-            add(
+            note(
                 RequestPurpose::AuthAccount,
                 4.4 * features.auth_schema as f64,
                 "OAuth/session payload",
             );
         }
         if features.catalog_schema > 0.0 && features.conversation_schema == 0.0 {
-            add(
+            note(
                 RequestPurpose::ModelCatalog,
                 3.2 * features.catalog_schema as f64,
                 "quota/catalog payload",
             );
         }
-
-        // 2. Payload byte statistics, entropy & archive signatures
         if features.archive_magic.is_some() || features.archive_content_type.is_some() {
-            add(RequestPurpose::FileUpload, 5.2, "compressed archive payload");
-            add(RequestPurpose::CodebaseIndexing, 1.8, "");
+            note(RequestPurpose::FileUpload, 5.2, "compressed archive payload");
         }
         if features.is_multipart {
-            let w = if features.multipart_file_count >= 2 { 4.8 } else { 3.6 };
-            add(RequestPurpose::FileUpload, w, "multipart file upload");
+            note(
+                RequestPurpose::FileUpload,
+                if features.multipart_file_count >= 2 { 4.8 } else { 3.6 },
+                "multipart file upload",
+            );
         }
         if features.is_octet_stream && features.payload_bytes >= 16 * 1024 {
-            add(RequestPurpose::FileUpload, 3.4, "binary octet-stream upload");
+            note(RequestPurpose::FileUpload, 3.4, "binary octet-stream upload");
             if features.shannon_entropy >= 7.2 {
-                add(RequestPurpose::FileUpload, 1.4, "high-entropy binary stream");
+                note(RequestPurpose::FileUpload, 1.4, "high-entropy binary stream");
             }
         }
         if features.distinct_local_paths >= 5 && features.conversation_schema == 0.0 {
-            add(RequestPurpose::CodebaseIndexing, 3.8, "multi-file workspace path batch");
+            note(RequestPurpose::CodebaseIndexing, 3.8, "multi-file workspace path batch");
         }
         if features.upload_asymmetry >= 0.7
             && features.payload_bytes >= 256 * 1024
             && features.conversation_schema == 0.0
         {
-            add(RequestPurpose::FileUpload, 2.2, "asymmetric bulk upload");
-            add(RequestPurpose::CodebaseIndexing, 1.8, "");
+            note(RequestPurpose::FileUpload, 3.6, "asymmetric bulk upload");
         }
-
-        // 3. Transport, method & header morphology features
         if features.is_websocket {
-            add(RequestPurpose::RealtimeSync, 6.2, "WebSocket transport");
+            note(RequestPurpose::RealtimeSync, 6.2, "WebSocket transport");
         }
         if features.is_webchannel_query {
-            add(RequestPurpose::RealtimeSync, 4.6, "WebChannel transport params");
+            note(RequestPurpose::RealtimeSync, 4.6, "WebChannel transport params");
         }
         if features.is_sse_expected && features.conversation_schema > 0.0 {
-            add(RequestPurpose::ChatInference, 1.4, "streaming inference");
-            if features.tool_result_schema > 0.0 {
-                add(RequestPurpose::ToolResultSync, 1.4, "");
-            }
+            note(RequestPurpose::ChatInference, 1.4, "streaming inference");
         }
         if !features.telemetry_headers.is_empty() && features.conversation_schema == 0.0 {
             let has_sentry = features.telemetry_headers.iter().any(|h| h.contains("sentry"));
@@ -281,82 +265,75 @@ impl RequestClassifier {
                 .iter()
                 .any(|h| h.contains("statsig") || h.contains("launchdarkly"));
             if has_sentry {
-                add(RequestPurpose::CrashReport, 4.4, "crash SDK header");
+                morph_scores[class_idx(RequestPurpose::CrashReport)] += 4.4;
+                note(RequestPurpose::CrashReport, 4.4, "crash SDK header");
             } else if has_statsig {
-                add(RequestPurpose::FeatureFlags, 4.2, "feature-flag SDK header");
+                morph_scores[class_idx(RequestPurpose::FeatureFlags)] += 4.2;
+                note(RequestPurpose::FeatureFlags, 4.2, "feature-flag SDK header");
             } else {
-                add(RequestPurpose::Telemetry, 4.2, "telemetry SDK header");
+                morph_scores[class_idx(RequestPurpose::Telemetry)] += 3.8;
+                note(RequestPurpose::Telemetry, 4.2, "telemetry SDK header");
             }
-        }
-        if input.method.eq_ignore_ascii_case("GET") && features.payload_bytes == 0 {
-            add(RequestPurpose::ChatInference, -2.2, "");
-            add(RequestPurpose::ToolResultSync, -2.5, "");
-            add(RequestPurpose::FileUpload, -2.2, "");
-            add(RequestPurpose::CodebaseIndexing, -1.2, "");
         }
         if input.repeat_count >= 4
             && features.payload_bytes > 0
             && features.payload_bytes <= 16 * 1024
             && features.conversation_schema == 0.0
         {
-            add(RequestPurpose::Telemetry, 0.8, "periodic beacon cadence");
-            add(RequestPurpose::RealtimeSync, 0.7, "");
+            note(RequestPurpose::Telemetry, 1.2, "periodic beacon cadence");
         }
 
-        // 4. Morphological lexical token scoring over host labels and camelCase path tokens
+        // Morphological lexical evidence over host labels and camelCase path tokens.
         if let Some(host) = input.host {
-            score_host_morphology(host, &mut logits, &mut reasons);
+            score_host_morphology(host, &mut morph_scores, &mut reasons);
         }
         if !input.path.is_empty() && input.path != "/" {
-            score_path_morphology(input.path, input.method, &mut logits, &mut reasons);
+            score_path_morphology(input.path, input.method, &mut morph_scores, &mut reasons);
         }
 
-        // Tool-result turns and FIM completions travel over the same inference endpoints; let them
-        // inherit endpoint inference evidence so they aren't drowned out by generic chat path scores.
-        if features.tool_result_schema > 0.0 {
-            let chat_idx = class_idx(RequestPurpose::ChatInference);
-            let tool_idx = class_idx(RequestPurpose::ToolResultSync);
-            if logits[chat_idx] > 0.0 {
-                logits[tool_idx] = logits[tool_idx].max(logits[chat_idx] + 3.2 * features.tool_result_schema as f64);
-            }
-        }
-        if features.fim_schema > 0.0 {
-            let chat_idx = class_idx(RequestPurpose::ChatInference);
-            let fim_idx = class_idx(RequestPurpose::InlineCompletion);
-            if logits[chat_idx] > 0.0 {
-                logits[fim_idx] = logits[fim_idx].max(logits[chat_idx] + 2.6 * features.fim_schema as f64);
-            }
-        }
+        let is_ai_host = input.host.is_some_and(|h| {
+            let norm = h
+                .trim()
+                .trim_matches(['[', ']'])
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            is_builtin_ai_mitm_host(&norm)
+        });
 
-        // 5. Softmax calibration
-        let max_logit = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let mut exp_scores = [0.0f64; NUM_CLASSES];
-        let mut sum_exp = 0.0f64;
-        for i in 0..NUM_CLASSES {
-            let e = ((logits[i] - max_logit) / SOFTMAX_TEMPERATURE).exp();
-            exp_scores[i] = e;
-            sum_exp += e;
-        }
-        let mut probs = [0.0f64; NUM_CLASSES];
-        for i in 0..NUM_CLASSES {
-            probs[i] = if sum_exp > 0.0 { exp_scores[i] / sum_exp } else { 0.0 };
-        }
+        // Trained embedded multi-task MLP inference (14-class purpose + 3-head audit risk).
+        let pred = AuditModel::predict(&AuditModelInput {
+            features: &features,
+            method: input.method,
+            repeat_count: input.repeat_count,
+            morph_scores: &morph_scores,
+            findings_count,
+            is_builtin_ai_host: is_ai_host,
+        });
 
-        let (best_idx, &best_prob) = probs
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .unwrap_or((class_idx(RequestPurpose::OtherApi), &1.0));
-        let purpose = ALL_PURPOSES[best_idx];
+        let purpose = pred.purpose;
+        let best_idx = class_idx(purpose);
+        let best_prob = pred.confidence as f64;
+        let probs = pred.purpose_probs;
 
-        let telemetry_prob = (probs[class_idx(RequestPurpose::Telemetry)]
+        let purpose_tel_prob = probs[class_idx(RequestPurpose::Telemetry)]
             + probs[class_idx(RequestPurpose::FeatureFlags)]
-            + probs[class_idx(RequestPurpose::CrashReport)]) as f32;
-        let bulk_upload_prob =
-            (probs[class_idx(RequestPurpose::CodebaseIndexing)] + probs[class_idx(RequestPurpose::FileUpload)]) as f32;
-        let inference_prob = (probs[class_idx(RequestPurpose::ChatInference)]
+            + probs[class_idx(RequestPurpose::CrashReport)];
+        let purpose_bulk_prob =
+            probs[class_idx(RequestPurpose::CodebaseIndexing)] + probs[class_idx(RequestPurpose::FileUpload)];
+        let inference_prob = probs[class_idx(RequestPurpose::ChatInference)]
             + probs[class_idx(RequestPurpose::ToolResultSync)]
-            + probs[class_idx(RequestPurpose::InlineCompletion)]) as f32;
+            + probs[class_idx(RequestPurpose::InlineCompletion)];
+
+        let telemetry_prob = if inference_prob >= 0.55 {
+            purpose_tel_prob.min(pred.telemetry_risk)
+        } else {
+            purpose_tel_prob.max(pred.telemetry_risk).clamp(0.0, 1.0)
+        };
+        let bulk_upload_prob = if inference_prob >= 0.55 {
+            purpose_bulk_prob.min(pred.bulk_upload_risk)
+        } else {
+            purpose_bulk_prob.max(pred.bulk_upload_risk).clamp(0.0, 1.0)
+        };
 
         // Build concise human-readable feature explanation from top contributors to the winning class.
         let mut win_reasons: Vec<(f64, &'static str)> = reasons
@@ -395,10 +372,11 @@ impl RequestClassifier {
 
         ClassificationResult {
             purpose,
-            confidence: best_prob as f32,
+            confidence: pred.confidence,
             telemetry_prob,
             bulk_upload_prob,
             inference_prob,
+            audit_risk_score: pred.audit_risk_score,
             detail,
             features,
         }
@@ -521,24 +499,20 @@ fn detect_archive_ct(ct_lower: &str) -> Option<&'static str> {
     .find(|&ct| ct_lower.contains(ct))
 }
 
+static TELEMETRY_HEADER_SET: Lazy<RegexSet> = Lazy::new(|| {
+    RegexSet::new([
+        r"(?i)(?:telemetry|sentry|statsig|datadog|otlp|honeycomb|posthog|mixpanel|amplitude|launchdarkly|segment-anonymous)",
+        r"(?i)^dd-",
+        r"(?i)^x-.*-(?:device|machine)-id$",
+    ])
+    .expect("valid telemetry header regex set")
+});
+
 fn extract_telemetry_headers(headers: &HeaderMap) -> Vec<String> {
     let mut hits = Vec::new();
     for name in headers.keys() {
         let lower = name.as_str().to_ascii_lowercase();
-        let is_sdk_tel = lower.contains("telemetry")
-            || lower.contains("sentry")
-            || lower.contains("statsig")
-            || lower.contains("datadog")
-            || lower.starts_with("dd-")
-            || lower.contains("otlp")
-            || lower.contains("honeycomb")
-            || lower.contains("posthog")
-            || lower.contains("mixpanel")
-            || lower.contains("amplitude")
-            || lower.contains("launchdarkly")
-            || lower.contains("segment-anonymous")
-            || (lower.starts_with("x-") && (lower.ends_with("-device-id") || lower.ends_with("-machine-id")));
-        if is_sdk_tel && !hits.contains(&lower) {
+        if TELEMETRY_HEADER_SET.is_match(&lower) && !hits.contains(&lower) {
             hits.push(lower);
         }
     }
@@ -1038,7 +1012,242 @@ fn extract_text_structural_fallback(slice: &str, f: &mut ExtractedFeatures) {
     }
 }
 
-/// Score morphological tokens extracted from destination hostname labels.
+static HOST_TOKEN_PRIORS: Lazy<HashMap<&'static str, (RequestPurpose, f64, &'static str)>> = Lazy::new(|| {
+    let mut m = HashMap::with_capacity(64);
+    for tok in [
+        "telemetry",
+        "metrics",
+        "clientmetrics",
+        "analytics",
+        "firebaselogging",
+        "logging",
+        "otlp",
+        "otel",
+        "datadoghq",
+        "posthog",
+        "segment",
+        "amplitude",
+        "mixpanel",
+        "honeycomb",
+        "newrelic",
+        "applicationinsights",
+        "vortex",
+        "mmstat",
+        "retcode",
+        "umeng",
+        "rudderstack",
+        "snowplowanalytics",
+        "heapanalytics",
+        "fullstory",
+        "pendo",
+        "clarity",
+        "plausible",
+        "measurement",
+        "beacon",
+        "cloudtrace",
+        "monitoring",
+    ] {
+        m.insert(tok, (RequestPurpose::Telemetry, 4.4, "telemetry host morphology"));
+    }
+    for tok in [
+        "statsig",
+        "statsigapi",
+        "featuregates",
+        "launchdarkly",
+        "growthbook",
+        "optimizely",
+    ] {
+        m.insert(tok, (RequestPurpose::FeatureFlags, 4.8, "feature-flag host morphology"));
+    }
+    for tok in [
+        "sentry",
+        "crash",
+        "crashlytics",
+        "crashlyticsreports",
+        "bugsnag",
+        "rollbar",
+        "backtrace",
+        "raygun",
+        "clouderrorreporting",
+        "livediagnostics",
+    ] {
+        m.insert(
+            tok,
+            (RequestPurpose::CrashReport, 4.8, "crash/diagnostic host morphology"),
+        );
+    }
+    for tok in ["webchannel", "realtime", "ws", "wss", "socket"] {
+        m.insert(tok, (RequestPurpose::RealtimeSync, 4.4, "realtime channel host"));
+    }
+    for tok in ["oauth", "oauth2", "auth", "auth0", "login", "accounts", "sso"] {
+        m.insert(tok, (RequestPurpose::AuthAccount, 4.2, "auth/account host"));
+    }
+    for tok in ["update", "updates", "releases", "marketplace", "downloads", "vsx"] {
+        m.insert(tok, (RequestPurpose::UpdateExtension, 4.0, "update/marketplace host"));
+    }
+    for tok in ["upload", "uploads", "storage", "blob", "s3", "cloudflarestorage"] {
+        m.insert(tok, (RequestPurpose::FileUpload, 3.6, "object-storage host"));
+    }
+    for tok in ["repo", "repo1", "repo42"] {
+        m.insert(tok, (RequestPurpose::CodebaseIndexing, 4.2, "code-sync host"));
+    }
+    m
+});
+
+static PATH_TOKEN_PRIORS: Lazy<HashMap<&'static str, (RequestPurpose, f64, &'static str)>> = Lazy::new(|| {
+    let mut m = HashMap::with_capacity(96);
+    for tok in [
+        "telemetry",
+        "analytics",
+        "metrics",
+        "metric",
+        "traces",
+        "otlp",
+        "otel",
+        "rgstr",
+        "clearcut",
+        "beacon",
+        "beacons",
+        "logevent",
+        "logevents",
+        "batchlog",
+        "clientmetrics",
+        "capture",
+        "collect",
+        "track",
+        "identify",
+        "ces",
+    ] {
+        m.insert(tok, (RequestPurpose::Telemetry, 4.4, "telemetry path/RPC token"));
+    }
+    for tok in [
+        "statsig",
+        "featuregates",
+        "featuregate",
+        "featureflags",
+        "featureflag",
+        "experiments",
+        "experiment",
+        "abtest",
+        "remoteconfig",
+        "launchdarkly",
+    ] {
+        m.insert(tok, (RequestPurpose::FeatureFlags, 4.8, "feature-flag path token"));
+    }
+    for tok in [
+        "crash",
+        "crashes",
+        "crashlytics",
+        "minidump",
+        "sentry",
+        "bugsnag",
+        "rollbar",
+        "feedback",
+        "bugreport",
+        "diagnostic",
+        "diagnostics",
+        "errorreporting",
+        "errorreport",
+    ] {
+        m.insert(tok, (RequestPurpose::CrashReport, 4.8, "crash/diagnostic path token"));
+    }
+    for tok in [
+        "embeddings",
+        "embedding",
+        "merkle",
+        "indexing",
+        "codebase",
+        "vector",
+        "vectors",
+        "repositoryservice",
+        "reposervice",
+        "chunks",
+    ] {
+        m.insert(
+            tok,
+            (RequestPurpose::CodebaseIndexing, 4.6, "codebase-indexing path token"),
+        );
+    }
+    for tok in ["files", "uploads", "upload", "attachments", "archive", "bundle"] {
+        m.insert(tok, (RequestPurpose::FileUpload, 4.0, "file-upload path token"));
+    }
+    for tok in [
+        "tunnel",
+        "tunnels",
+        "webchannel",
+        "realtime",
+        "channel",
+        "channels",
+        "subscribe",
+        "heartbeat",
+        "keepalive",
+        "ping",
+        "health",
+        "healthz",
+        "healthservice",
+        "liveness",
+        "readiness",
+    ] {
+        m.insert(tok, (RequestPurpose::RealtimeSync, 4.6, "realtime/tunnel path token"));
+    }
+    for tok in [
+        "oauth",
+        "oauth2",
+        "login",
+        "logout",
+        "signin",
+        "signout",
+        "auth",
+        "authservice",
+        "userinfo",
+        "whoami",
+        "billing",
+        "subscription",
+        "subscriptions",
+        "license",
+        "entitlement",
+        "entitlements",
+        "credits",
+        "verify",
+    ] {
+        m.insert(tok, (RequestPurpose::AuthAccount, 4.4, "auth/account path token"));
+    }
+    for tok in [
+        "models",
+        "quota",
+        "quotas",
+        "capabilities",
+        "onboard",
+        "onboarding",
+        "loadcodeassist",
+        "dashboardservice",
+        "preferences",
+        "settings",
+    ] {
+        m.insert(tok, (RequestPurpose::ModelCatalog, 4.2, "catalog/quota path token"));
+    }
+    for tok in [
+        "update",
+        "updates",
+        "upgrade",
+        "releases",
+        "release",
+        "marketplace",
+        "extensions",
+        "extension",
+        "plugins",
+        "vsix",
+        "changelog",
+    ] {
+        m.insert(
+            tok,
+            (RequestPurpose::UpdateExtension, 4.2, "update/extension path token"),
+        );
+    }
+    m
+});
+
+/// Score morphological tokens extracted from destination hostname labels via O(1) prior lookup.
 fn score_host_morphology(
     raw_host: &str,
     logits: &mut [f64; NUM_CLASSES],
@@ -1062,75 +1271,9 @@ fn score_host_morphology(
 
     let labels: Vec<&str> = host.split('.').collect();
     let first = labels.first().copied().unwrap_or("");
-    let tokens = tokenize_words(&host);
-
-    // Host label morphology (generalizes across arbitrary subdomains like `telemetry.newvendor.io`)
-    for tok in &tokens {
-        match tok.as_str() {
-            "telemetry"
-            | "metrics"
-            | "clientmetrics"
-            | "analytics"
-            | "firebaselogging"
-            | "logging"
-            | "otlp"
-            | "otel"
-            | "datadoghq"
-            | "posthog"
-            | "segment"
-            | "amplitude"
-            | "mixpanel"
-            | "honeycomb"
-            | "newrelic"
-            | "applicationinsights"
-            | "vortex"
-            | "mmstat"
-            | "retcode"
-            | "umeng"
-            | "rudderstack"
-            | "snowplowanalytics"
-            | "heapanalytics"
-            | "fullstory"
-            | "pendo"
-            | "clarity"
-            | "plausible"
-            | "measurement"
-            | "beacon"
-            | "cloudtrace"
-            | "monitoring" => {
-                bump(RequestPurpose::Telemetry, 4.4, "telemetry host morphology");
-            }
-            "statsig" | "statsigapi" | "featuregates" | "launchdarkly" | "growthbook" | "optimizely" => {
-                bump(RequestPurpose::FeatureFlags, 4.8, "feature-flag host morphology");
-            }
-            "sentry"
-            | "crash"
-            | "crashlytics"
-            | "crashlyticsreports"
-            | "bugsnag"
-            | "rollbar"
-            | "backtrace"
-            | "raygun"
-            | "clouderrorreporting"
-            | "livediagnostics" => {
-                bump(RequestPurpose::CrashReport, 4.8, "crash/diagnostic host morphology");
-            }
-            "webchannel" | "realtime" | "ws" | "wss" | "socket" => {
-                bump(RequestPurpose::RealtimeSync, 4.4, "realtime channel host");
-            }
-            "oauth" | "oauth2" | "auth" | "auth0" | "login" | "accounts" | "sso" => {
-                bump(RequestPurpose::AuthAccount, 4.2, "auth/account host");
-            }
-            "update" | "updates" | "releases" | "marketplace" | "downloads" | "vsx" => {
-                bump(RequestPurpose::UpdateExtension, 4.0, "update/marketplace host");
-            }
-            "upload" | "uploads" | "storage" | "blob" | "s3" | "cloudflarestorage" => {
-                bump(RequestPurpose::FileUpload, 3.6, "object-storage host");
-            }
-            "repo" | "repo1" | "repo42" => {
-                bump(RequestPurpose::CodebaseIndexing, 4.2, "code-sync host");
-            }
-            _ => {}
+    for tok in &tokenize_words(&host) {
+        if let Some(&(purpose, weight, tag)) = HOST_TOKEN_PRIORS.get(tok.as_str()) {
+            bump(purpose, weight, tag);
         }
     }
 
@@ -1156,12 +1299,11 @@ fn score_host_morphology(
         bump(RequestPurpose::FeatureFlags, 4.6, "feature-flag host morphology");
     }
     if is_builtin_ai_mitm_host(&host) && !host.contains("webchannel") && !host.starts_with("repo") {
-        // Gentle prior for AI API hosts; path & AST features override easily for non-chat endpoints.
         bump(RequestPurpose::ChatInference, 0.7, "");
     }
 }
 
-/// Score morphological tokens extracted from URL path and RPC action names.
+/// Score morphological tokens extracted from URL path and RPC action names via O(1) prior lookup.
 fn score_path_morphology(
     path: &str,
     method: &str,
@@ -1189,7 +1331,6 @@ fn score_path_morphology(
         || (has("count") && (has("token") || has("tokens")))
     {
         bump(RequestPurpose::TokenCount, 5.8, "token-count endpoint");
-        bump(RequestPurpose::ChatInference, -2.5, "");
         return;
     }
 
@@ -1222,49 +1363,13 @@ fn score_path_morphology(
         return;
     }
 
-    // Lexical feature weights across all non-inference paths & camelCase RPC actions
+    let is_get = method.eq_ignore_ascii_case("GET");
     for tok in &words {
-        match tok.as_str() {
-            "telemetry" | "analytics" | "metrics" | "metric" | "traces" | "otlp" | "otel" | "rgstr" | "clearcut"
-            | "beacon" | "beacons" | "logevent" | "logevents" | "batchlog" | "clientmetrics" | "capture"
-            | "collect" | "track" | "identify" | "ces" => {
-                bump(RequestPurpose::Telemetry, 4.4, "telemetry path/RPC token");
+        if let Some(&(purpose, weight, tag)) = PATH_TOKEN_PRIORS.get(tok.as_str()) {
+            if purpose == RequestPurpose::FileUpload && is_get {
+                continue;
             }
-            "statsig" | "featuregates" | "featuregate" | "featureflags" | "featureflag" | "experiments"
-            | "experiment" | "abtest" | "remoteconfig" | "launchdarkly" => {
-                bump(RequestPurpose::FeatureFlags, 4.8, "feature-flag path token");
-            }
-            "crash" | "crashes" | "crashlytics" | "minidump" | "sentry" | "bugsnag" | "rollbar" | "feedback"
-            | "bugreport" | "diagnostic" | "diagnostics" | "errorreporting" | "errorreport" => {
-                bump(RequestPurpose::CrashReport, 4.8, "crash/diagnostic path token");
-            }
-            "embeddings" | "embedding" | "merkle" | "indexing" | "codebase" | "vector" | "vectors"
-            | "repositoryservice" | "reposervice" | "chunks" => {
-                bump(RequestPurpose::CodebaseIndexing, 4.6, "codebase-indexing path token");
-            }
-            "files" | "uploads" | "upload" | "attachments" | "archive" | "bundle" => {
-                if !method.eq_ignore_ascii_case("GET") {
-                    bump(RequestPurpose::FileUpload, 4.0, "file-upload path token");
-                }
-            }
-            "tunnel" | "tunnels" | "webchannel" | "realtime" | "channel" | "channels" | "subscribe" | "heartbeat"
-            | "keepalive" | "ping" | "health" | "healthz" | "healthservice" | "liveness" | "readiness" => {
-                bump(RequestPurpose::RealtimeSync, 4.6, "realtime/tunnel path token");
-            }
-            "oauth" | "oauth2" | "login" | "logout" | "signin" | "signout" | "auth" | "authservice" | "userinfo"
-            | "whoami" | "billing" | "subscription" | "subscriptions" | "license" | "entitlement" | "entitlements"
-            | "credits" | "verify" => {
-                bump(RequestPurpose::AuthAccount, 4.4, "auth/account path token");
-            }
-            "models" | "quota" | "quotas" | "capabilities" | "onboard" | "onboarding" | "loadcodeassist"
-            | "dashboardservice" | "preferences" | "settings" => {
-                bump(RequestPurpose::ModelCatalog, 4.2, "catalog/quota path token");
-            }
-            "update" | "updates" | "upgrade" | "releases" | "release" | "marketplace" | "extensions" | "extension"
-            | "plugins" | "vsix" | "changelog" => {
-                bump(RequestPurpose::UpdateExtension, 4.2, "update/extension path token");
-            }
-            _ => {}
+            bump(purpose, weight, tag);
         }
     }
 

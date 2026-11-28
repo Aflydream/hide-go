@@ -421,6 +421,22 @@ impl Matcher {
         !self.trie[node].next.is_empty()
     }
 
+    /// Fast zero-allocation check for whether any registered vault token appears in `text`.
+    pub fn contains_any_token(&self, text: &str) -> bool {
+        if self.pairs.is_empty() || text.is_empty() {
+            return false;
+        }
+        let bytes = text.as_bytes();
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            if self.root_next[bytes[pos] as usize] != 0 && self.find_at(text, pos, None).is_some() {
+                return true;
+            }
+            pos += 1;
+        }
+        false
+    }
+
     /// Byte ranges of registered tokens already present in `text` (never re-masked).
     pub fn token_ranges(&self, text: &str) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
@@ -1218,6 +1234,11 @@ impl PrivacyVault {
     pub fn restore_plain_text(&self, text: &str) -> (String, usize) {
         let (out, n, _) = self.matcher().restore(text, None, true);
         (out, n)
+    }
+
+    /// Fast zero-allocation check for whether any vault token appears in `text`.
+    pub fn has_any_token_in(&self, text: &str) -> bool {
+        self.matcher().contains_any_token(text)
     }
 
     /// Return all active token -> final original pairs sorted by token length descending.

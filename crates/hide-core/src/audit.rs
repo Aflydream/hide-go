@@ -98,6 +98,7 @@ pub struct HttpAuditVerdict {
     pub telemetry_prob: f32,
     pub bulk_upload_prob: f32,
     pub inference_prob: f32,
+    pub audit_risk_score: f32,
 }
 
 /// Per-harness rollup surfaced in `GET /api/status`.
@@ -240,19 +241,22 @@ pub fn analyze_http_request(
     findings_count: usize,
     repeat_count: u32,
 ) -> HttpAuditVerdict {
-    let cls = RequestClassifier::classify(&ClassificationInput {
-        method,
-        host,
-        path,
-        content_type,
-        content_encoding,
-        headers,
-        raw_bytes,
-        body_text,
-        bytes_sent_override: None,
-        bytes_received_override: None,
-        repeat_count,
-    });
+    let cls = RequestClassifier::classify_with_findings(
+        &ClassificationInput {
+            method,
+            host,
+            path,
+            content_type,
+            content_encoding,
+            headers,
+            raw_bytes,
+            body_text,
+            bytes_sent_override: None,
+            bytes_received_override: None,
+            repeat_count,
+        },
+        findings_count,
+    );
     let signals = signals_from_classification(&cls, host, path, category, findings_count);
     HttpAuditVerdict {
         purpose: cls.purpose,
@@ -262,6 +266,7 @@ pub fn analyze_http_request(
         telemetry_prob: cls.telemetry_prob,
         bulk_upload_prob: cls.bulk_upload_prob,
         inference_prob: cls.inference_prob,
+        audit_risk_score: cls.audit_risk_score,
     }
 }
 
@@ -303,8 +308,9 @@ fn signals_from_classification(
         });
     }
 
-    // 3. Telemetry / analytics / metrics reporting (from classifier probability or explicit category)
+    // 3. Telemetry / analytics / metrics reporting (from trained model probability or explicit category)
     if (cls.purpose == RequestPurpose::Telemetry && cls.confidence >= 0.45)
+        || (!is_inference && !telemetry_hit && cls.telemetry_prob >= 0.72)
         || (category == TrafficCategory::Telemetry && !is_inference && !telemetry_hit)
     {
         telemetry_hit = true;

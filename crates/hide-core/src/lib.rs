@@ -2,6 +2,8 @@
 
 pub mod all_hide;
 pub mod audit;
+pub mod audit_model;
+mod audit_model_weights;
 pub mod ca;
 pub mod classifier;
 pub mod config;
@@ -39,9 +41,9 @@ mod tests {
     use crate::vault::PrivacyVault;
 
     #[test]
-    fn test_all_seven_harnesses_supported_and_detected() {
+    fn test_all_harnesses_supported_and_detected() {
         let profiles = get_all_harness_profiles(18787);
-        assert_eq!(profiles.len(), 7);
+        assert_eq!(profiles.len(), 8);
 
         let expected = [
             HarnessKind::ClaudeCode,
@@ -51,6 +53,7 @@ mod tests {
             HarnessKind::Qoder,
             HarnessKind::Cursor,
             HarnessKind::GrokBuild,
+            HarnessKind::Pi,
         ];
         for kind in expected {
             assert!(
@@ -82,6 +85,10 @@ mod tests {
             r#"{"messages":[]}"#,
         );
         assert_eq!(h3, HarnessKind::GrokBuild);
+
+        let (h4, _) =
+            detect_harness_and_category("/pi/v1/messages", Some("pi-coding-agent/1.7.0"), r#"{"messages":[]}"#);
+        assert_eq!(h4, HarnessKind::Pi);
     }
 
     #[test]
