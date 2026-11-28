@@ -192,6 +192,7 @@ export function Traffic() {
         (!q ||
           r.endpoint.toLowerCase().includes(q) ||
           getHarnessLabel(r.harness, locale).toLowerCase().includes(q) ||
+          (r.clientProcess?.toLowerCase().includes(q) ?? false) ||
           getPurposeLabel(r.purpose, locale, r.category).toLowerCase().includes(q) ||
           (r.purposeDetail?.toLowerCase().includes(q) ?? false) ||
           r.id.startsWith(q)),
@@ -437,8 +438,9 @@ export function Traffic() {
                           )}
                           {r.simulated && <span className="shrink-0 text-2xs text-info">{t('overview.simulatedTag')}</span>}
                         </div>
-                        <p className="truncate font-mono text-2xs text-fg-subtle" title={r.endpoint}>
+                        <p className="truncate font-mono text-2xs text-fg-subtle" title={r.clientProcess ? `${r.method} ${r.endpoint} · ${r.clientProcess}` : r.endpoint}>
                           {r.method} {r.endpoint}
+                          {r.clientProcess ? ` · ${r.clientProcess}` : ''}
                         </p>
                       </td>
                       <td className="py-2 pl-2 align-top">
@@ -602,6 +604,12 @@ function RecordDetail({
             <dt>{t('traffic.labelTool')}</dt>
             <dd className="text-fg-muted">{getHarnessLabel(record.harness, locale)}</dd>
           </div>
+          {record.clientProcess && (
+            <div className="flex gap-1.5">
+              <dt>{t('traffic.labelProcess')}</dt>
+              <dd className="font-mono text-fg-muted">{record.clientProcess}</dd>
+            </div>
+          )}
           <div className="flex gap-1.5">
             <dt>{t('traffic.labelUpstream')}</dt>
             <dd className="text-fg-muted">{blockedLocally ? t('traffic.blockedLocally') : record.upstreamVendor}</dd>
@@ -785,6 +793,9 @@ function MetaList({ record }: { record: TrafficAuditRecord }) {
     [t('traffic.metaId'), <code className="font-mono">{record.id}</code>],
     [t('traffic.metaTime'), record.timestamp],
     [t('traffic.metaTool'), getHarnessLabel(record.harness, locale)],
+    ...(record.clientProcess
+      ? [[t('traffic.metaClientProcess'), <code className="font-mono">{record.clientProcess}</code>] as [string, React.ReactNode]]
+      : []),
     [
       t('traffic.metaPurpose'),
       <span className="inline-flex flex-wrap items-center gap-2">

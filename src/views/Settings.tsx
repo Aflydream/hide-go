@@ -1,9 +1,9 @@
 import { Fragment, useEffect, useState, type ReactNode } from 'react';
-import { ArrowsClockwise, ArrowSquareOut, CaretDown, CaretRight, CheckCircle } from '@phosphor-icons/react';
+import { ArrowsClockwise, CaretDown, CaretRight, CheckCircle, DownloadSimple } from '@phosphor-icons/react';
 import { useStore } from '../store';
 import { Badge, Button, CopyButton, Section, Segmented, Skeleton, Switch, cx } from '../components/ui';
 import { useColorScheme, type ColorSchemePref } from '../components/WindowFrame';
-import { formatDuration } from '../lib/format';
+import { formatBytes, formatDuration } from '../lib/format';
 import { SUPPORTED_LOCALES, translate, useI18n } from '../lib/i18n';
 import type { UiLanguage } from '../types';
 
@@ -83,7 +83,20 @@ function ReleaseNotesView({ markdown }: { markdown: string }) {
 }
 
 export function Settings() {
-  const { config, status, statusError, saveConfig, updateInfo, updateError, checkingUpdates, checkForUpdates } = useStore();
+  const {
+    config,
+    status,
+    statusError,
+    saveConfig,
+    updateInfo,
+    updateError,
+    checkingUpdates,
+    checkForUpdates,
+    downloadingUpdate,
+    downloadedUpdate,
+    downloadUpdateError,
+    downloadUpdate,
+  } = useStore();
   const { pref, setPref, systemLocale, locale, t } = useI18n();
   const { pref: themePref, setPref: setThemePref } = useColorScheme();
   const [changelogOpen, setChangelogOpen] = useState(false);
@@ -202,20 +215,30 @@ export function Settings() {
 
               <div className="flex shrink-0 items-center gap-2">
                 {updateInfo?.updateAvailable && (
-                  <a
-                    href={updateInfo.releaseUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded border border-transparent bg-brand-solid px-2.5 text-xs font-medium text-brand-on transition-colors hover:bg-brand-solid/90"
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    disabled={downloadingUpdate}
+                    icon={
+                      downloadingUpdate ? (
+                        <ArrowsClockwise size={14} className="animate-spin" />
+                      ) : (
+                        <DownloadSimple size={14} />
+                      )
+                    }
+                    onClick={() => void downloadUpdate()}
                   >
-                    {t('settings.updatesDownloadBtn')}
-                    <ArrowSquareOut size={13} aria-hidden="true" />
-                  </a>
+                    {downloadingUpdate
+                      ? t('settings.updatesDownloading')
+                      : updateInfo.assetSize
+                        ? `${t('settings.updatesDownloadBtn')} (${formatBytes(updateInfo.assetSize)})`
+                        : t('settings.updatesDownloadBtn')}
+                  </Button>
                 )}
                 <Button
                   size="sm"
                   variant="secondary"
-                  disabled={checkingUpdates}
+                  disabled={checkingUpdates || downloadingUpdate}
                   icon={<ArrowsClockwise size={14} className={checkingUpdates ? 'animate-spin' : undefined} />}
                   onClick={() => void checkForUpdates(true)}
                 >
@@ -223,6 +246,31 @@ export function Settings() {
                 </Button>
               </div>
             </div>
+
+            {(downloadedUpdate || downloadUpdateError) && (
+              <div className="flex flex-wrap items-center justify-between gap-3 bg-surface-2/40 px-4 py-2.5 text-xs">
+                {downloadedUpdate ? (
+                  <>
+                    <div className="min-w-0">
+                      <span className="font-medium text-fg">
+                        {downloadedUpdate.launched
+                          ? t('settings.updatesDownloadLaunchedNote', { file: downloadedUpdate.fileName })
+                          : t('settings.updatesDownloadSavedNote', { file: downloadedUpdate.fileName })}
+                      </span>
+                      {downloadedUpdate.verified && (
+                        <span className="ml-2 text-[11px] text-fg-subtle">{t('settings.updatesShaVerified')}</span>
+                      )}
+                      <p className="mt-0.5 truncate font-mono text-[11px] text-fg-subtle" title={downloadedUpdate.filePath}>
+                        {downloadedUpdate.filePath}
+                      </p>
+                    </div>
+                    <CopyButton compact text={downloadedUpdate.filePath} label={t('settings.updatesCopyPath')} />
+                  </>
+                ) : (
+                  <span className="text-danger">{downloadUpdateError}</span>
+                )}
+              </div>
+            )}
 
             {updateInfo?.updateAvailable && localizedChangelog && (
               <div>
@@ -277,7 +325,7 @@ export function Settings() {
             <div className="flex items-center justify-between gap-4 px-4 py-3">
               <dt className="text-fg-subtle">{t('settings.statusLabel')}</dt>
               <dd className="flex items-center gap-2 text-fg">
-                <span aria-hidden="true" className={cx('h-2 w-2 rounded-full', online ? 'bg-brand' : 'bg-danger')} />
+                <span aria-hidden="true" className={cx('h-2 w-2 rounded-full', online ? 'bg-ok' : 'bg-danger')} />
                 <span>{online ? t('settings.statusRunning') : t('settings.statusDisconnected')}</span>
                 {status && <span className="tabular text-fg-subtle">· {formatDuration(status.uptimeSecs, locale)}</span>}
               </dd>

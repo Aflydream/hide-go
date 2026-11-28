@@ -147,6 +147,7 @@ const HARNESS_NOTE_KEYS: Partial<Record<HarnessKind, MessageKey>> = {
   qoder: 'harness.note.qoder',
   cursor: 'harness.note.cursor',
   'grok-build': 'harness.note.grok-build',
+  pi: 'harness.note.pi',
 };
 
 export function localizeHarnessIntegrationNote(

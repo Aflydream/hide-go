@@ -11,7 +11,7 @@ import type {
 } from '../types';
 import { LOCALE_META, translate, type Locale, type MessageKey } from './i18n';
 
-export const HARNESS_ORDER: HarnessKind[] = ['claude-code', 'codex', 'antigravity', 'zcode', 'qoder', 'cursor', 'grok-build'];
+export const HARNESS_ORDER: HarnessKind[] = ['claude-code', 'codex', 'antigravity', 'zcode', 'qoder', 'cursor', 'grok-build', 'pi'];
 export const PURPOSE_ORDER: RequestPurpose[] = [
   'chat-inference',
   'tool-result-sync',
@@ -39,6 +39,7 @@ const HARNESS_KEYS: Record<HarnessKind, MessageKey> = {
   qoder: 'harness.qoder',
   cursor: 'harness.cursor',
   'grok-build': 'harness.grok-build',
+  pi: 'harness.pi',
   generic: 'harness.generic',
 };
 

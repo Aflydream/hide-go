@@ -33,6 +33,7 @@ export default {
         line: { DEFAULT: token('line'), strong: token('line-strong'), control: token('line-control') },
         fg: { DEFAULT: token('fg'), muted: token('fg-muted'), subtle: token('fg-subtle') },
         brand: { DEFAULT: token('brand'), solid: token('brand-solid'), on: token('brand-on') },
+        ok: { DEFAULT: token('ok') },
         danger: { DEFAULT: token('danger'), solid: token('danger-solid') },
         warn: { DEFAULT: token('warn') },
         info: { DEFAULT: token('info') },

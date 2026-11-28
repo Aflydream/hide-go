@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   ChartLineUp,
+  ArrowsClockwise,
   ArrowsLeftRight,
   ShieldCheck,
   Plugs,
@@ -11,10 +12,12 @@ import {
   EyeSlash,
   Lightning,
   PaperPlaneTilt,
+  WarningCircle,
   WifiSlash,
 } from '@phosphor-icons/react';
 import { StoreProvider, isAuthError, useStore } from './store';
-import { Button, Segmented, ToastProvider, cx, type SegmentTone } from './components/ui';
+import { api } from './lib/api';
+import { Badge, Button, Dialog, Segmented, ToastProvider, cx, useToast, type SegmentTone } from './components/ui';
 import { ColorSchemeProvider, WindowFrame } from './components/WindowFrame';
 import type { Route } from './lib/hooks';
 import { formatCount, formatDuration, getModeLabel } from './lib/format';
@@ -170,7 +173,7 @@ function Sidebar({ navItems }: { navItems: NavItem[] }) {
       <div className="border-t border-line p-3 max-[1180px]:hidden">
         <div role="status" aria-live="polite">
           <div className="flex items-center gap-2 text-xs">
-            <span aria-hidden="true" className={cx('h-2 w-2 rounded-full', online ? 'bg-brand' : 'bg-danger')} />
+            <span aria-hidden="true" className={cx('h-2 w-2 rounded-full', online ? 'bg-ok' : 'bg-danger')} />
             <span className="font-medium text-fg">{online ? t('shell.online') : t('shell.offline')}</span>
             {config && <span className="tabular ml-auto font-mono text-2xs text-fg-subtle">:{config.proxyPort}</span>}
           </div>
@@ -256,6 +259,109 @@ function AuditWarning() {
   );
 }
 
+function RestartReminderBanner() {
+  const { runtimeHealth, navigate } = useStore();
+  const { locale, t } = useI18n();
+  const pending = runtimeHealth?.runningHarnesses.filter((h) => h.needsRestart) ?? [];
+  if (pending.length === 0) return null;
+  const sep = locale === 'zh-CN' ? '、' : ', ';
+  const names = pending.map((h) => h.name).join(sep);
+  return (
+    <div role="status" className="flex items-center gap-3 border-b border-warn/40 bg-warn/10 px-6 py-2 text-xs">
+      <ArrowsClockwise aria-hidden="true" size={14} weight="bold" className="shrink-0 text-warn" />
+      <span className="font-medium text-warn">{t('shell.restartBannerTitle', { tools: names })}</span>
+      <span className="truncate text-fg-muted">{t('shell.restartBannerBody')}</span>
+      <button
+        type="button"
+        onClick={() => navigate('integrations', { tool: pending[0]!.kind })}
+        className="ml-auto shrink-0 cursor-pointer font-medium text-fg underline-offset-2 hover:underline"
+      >
+        {t('shell.restartBannerAction')}
+      </button>
+    </div>
+  );
+}
+
+function ConflictResolutionModal() {
+  const { config, runtimeHealth, resolveConflict } = useStore();
+  const { t } = useI18n();
+  const toast = useToast();
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const conflict = config?.mode !== 'audit-only' ? (runtimeHealth?.conflicts[0] ?? null) : null;
+
+  const handleAction = async (action: 'stop-peer' | 'switch-hidego-audit' | 'dismiss') => {
+    if (!conflict) return;
+    setBusyAction(action);
+    try {
+      await resolveConflict(conflict.id, action);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleQuitHideGo = async () => {
+    setBusyAction('quit-hidego');
+    try {
+      await api.quitDesktop();
+    } catch {
+      toast.push({
+        tone: 'warn',
+        title: t('conflict.quitUnsupportedTitle'),
+        body: t('conflict.quitUnsupportedBody'),
+      });
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  return (
+    <Dialog
+      open={Boolean(conflict)}
+      onClose={() => void handleAction('dismiss')}
+      title={t('conflict.title')}
+      description={t('conflict.description')}
+      width="max-w-lg"
+      footer={
+        conflict ? (
+          <div className="flex w-full flex-wrap items-center justify-end gap-2">
+            <Button size="sm" variant="ghost" disabled={busyAction !== null} onClick={() => void handleAction('dismiss')}>
+              {t('conflict.actionIgnore')}
+            </Button>
+            <Button size="sm" variant="secondary" disabled={busyAction !== null} onClick={() => void handleAction('switch-hidego-audit')}>
+              {t('conflict.actionSwitchAudit')}
+            </Button>
+            <Button size="sm" variant="secondary" disabled={busyAction !== null} onClick={() => void handleQuitHideGo()}>
+              {t('conflict.actionQuitHideGo')}
+            </Button>
+            {conflict.canStopPeer && (
+              <Button size="sm" variant="danger" disabled={busyAction !== null} onClick={() => void handleAction('stop-peer')}>
+                {t('conflict.actionStopPeer', { peer: conflict.peerName })}
+              </Button>
+            )}
+          </div>
+        ) : null
+      }
+    >
+      {conflict && (
+        <div className="space-y-3 text-xs">
+          <div className="flex items-start gap-2.5 rounded-md border border-warn/40 bg-warn/10 p-3">
+            <WarningCircle aria-hidden="true" size={16} weight="bold" className="mt-0.5 shrink-0 text-warn" />
+            <div className="min-w-0 space-y-1">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="font-semibold text-fg">{conflict.peerName}</span>
+                {conflict.port ? <Badge tone="warn">127.0.0.1:{conflict.port}</Badge> : null}
+                {conflict.pid ? <Badge tone="neutral">PID {conflict.pid}</Badge> : null}
+              </div>
+              <p className="break-all leading-5 text-fg-muted">{conflict.detail}</p>
+            </div>
+          </div>
+          <p className="leading-5 text-fg-muted">{t('conflict.guidance')}</p>
+        </div>
+      )}
+    </Dialog>
+  );
+}
+
 function Main() {
   const { route } = useStore();
   const mainRef = useRef<HTMLElement>(null);
@@ -313,10 +419,12 @@ function Shell() {
           <TopBar navItems={navItems} />
           <ConnectionBanner />
           <AuditWarning />
+          <RestartReminderBanner />
           <Main />
         </div>
       </div>
       <SimulateDialog open={simulatorOpen} onClose={closeSimulator} />
+      <ConflictResolutionModal />
     </WindowFrame>
   );
 }

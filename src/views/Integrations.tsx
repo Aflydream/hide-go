@@ -5,7 +5,7 @@ import { api } from '../lib/api';
 import { Badge, Button, Callout, CopyButton, Segmented, Skeleton, Switch, cx, inputClass, useToast } from '../components/ui';
 import { formatCount, getPurposeLabel, getPurposeTone, proxyBase } from '../lib/format';
 import { localizeHarnessIntegrationNote, localizeHarnessTargets, translate, useI18n, type Locale } from '../lib/i18n';
-import type { CaStatus, HarnessKind, HarnessProfile, MitmHostsResponse } from '../types';
+import type { CaStatus, HarnessKind, HarnessProfile, MitmHostsResponse, PeerRelayInfo, RunningHarnessNotice } from '../types';
 import { useSimulate } from './SimulateDialog';
 
 type Shell = 'bash' | 'powershell';
@@ -18,6 +18,7 @@ const FALLBACK_TARGETS: Partial<Record<HarnessProfile['kind'], string[]>> = {
   qoder: ['Qoder/User/settings.json', 'QoderCN/User/settings.json', '环境变量 NODE_EXTRA_CA_CERTS'],
   cursor: ['Cursor/User/settings.json', '环境变量 NODE_EXTRA_CA_CERTS'],
   'grok-build': ['环境变量 GROK_XAI_API_BASE_URL / HTTPS_PROXY / NODE_EXTRA_CA_CERTS'],
+  pi: ['~/.pi/agent/models.json', '环境变量 HTTPS_PROXY / NODE_EXTRA_CA_CERTS'],
 };
 
 function describeAutoConnectMode(profile: HarnessProfile, locale: Locale): string {
@@ -348,6 +349,8 @@ function ToolDetail({
   profile,
   port,
   liveCount,
+  runningNotice,
+  peerRelays,
   shell,
   caStatus,
   caBusy,
@@ -358,6 +361,8 @@ function ToolDetail({
   profile: HarnessProfile;
   port: number;
   liveCount: number;
+  runningNotice: RunningHarnessNotice | null;
+  peerRelays: PeerRelayInfo[];
   shell: Shell;
   caStatus: CaStatus | null;
   caBusy: boolean;
@@ -375,6 +380,9 @@ function ToolDetail({
   const snippet = shell === 'bash' ? profile.envSetupBash : profile.envSetupPowershell;
   const effectiveTraffic = Math.max(liveCount, profile.trafficCount);
   const integrationNote = localizeHarnessIntegrationNote(profile.kind, profile.integrationNote, locale);
+  const chainedRelay = peerRelays.find((r) => r.status === 'chained' && r.affectedHarnesses.includes(profile.kind)) ?? null;
+  const overwrittenRelay =
+    peerRelays.find((r) => r.status === 'overwrote-harness' && r.affectedHarnesses.includes(profile.kind)) ?? null;
 
   const handleConnect = async () => {
     setConnecting(true);
@@ -447,8 +455,43 @@ function ToolDetail({
               {t('integrations.badgeLiveTraffic', { count: formatCount(effectiveTraffic, locale) })}
             </Badge>
           )}
+          {runningNotice?.needsRestart && (
+            <Badge tone="warn" dot>
+              {t('integrations.statusNeedsRestart')}
+            </Badge>
+          )}
         </div>
         <p className="mt-1 text-xs text-fg-subtle">{profile.protocolFamily}</p>
+        {runningNotice?.needsRestart && (
+          <div className="mt-4">
+            <Callout tone="warn" title={t('integrations.restartCalloutTitle', { name: profile.name })}>
+              {t('integrations.restartCalloutBody', {
+                pids: runningNotice.pids.slice(0, 4).join(', '),
+              })}
+            </Callout>
+          </div>
+        )}
+        {overwrittenRelay && (
+          <div className="mt-4">
+            <Callout
+              tone="warn"
+              title={t('integrations.relayDriftTitle', {
+                relay: overwrittenRelay.processName
+                  ? `${overwrittenRelay.processName} (127.0.0.1:${overwrittenRelay.port})`
+                  : `127.0.0.1:${overwrittenRelay.port}`,
+              })}
+              action={
+                profile.autoConnectMode !== 'manual' ? (
+                  <Button size="sm" variant="primary" disabled={connecting} onClick={handleConnect}>
+                    {t('integrations.relayDriftRechainBtn')}
+                  </Button>
+                ) : undefined
+              }
+            >
+              {t('integrations.relayDriftBody')}
+            </Callout>
+          </div>
+        )}
         {integrationNote && (
           <div className="mt-4">
             <Callout
@@ -549,6 +592,28 @@ function ToolDetail({
               )}
             </div>
           </div>
+          {chainedRelay && (
+            <div className="flex items-start justify-between gap-4 border-t border-line pt-2.5">
+              <span className="shrink-0 text-fg-subtle">{t('integrations.chainedRelayLabel')}</span>
+              <span className="text-right font-mono text-fg-muted">
+                {chainedRelay.processName
+                  ? `${chainedRelay.processName} · 127.0.0.1:${chainedRelay.port}`
+                  : `127.0.0.1:${chainedRelay.port}`}
+              </span>
+            </div>
+          )}
+          {runningNotice && runningNotice.companions.length > 0 && (
+            <div className="flex items-start justify-between gap-4 border-t border-line pt-2.5">
+              <span className="shrink-0 text-fg-subtle">{t('integrations.companionsLabel')}</span>
+              <div className="flex flex-wrap justify-end gap-1.5">
+                {runningNotice.companions.slice(0, 6).map((c) => (
+                  <Badge key={`${c.pid}-${c.name}`} tone="neutral">
+                    {c.name} ({t(c.relation === 'child' ? 'integrations.companionChild' : 'integrations.companionSibling')})
+                  </Badge>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </Block>
 
@@ -647,7 +712,7 @@ function ToolDetail({
 }
 
 export function Integrations() {
-  const { harnesses, refreshHarnesses, config, saveConfig, saving, logs, params, navigate } = useStore();
+  const { harnesses, refreshHarnesses, runtimeHealth, refreshRuntimeHealth, config, saveConfig, saving, logs, params, navigate } = useStore();
   const { t } = useI18n();
   const toast = useToast();
   const [shell, setShell] = useState<Shell>(() => (/win/i.test(navigator.platform) ? 'powershell' : 'bash'));
@@ -676,8 +741,16 @@ export function Integrations() {
   }, [refreshCaStatus]);
 
   const refreshAll = useCallback(async () => {
-    await Promise.all([refreshHarnesses(), refreshCaStatus()]);
-  }, [refreshHarnesses, refreshCaStatus]);
+    await Promise.all([refreshHarnesses(), refreshCaStatus(), refreshRuntimeHealth()]);
+  }, [refreshHarnesses, refreshCaStatus, refreshRuntimeHealth]);
+
+  const runningByKind = useMemo(() => {
+    const map = new Map<HarnessKind, RunningHarnessNotice>();
+    for (const item of runtimeHealth?.runningHarnesses ?? []) {
+      map.set(item.kind, item);
+    }
+    return map;
+  }, [runtimeHealth]);
 
   const liveCounts = useMemo(() => {
     const counts = new Map<HarnessKind, number>();
@@ -873,20 +946,25 @@ export function Integrations() {
         <ul className="min-h-0 flex-1 divide-y divide-line overflow-y-auto">
           {harnesses.map((h) => {
             const active = h.kind === selected.kind;
+            const running = runningByKind.get(h.kind);
             const statusText = h.detectedActive
               ? t('integrations.statusActive')
-              : h.configured
-                ? t('integrations.statusConfigured')
-                : h.installed
-                  ? t('integrations.statusInstalled')
-                  : t('integrations.statusMissing');
+              : running?.needsRestart
+                ? t('integrations.statusNeedsRestart')
+                : h.configured
+                  ? t('integrations.statusConfigured')
+                  : h.installed
+                    ? t('integrations.statusInstalled')
+                    : t('integrations.statusMissing');
             const dotTone = h.detectedActive
-              ? 'bg-brand'
-              : h.configured
-                ? 'bg-brand-solid'
-                : h.installed
-                  ? 'bg-warn'
-                  : 'bg-line-strong';
+              ? 'bg-ok'
+              : running?.needsRestart
+                ? 'bg-warn'
+                : h.configured
+                  ? 'bg-brand'
+                  : h.installed
+                    ? 'bg-warn'
+                    : 'bg-line-strong';
             return (
               <li key={h.kind}>
                 <button
@@ -948,6 +1026,8 @@ export function Integrations() {
           profile={selected}
           port={config.proxyPort}
           liveCount={liveCounts.get(selected.kind) ?? 0}
+          runningNotice={runningByKind.get(selected.kind) ?? null}
+          peerRelays={runtimeHealth?.peerRelays ?? []}
           shell={shell}
           caStatus={caStatus}
           caBusy={caBusy}

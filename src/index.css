@@ -21,7 +21,7 @@
 }
 
 /*
- * Design tokens — Dual-mode palette (Warm Paper Light + Precision Obsidian Ink Dark).
+ * Design tokens — Dual-mode palette (Warm Paper Light + Warm Graphite Dark).
  * Meets WCAG AA contrast targets (>= 4.5:1 text, >= 3:1 controls) and keys off `color-scheme`.
  * Values are RGB channels so Tailwind alpha modifiers work (bg-brand/10).
  */
@@ -29,28 +29,29 @@
   :root {
     color-scheme: light dark;
 
-    /* Light tokens (Warm Paper & Ink) */
-    --bg: 244 242 236;
-    --surface: 253 252 249;
-    --surface-2: 248 246 241;
-    --surface-3: 238 235 227;
-    --line: 229 225 215;
-    --line-strong: 204 198 184;
-    --line-control: 136 131 117;
-    --fg: 24 26 22;
-    --fg-muted: 76 79 71;
-    --fg-subtle: 102 104 94;
-    --brand: 6 95 70;
-    --brand-solid: 4 120 87;
+    /* Light tokens (Warm Paper & Slate Indigo) */
+    --bg: 246 244 240;
+    --surface: 254 253 251;
+    --surface-2: 249 247 243;
+    --surface-3: 239 236 229;
+    --line: 228 224 216;
+    --line-strong: 204 198 188;
+    --line-control: 132 128 120;
+    --fg: 24 25 29;
+    --fg-muted: 75 79 88;
+    --fg-subtle: 102 106 116;
+    --brand: 49 78 148;
+    --brand-solid: 43 72 142;
     --brand-on: 255 255 255;
-    --danger: 168 40 24;
-    --danger-solid: 185 45 28;
-    --warn: 138 82 8;
-    --info: 38 84 150;
-    --focus: 4 120 87;
+    --ok: 42 122 86;
+    --danger: 174 44 42;
+    --danger-solid: 185 45 43;
+    --warn: 152 86 14;
+    --info: 74 96 148;
+    --focus: 43 72 142;
 
-    --scrollbar-thumb-light: #b6b0a2;
-    --scrollbar-thumb-dark: #475569;
+    --scrollbar-thumb-light: #b8b3a8;
+    --scrollbar-thumb-dark: #4f5565;
     --scrollbar-track-light: transparent;
     --scrollbar-track-dark: transparent;
     --scrollbar-thumb: var(--scrollbar-thumb-light);
@@ -64,47 +65,49 @@
 
   :root:has(> head > meta[name='color-scheme'][content='dark']) {
     color-scheme: dark;
-    --bg: 13 17 23;
-    --surface: 20 26 35;
-    --surface-2: 26 34 46;
-    --surface-3: 34 43 58;
-    --line: 42 52 68;
-    --line-strong: 58 72 94;
-    --line-control: 100 116 139;
-    --fg: 241 245 249;
-    --fg-muted: 173 185 204;
-    --fg-subtle: 143 158 179;
-    --brand: 52 211 153;
-    --brand-solid: 16 185 129;
-    --brand-on: 9 14 21;
-    --danger: 251 113 133;
-    --danger-solid: 225 29 72;
-    --warn: 251 191 36;
-    --info: 96 165 250;
-    --focus: 52 211 153;
+    --bg: 18 19 22;
+    --surface: 25 27 32;
+    --surface-2: 31 34 40;
+    --surface-3: 40 44 52;
+    --line: 48 52 62;
+    --line-strong: 68 74 88;
+    --line-control: 112 118 134;
+    --fg: 240 241 245;
+    --fg-muted: 176 181 193;
+    --fg-subtle: 146 152 166;
+    --brand: 138 172 252;
+    --brand-solid: 74 108 206;
+    --brand-on: 255 255 255;
+    --ok: 92 196 140;
+    --danger: 248 122 128;
+    --danger-solid: 212 62 72;
+    --warn: 244 190 88;
+    --info: 128 176 244;
+    --focus: 138 172 252;
     --scrollbar-thumb: var(--scrollbar-thumb-dark);
   }
 
   @media (prefers-color-scheme: dark) {
     :root:not(:has(> head > meta[name='color-scheme'][content='light'])) {
-      --bg: 13 17 23;
-      --surface: 20 26 35;
-      --surface-2: 26 34 46;
-      --surface-3: 34 43 58;
-      --line: 42 52 68;
-      --line-strong: 58 72 94;
-      --line-control: 100 116 139;
-      --fg: 241 245 249;
-      --fg-muted: 173 185 204;
-      --fg-subtle: 143 158 179;
-      --brand: 52 211 153;
-      --brand-solid: 16 185 129;
-      --brand-on: 9 14 21;
-      --danger: 251 113 133;
-      --danger-solid: 225 29 72;
-      --warn: 251 191 36;
-      --info: 96 165 250;
-      --focus: 52 211 153;
+      --bg: 18 19 22;
+      --surface: 25 27 32;
+      --surface-2: 31 34 40;
+      --surface-3: 40 44 52;
+      --line: 48 52 62;
+      --line-strong: 68 74 88;
+      --line-control: 112 118 134;
+      --fg: 240 241 245;
+      --fg-muted: 176 181 193;
+      --fg-subtle: 146 152 166;
+      --brand: 138 172 252;
+      --brand-solid: 74 108 206;
+      --brand-on: 255 255 255;
+      --ok: 92 196 140;
+      --danger: 248 122 128;
+      --danger-solid: 212 62 72;
+      --warn: 244 190 88;
+      --info: 128 176 244;
+      --focus: 138 172 252;
       --scrollbar-thumb: var(--scrollbar-thumb-dark);
     }
   }
@@ -256,6 +259,12 @@
     .hg-window-frame,
     .hg-toast {
       border: 1px solid CanvasText;
+    }
+    button[role='switch'] {
+      border: 1px solid ButtonText;
+    }
+    button[role='switch'][aria-checked='true'] {
+      background-color: Highlight;
     }
     .hg-active-bar {
       background-color: Highlight;

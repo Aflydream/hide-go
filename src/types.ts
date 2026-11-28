@@ -1,4 +1,4 @@
-export type HarnessKind = 'claude-code' | 'codex' | 'antigravity' | 'zcode' | 'qoder' | 'cursor' | 'grok-build' | 'generic';
+export type HarnessKind = 'claude-code' | 'codex' | 'antigravity' | 'zcode' | 'qoder' | 'cursor' | 'grok-build' | 'pi' | 'generic';
 
 export type TrafficCategory = 'interactive-prompt' | 'codebase-indexing' | 'telemetry' | 'tool-execution-sync';
 
@@ -149,12 +149,27 @@ export interface UpdateCheckResult {
   checkedAt: string;
   releaseNotesEn?: string | null;
   releaseNotesZh?: string | null;
+  downloadUrl?: string | null;
+  assetName?: string | null;
+  assetSize?: number | null;
+  sha256Url?: string | null;
+}
+
+export interface UpdateDownloadResult {
+  version: string;
+  fileName: string;
+  filePath: string;
+  bytes: number;
+  sha256: string;
+  verified: boolean;
+  launched: boolean;
 }
 
 export interface TrafficSummary {
   id: string;
   timestamp: string;
   harness: HarnessKind;
+  clientProcess?: string | null;
   category: TrafficCategory;
   purpose?: RequestPurpose;
   purposeConfidence?: number;
@@ -179,6 +194,7 @@ export interface TrafficAuditRecord {
   id: string;
   timestamp: string;
   harness: HarnessKind;
+  clientProcess?: string | null;
   category: TrafficCategory;
   purpose?: RequestPurpose;
   purposeConfidence?: number;
@@ -281,4 +297,52 @@ export interface RuleValidation {
   valid: boolean;
   message?: string;
   matches?: string[];
+}
+
+export interface CompanionProcessInfo {
+  pid: number;
+  name: string;
+  relation: 'child' | 'sibling' | string;
+}
+
+export interface RunningHarnessNotice {
+  kind: HarnessKind;
+  name: string;
+  pids: number[];
+  configured: boolean;
+  hasTraffic: boolean;
+  needsRestart: boolean;
+  companions: CompanionProcessInfo[];
+}
+
+export interface PeerRelayInfo {
+  port: number;
+  processName?: string | null;
+  pid?: number | null;
+  status: 'chained' | 'overwrote-harness' | string;
+  affectedHarnesses: HarnessKind[];
+}
+
+export interface ConflictAlert {
+  id: string;
+  source: 'peer-config' | 'live-payload' | string;
+  peerName: string;
+  pid?: number | null;
+  port?: number | null;
+  detail: string;
+  canStopPeer: boolean;
+}
+
+export interface RuntimeHealthResponse {
+  runningHarnesses: RunningHarnessNotice[];
+  peerRelays: PeerRelayInfo[];
+  conflicts: ConflictAlert[];
+}
+
+export type ConflictResolutionAction = 'stop-peer' | 'switch-hidego-audit' | 'dismiss';
+
+export interface ConflictResolutionResult {
+  ok: boolean;
+  action: string;
+  message: string;
 }

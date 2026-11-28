@@ -1,6 +1,8 @@
 import { getActiveLocale, translate } from './i18n';
 import type {
   CaStatus,
+  ConflictResolutionAction,
+  ConflictResolutionResult,
   GatewayStatus,
   HarnessActionResult,
   HarnessKind,
@@ -8,10 +10,12 @@ import type {
   HideConfig,
   MitmHostsResponse,
   RuleValidation,
+  RuntimeHealthResponse,
   TrafficAuditRecord,
   TrafficCategory,
   TrafficSummary,
   UpdateCheckResult,
+  UpdateDownloadResult,
   VaultEntry,
 } from '../types';
 
@@ -162,4 +166,16 @@ export const api = {
     request<RuleValidation>('/api/rules/validate', { method: 'POST', body: JSON.stringify({ pattern, sample }) }),
   checkUpdates: (force = false) =>
     request<UpdateCheckResult>(`/api/updates/check${force ? '?force=true' : ''}`),
+  downloadUpdate: (force = false, launch = true) =>
+    request<UpdateDownloadResult>('/api/updates/download', {
+      method: 'POST',
+      body: JSON.stringify({ force, launch }),
+    }),
+  runtimeHealth: () => request<RuntimeHealthResponse>('/api/runtime/health'),
+  resolveConflict: (conflictId: string, action: ConflictResolutionAction) =>
+    request<ConflictResolutionResult>('/api/runtime/conflict/resolve', {
+      method: 'POST',
+      body: JSON.stringify({ conflictId, action }),
+    }),
+  quitDesktop: () => request<void>('/api/quit', { method: 'POST' }),
 };

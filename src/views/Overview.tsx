@@ -243,7 +243,15 @@ export function Overview() {
       </div>
 
       <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_380px]">
-        <Panel title={t('overview.activityTitle')} description={t('overview.activityDesc')}>
+        <Panel
+          title={t('overview.activityTitle')}
+          description={t('overview.activityDesc')}
+          actions={
+            <Button size="sm" variant="ghost" icon={<Plugs size={14} />} onClick={() => navigate('integrations')}>
+              {t('overview.integrationGuide')}
+            </Button>
+          }
+        >
           <ul className="grid grid-cols-2 gap-px bg-line lg:grid-cols-4">
             {HARNESS_ORDER.map((kind) => {
               const summary = liveByHarness.get(kind);
@@ -264,7 +272,7 @@ export function Overview() {
                     <div className="flex items-center gap-2">
                       <span
                         aria-hidden="true"
-                        className={cx('h-1.5 w-1.5 rounded-full', hasRisk ? 'bg-warn' : count ? 'bg-brand' : 'bg-line-strong')}
+                        className={cx('h-1.5 w-1.5 rounded-full', hasRisk ? 'bg-warn' : count ? 'bg-ok' : 'bg-line-strong')}
                       />
                       <span className="truncate text-sm text-fg">{getHarnessLabel(kind, locale)}</span>
                     </div>
@@ -280,11 +288,6 @@ export function Overview() {
                 </li>
               );
             })}
-            <li className="flex items-center bg-surface px-4 py-3">
-              <Button size="sm" variant="ghost" icon={<Plugs size={14} />} onClick={() => navigate('integrations')}>
-                {t('overview.integrationGuide')}
-              </Button>
-            </li>
           </ul>
         </Panel>
 
@@ -295,6 +298,7 @@ export function Overview() {
                   { slug: 'claude-code', path: '/claude-code' },
                   { slug: 'codex', path: '/codex/v1' },
                   { slug: 'grok-build', path: '/grok-build/v1' },
+                  { slug: 'pi', path: '/pi' },
                 ].map(({ slug, path }) => (
                   <div key={slug} className="flex items-center gap-2 rounded border border-line bg-surface-2 py-1 pl-3 pr-1">
                     <code className="min-w-0 flex-1 truncate font-mono text-xs text-fg">{`${base}${path}`}</code>

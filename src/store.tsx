@@ -2,7 +2,17 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { api, ApiError } from './lib/api';
 import { usePoll, useRoute, type Route } from './lib/hooks';
 import { useI18n } from './lib/i18n';
-import type { GatewayStatus, HarnessProfile, HideConfig, TrafficSummary, UpdateCheckResult, VaultEntry } from './types';
+import type {
+  ConflictResolutionAction,
+  GatewayStatus,
+  HarnessProfile,
+  HideConfig,
+  RuntimeHealthResponse,
+  TrafficSummary,
+  UpdateCheckResult,
+  UpdateDownloadResult,
+  VaultEntry,
+} from './types';
 import { useToast } from './components/ui';
 
 interface Store {
@@ -19,10 +29,17 @@ interface Store {
   vault: VaultEntry[];
   vaultLoading: boolean;
   refreshVault: () => Promise<unknown>;
+  runtimeHealth: RuntimeHealthResponse | null;
+  refreshRuntimeHealth: () => Promise<unknown>;
+  resolveConflict: (conflictId: string, action: ConflictResolutionAction) => Promise<boolean>;
   updateInfo: UpdateCheckResult | null;
   updateError: string | null;
   checkingUpdates: boolean;
   checkForUpdates: (force?: boolean) => Promise<UpdateCheckResult | null>;
+  downloadingUpdate: boolean;
+  downloadedUpdate: UpdateDownloadResult | null;
+  downloadUpdateError: string | null;
+  downloadUpdate: () => Promise<UpdateDownloadResult | null>;
   route: Route;
   params: URLSearchParams;
   navigate: (route: Route, params?: Record<string, string>) => void;
@@ -52,6 +69,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [downloadingUpdate, setDownloadingUpdate] = useState(false);
+  const [downloadedUpdate, setDownloadedUpdate] = useState<UpdateDownloadResult | null>(null);
+  const [downloadUpdateError, setDownloadUpdateError] = useState<string | null>(null);
   const saveSeq = useRef(0);
   const confirmedConfigRef = useRef<HideConfig | null>(null);
   const syncedLangRef = useRef(false);
@@ -94,12 +114,77 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [toast, t],
   );
 
+  const downloadUpdate = useCallback(async () => {
+    setDownloadingUpdate(true);
+    setDownloadUpdateError(null);
+    try {
+      const res = await api.downloadUpdate(false, true);
+      setDownloadedUpdate(res);
+      toast.push({
+        tone: 'brand',
+        title: res.launched
+          ? t('settings.updatesDownloadLaunchedTitle', { version: res.version })
+          : t('settings.updatesDownloadSavedTitle', { version: res.version }),
+        body: res.filePath,
+      });
+      return res;
+    } catch (e) {
+      const msg = (e as Error).message;
+      setDownloadUpdateError(msg);
+      toast.push({
+        tone: 'danger',
+        title: t('settings.updatesDownloadFailedTitle'),
+        body: msg,
+      });
+      return null;
+    } finally {
+      setDownloadingUpdate(false);
+    }
+  }, [toast, t]);
+
   const status = usePoll(api.status, 2500);
   const logs = usePoll(api.logsIfChanged, route === 'overview' || route === 'traffic' ? 2500 : 10000);
   const needsHarnesses = route === 'integrations' || route === 'overview';
   const harnesses = usePoll(api.harnesses, route === 'integrations' ? 8000 : 15000, needsHarnesses);
   const needsVault = route === 'vault' || route === 'traffic';
   const vault = usePoll(api.vaultIfChanged, 5000, needsVault);
+  const runtimeHealth = usePoll(api.runtimeHealth, 8000);
+
+  const resolveConflict = useCallback(
+    async (conflictId: string, action: ConflictResolutionAction) => {
+      try {
+        const res = await api.resolveConflict(conflictId, action);
+        if (action === 'switch-hidego-audit') {
+          const nextCfg = await api.config().catch(() => null);
+          if (nextCfg) {
+            confirmedConfigRef.current = nextCfg;
+            setConfig(nextCfg);
+          }
+        }
+        void runtimeHealth.refresh().catch(() => {});
+        void status.refresh().catch(() => {});
+        if (action !== 'dismiss') {
+          toast.push({
+            tone: res.ok ? 'brand' : 'warn',
+            title:
+              action === 'stop-peer'
+                ? t(res.ok ? 'conflict.toastStoppedPeer' : 'conflict.toastStopFailed')
+                : t('conflict.toastSwitchedAudit'),
+            body: res.message,
+          });
+        }
+        return res.ok;
+      } catch (e) {
+        toast.push({
+          tone: 'danger',
+          title: t('conflict.toastFailed'),
+          body: (e as Error).message,
+        });
+        return false;
+      }
+    },
+    [runtimeHealth, status, toast, t],
+  );
 
   // Config is loaded once and after each save; it is not polled, so edits are never overwritten.
   useEffect(() => {
@@ -178,10 +263,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       vault: vault.data ?? EMPTY_VAULT,
       vaultLoading: vault.loading,
       refreshVault: vault.refresh,
+      runtimeHealth: runtimeHealth.data,
+      refreshRuntimeHealth: runtimeHealth.refresh,
+      resolveConflict,
       updateInfo,
       updateError,
       checkingUpdates,
       checkForUpdates,
+      downloadingUpdate,
+      downloadedUpdate,
+      downloadUpdateError,
+      downloadUpdate,
       route,
       params,
       navigate,
@@ -189,7 +281,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       simulatorOpen,
       closeSimulator,
     }),
-    [config, saveConfig, saving, status.data, status.error, logs.data, logs.loading, logs.refresh, harnesses.data, harnesses.refresh, vault.data, vault.loading, vault.refresh, updateInfo, updateError, checkingUpdates, checkForUpdates, route, params, navigate, openSimulator, simulatorOpen, closeSimulator],
+    [config, saveConfig, saving, status.data, status.error, logs.data, logs.loading, logs.refresh, harnesses.data, harnesses.refresh, vault.data, vault.loading, vault.refresh, runtimeHealth.data, runtimeHealth.refresh, resolveConflict, updateInfo, updateError, checkingUpdates, checkForUpdates, downloadingUpdate, downloadedUpdate, downloadUpdateError, downloadUpdate, route, params, navigate, openSimulator, simulatorOpen, closeSimulator],
   );
 
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;
