@@ -1,7 +1,7 @@
 import { useId, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { ArrowsClockwise, Eye, EyeSlash, ShieldCheck, WarningCircle } from '@phosphor-icons/react';
 import { useStore } from '../store';
-import { Badge, Button, Callout, ConfirmDialog, IconButton, RadioCard, Section, Skeleton, Switch, cx } from '../components/ui';
+import { Badge, Button, Callout, ConfirmDialog, IconButton, RadioCard, Section, Segmented, Skeleton, Switch, cx } from '../components/ui';
 import { COVER_THEMES, getCoverThemeLabel, getModeLabel, getPolicyLabel } from '../lib/format';
 import { useI18n } from '../lib/i18n';
 import type { CoverTheme, HideConfig, PrivacyMode, ToolCallSecretPolicy } from '../types';
@@ -118,7 +118,7 @@ export function Policy() {
           >
             <Example
               local={'fn verify_margin(wallet_secret: &str) // liquidation threshold check'}
-              vendor={'fn orchid_petal_grove(fern_moss_stem: &str) // Check greenhouse soil moisture before misting cycle (#a7b3)'}
+              vendor={'fn verify_canopy_drift(drip_valve_token: &str) // Verify greenhouse drip line moisture baseline'}
             />
           </RadioCard>
         </div>
@@ -153,6 +153,47 @@ export function Policy() {
             checked={config.protectInternalNetwork}
             onChange={(v) => set({ protectInternalNetwork: v })}
           />
+          <ToggleRow
+            title={t('policy.scopePersonalTitle')}
+            description={t('policy.scopePersonalDesc')}
+            checked={config.protectPersonalInfo !== false}
+            onChange={(v) => set({ protectPersonalInfo: v })}
+          />
+          <ToggleRow
+            title={t('policy.scopeGuardTitle')}
+            description={t('policy.scopeGuardDesc')}
+            checked={config.guardModelEnabled !== false}
+            onChange={(v) => set({ guardModelEnabled: v })}
+          />
+          {config.guardModelEnabled !== false && (
+            <div className="flex flex-wrap items-center justify-between gap-4 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-fg">{t('policy.scopeGuardThresholdTitle')}</p>
+                <p className="mt-0.5 text-xs text-fg-subtle">{t('policy.scopeGuardThresholdDesc')}</p>
+              </div>
+              <Segmented<'strict' | 'balanced' | 'conservative'>
+                size="sm"
+                label={t('policy.scopeGuardThresholdTitle')}
+                value={
+                  (config.guardThreshold ?? 0.8) <= 0.72
+                    ? 'strict'
+                    : (config.guardThreshold ?? 0.8) >= 0.86
+                      ? 'conservative'
+                      : 'balanced'
+                }
+                onChange={(preset) =>
+                  void set({
+                    guardThreshold: preset === 'strict' ? 0.65 : preset === 'conservative' ? 0.9 : 0.8,
+                  })
+                }
+                options={[
+                  { value: 'strict', label: t('policy.guardStrict') },
+                  { value: 'balanced', label: t('policy.guardBalanced') },
+                  { value: 'conservative', label: t('policy.guardConservative') },
+                ]}
+              />
+            </div>
+          )}
         </div>
       </Section>
 

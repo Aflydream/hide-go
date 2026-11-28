@@ -1,4 +1,5 @@
-import { ArrowsClockwise, ArrowSquareOut, CheckCircle } from '@phosphor-icons/react';
+import { Fragment, useEffect, useState, type ReactNode } from 'react';
+import { ArrowsClockwise, ArrowSquareOut, CaretDown, CaretRight, CheckCircle } from '@phosphor-icons/react';
 import { useStore } from '../store';
 import { Badge, Button, CopyButton, Section, Segmented, Skeleton, Switch, cx } from '../components/ui';
 import { useColorScheme, type ColorSchemePref } from '../components/WindowFrame';
@@ -6,13 +7,99 @@ import { formatDuration } from '../lib/format';
 import { SUPPORTED_LOCALES, translate, useI18n } from '../lib/i18n';
 import type { UiLanguage } from '../types';
 
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+  return parts.map((part, idx) => {
+    if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
+      return (
+        <code key={idx} className="rounded bg-surface-3/80 px-1 py-0.5 font-mono text-[11px] text-fg">
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+      return (
+        <strong key={idx} className="font-medium text-fg">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+    return <Fragment key={idx}>{part}</Fragment>;
+  });
+}
+
+function ReleaseNotesView({ markdown }: { markdown: string }) {
+  const lines = markdown.split(/\r?\n/);
+  const blocks: ReactNode[] = [];
+  let bullets: string[] = [];
+
+  const flushBullets = (keyPrefix: string) => {
+    if (bullets.length === 0) return;
+    const items = bullets;
+    bullets = [];
+    blocks.push(
+      <ul key={`${keyPrefix}-ul`} className="list-disc space-y-1 pl-4 text-xs leading-relaxed text-fg-muted">
+        {items.map((item, i) => (
+          <li key={i}>{renderInlineMarkdown(item)}</li>
+        ))}
+      </ul>,
+    );
+  };
+
+  lines.forEach((raw, idx) => {
+    const line = raw.trim();
+    if (!line || line === '---' || line === '***') {
+      flushBullets(`b-${idx}`);
+      return;
+    }
+    if (line.startsWith('- ') || line.startsWith('* ')) {
+      bullets.push(line.slice(2).trim());
+      return;
+    }
+    flushBullets(`h-${idx}`);
+    if (line.startsWith('### ')) {
+      blocks.push(
+        <h4 key={idx} className="pt-1.5 text-[11px] font-semibold uppercase tracking-wide text-fg first:pt-0">
+          {line.slice(4).trim()}
+        </h4>,
+      );
+    } else if (line.startsWith('## ')) {
+      blocks.push(
+        <h3 key={idx} className="font-mono text-xs font-semibold text-fg">
+          {line.slice(3).trim()}
+        </h3>,
+      );
+    } else {
+      blocks.push(
+        <p key={idx} className="text-xs leading-relaxed text-fg-muted">
+          {renderInlineMarkdown(line)}
+        </p>,
+      );
+    }
+  });
+  flushBullets('end');
+
+  return <div className="space-y-1.5">{blocks}</div>;
+}
+
 export function Settings() {
   const { config, status, statusError, saveConfig, updateInfo, updateError, checkingUpdates, checkForUpdates } = useStore();
   const { pref, setPref, systemLocale, locale, t } = useI18n();
   const { pref: themePref, setPref: setThemePref } = useColorScheme();
+  const [changelogOpen, setChangelogOpen] = useState(false);
 
   const online = !!status && !statusError;
   const autoCheckEnabled = config ? config.autoCheckUpdates !== false : true;
+  const localizedChangelog = updateInfo?.updateAvailable
+    ? locale === 'zh-CN'
+      ? updateInfo.releaseNotesZh || updateInfo.releaseNotesEn || null
+      : updateInfo.releaseNotesEn || updateInfo.releaseNotesZh || null
+    : null;
+
+  useEffect(() => {
+    setChangelogOpen(false);
+  }, [updateInfo?.latestVersion]);
+
   const formattedCheckedAt = updateInfo?.checkedAt
     ? new Date(updateInfo.checkedAt).toLocaleTimeString(locale === 'zh-CN' ? 'zh-CN' : 'en-US', {
         hour: '2-digit',
@@ -136,6 +223,41 @@ export function Settings() {
                 </Button>
               </div>
             </div>
+
+            {updateInfo?.updateAvailable && localizedChangelog && (
+              <div>
+                <button
+                  type="button"
+                  aria-expanded={changelogOpen}
+                  aria-controls="update-changelog-panel"
+                  onClick={() => setChangelogOpen((open) => !open)}
+                  className="flex w-full cursor-pointer items-center justify-between gap-3 px-4 py-2.5 text-left transition-colors hover:bg-surface-2/60"
+                >
+                  <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-fg">
+                    {changelogOpen ? (
+                      <CaretDown size={13} className="shrink-0 text-fg-subtle" aria-hidden="true" />
+                    ) : (
+                      <CaretRight size={13} className="shrink-0 text-fg-subtle" aria-hidden="true" />
+                    )}
+                    <span>{t('settings.updatesChangelogTitle')}</span>
+                    <span className="font-mono text-[11px] font-normal text-fg-subtle">
+                      v{updateInfo.latestVersion}
+                    </span>
+                  </span>
+                  <span className="shrink-0 text-[11px] text-fg-subtle">
+                    {t(changelogOpen ? 'settings.updatesChangelogCollapse' : 'settings.updatesChangelogExpand')}
+                  </span>
+                </button>
+                {changelogOpen && (
+                  <div
+                    id="update-changelog-panel"
+                    className="max-h-72 overflow-y-auto border-t border-line bg-surface-2/40 px-4 py-3"
+                  >
+                    <ReleaseNotesView markdown={localizedChangelog} />
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
       </Section>

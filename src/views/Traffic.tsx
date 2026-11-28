@@ -581,6 +581,9 @@ function RecordDetail({
           <Badge tone={act.tone}>{act.label}</Badge>
           <Badge tone={getPurposeTone(record.purpose)} title={record.purposeDetail || undefined}>
             {getPurposeLabel(record.purpose, locale, record.category)}
+            {record.purposeConfidence && record.purposeConfidence > 0
+              ? ` · ${Math.round(record.purposeConfidence * 100)}%`
+              : ''}
           </Badge>
           <Badge>{getModeLabel(record.appliedMode, locale)}</Badge>
           {record.simulated && <Badge tone="info">{t('overview.simulatedTag')}</Badge>}

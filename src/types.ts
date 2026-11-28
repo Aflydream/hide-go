@@ -58,6 +58,9 @@ export interface HideConfig {
   protectProjectPaths: boolean;
   protectSecretsAndKeys: boolean;
   protectInternalNetwork: boolean;
+  protectPersonalInfo?: boolean;
+  guardModelEnabled?: boolean;
+  guardThreshold?: number;
   projectSalt: string;
   toolCallSecretPolicy: ToolCallSecretPolicy;
   customRules: CustomRule[];
@@ -144,6 +147,8 @@ export interface UpdateCheckResult {
   releaseUrl: string;
   publishedAt?: string | null;
   checkedAt: string;
+  releaseNotesEn?: string | null;
+  releaseNotesZh?: string | null;
 }
 
 export interface TrafficSummary {
@@ -152,6 +157,7 @@ export interface TrafficSummary {
   harness: HarnessKind;
   category: TrafficCategory;
   purpose?: RequestPurpose;
+  purposeConfidence?: number;
   purposeDetail?: string;
   method: string;
   endpoint: string;
@@ -175,6 +181,7 @@ export interface TrafficAuditRecord {
   harness: HarnessKind;
   category: TrafficCategory;
   purpose?: RequestPurpose;
+  purposeConfidence?: number;
   purposeDetail?: string;
   method: string;
   endpoint: string;
